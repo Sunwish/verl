@@ -371,19 +371,20 @@ def _check_mxfp8_2d_tensor(tensor: torch.Tensor):
         )
 
 
-def _round_mxfp8_rint(abs_scaled: torch.Tensor) -> torch.Tensor:
-    floor_val = torch.floor(abs_scaled)
-    frac = abs_scaled - floor_val
-    round_up = frac > 0.5
-    ties = frac == 0.5
-    odd_floor = torch.remainder(floor_val, 2) == 1
-    return floor_val + round_up.to(floor_val.dtype) + (ties & odd_floor).to(floor_val.dtype)
+# torch.round 本身就是四舍六入五成双的实现
+# def _round_mxfp8_rint(abs_scaled: torch.Tensor) -> torch.Tensor:
+#     floor_val = torch.floor(abs_scaled)
+#     frac = abs_scaled - floor_val
+#     round_up = frac > 0.5
+#     ties = frac == 0.5
+#     odd_floor = torch.remainder(floor_val, 2) == 1
+#     return floor_val + round_up.to(floor_val.dtype) + (ties & odd_floor).to(floor_val.dtype)
 
 
 def _round_mxfp8_scaled_abs(abs_scaled: torch.Tensor, rounding_mode: str) -> torch.Tensor:
     rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
     if rounding_mode == "rint":
-        return _round_mxfp8_rint(abs_scaled)
+        return torch.round(abs_scaled)
     if rounding_mode == "round":
         return torch.floor(abs_scaled + 0.5)
 
