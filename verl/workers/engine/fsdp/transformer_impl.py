@@ -80,6 +80,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+_RUNTIME_QUANTIZED_ROLLOUTS = {"fp8", "ascend"}
 
 
 class FSDPEngine(BaseEngine):
@@ -500,6 +501,7 @@ class FSDPEngine(BaseEngine):
                 "group_size": self._qat_config.group_size,
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
+                "rollout_weight_sync_mode": self._qat_config.rollout_weight_sync_mode,
             },
         )
         enable_qat_fuse(module)
@@ -508,6 +510,17 @@ class FSDPEngine(BaseEngine):
             self._restore_w4a4_input_scales(module, self.model_config.local_path)
 
         return module
+
+    def _resolve_qat_rollout_weight_sync_mode(self, rollout_quantization: Optional[str] = None) -> str:
+        mode = getattr(self._qat_config, "rollout_weight_sync_mode", "auto")
+        if mode not in {"auto", "quantized", "bf16"}:
+            raise ValueError(f"Unsupported qat.rollout_weight_sync_mode: {mode}")
+
+        if mode == "auto":
+            if rollout_quantization in _RUNTIME_QUANTIZED_ROLLOUTS:
+                return "bf16"
+            return "quantized"
+        return mode
 
     def _restore_w4a4_input_scales(self, model, model_path):
         """Restore input_global_scale and input_amax from checkpoint for W4A4 mode."""
@@ -791,7 +804,7 @@ class FSDPEngine(BaseEngine):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.optimizer)
 
-    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, rollout_quantization=None, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -846,26 +859,33 @@ class FSDPEngine(BaseEngine):
             )
 
         if self._qat_enabled:
-            from verl.utils.qat.quantizer import QATQuantizer
-            from verl.utils.torch_dtypes import PrecisionType
-
-            mixed_precision_config = self.engine_config.mixed_precision
-            if mixed_precision_config is not None:
-                param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
-            else:
-                param_dtype = torch.bfloat16
-
-            quantizer = QATQuantizer(
-                mode=self._qat_config.mode,
-                group_size=self._qat_config.group_size,
-                ignore_patterns=list(self._qat_config.ignore_patterns),
-                device=torch.device(get_device_id()),
-                param_dtype=param_dtype,
+            rollout_weight_sync_mode = self._resolve_qat_rollout_weight_sync_mode(rollout_quantization)
+            logger.info(
+                "QAT rollout weight sync mode resolved to %s (rollout_quantization=%s)",
+                rollout_weight_sync_mode,
+                rollout_quantization,
             )
-            per_tensor_param = quantizer.quantize_with_fusion(
-                per_tensor_param,
-                target_device=torch.device("cpu"),
-            )
+            if rollout_weight_sync_mode == "quantized":
+                from verl.utils.qat.quantizer import QATQuantizer
+                from verl.utils.torch_dtypes import PrecisionType
+
+                mixed_precision_config = self.engine_config.mixed_precision
+                if mixed_precision_config is not None:
+                    param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+                else:
+                    param_dtype = torch.bfloat16
+
+                quantizer = QATQuantizer(
+                    mode=self._qat_config.mode,
+                    group_size=self._qat_config.group_size,
+                    ignore_patterns=list(self._qat_config.ignore_patterns),
+                    device=torch.device(get_device_id()),
+                    param_dtype=param_dtype,
+                )
+                per_tensor_param = quantizer.quantize_with_fusion(
+                    per_tensor_param,
+                    target_device=torch.device("cpu"),
+                )
 
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict

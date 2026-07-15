@@ -122,7 +122,7 @@ class vLLMColocateWorkerExtension:
 
         # 1. patch for Lora
         VLLMHijack.hijack()
-        # 2. patch online fp8 quant
+        # 2. patch online fp8 / ascend mxfp8 quantized reload
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1":
             apply_vllm_fp8_patches()
         # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading

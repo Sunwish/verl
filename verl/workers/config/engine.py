@@ -136,6 +136,9 @@ class QATEngineConfig(BaseConfig):
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
+        rollout_weight_sync_mode (str): How QAT weights are exported during rollout sync.
+            "auto" keeps existing quantized exporters for native QAT rollouts and falls back
+            to bf16 full-precision tensor sync for runtime-quantized backends such as Ascend MXFP8.
     """
 
     enable: bool = False
@@ -144,6 +147,7 @@ class QATEngineConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    rollout_weight_sync_mode: str = "auto"
 
 
 @dataclass

@@ -37,6 +37,7 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    rollout_weight_sync_mode: str = "auto"
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:

@@ -89,3 +89,9 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
+
+  # Weight sync behavior for rollout updates.
+  # - auto: use native QAT exporters unless rollout backend expects runtime quantization.
+  # - quantized: always export quantized weights/scales from the trainer.
+  # - bf16: always export bf16 tensors and let rollout quantize during load.
+  rollout_weight_sync_mode: auto
