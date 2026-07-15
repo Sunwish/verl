@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+from copy import deepcopy
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -233,6 +234,12 @@ class vLLMHttpServer:
             set_expandable_segments(True)
 
         quantization, hf_overrides = self._apply_quantization()
+        logger.info(
+            "vLLM rollout startup model=%s quantization=%s quantization_config_file=%s",
+            self.model_config.local_path,
+            quantization,
+            self.config.quantization_config_file,
+        )
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -805,7 +812,28 @@ class vLLMHttpServer:
 
     def _init_model_config(self, model_config):
         """Initialise model_config. Override when a specific dataclass_type is needed."""
-        return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        model_cfg = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        rollout_model_path = getattr(self.config, "model_path", None)
+        if rollout_model_path:
+            rollout_model_cfg = deepcopy(model_cfg)
+            rollout_model_cfg.path = rollout_model_path
+            rollout_model_cfg.local_path = None
+            rollout_model_cfg.hf_config_path = rollout_model_path
+            rollout_model_cfg.local_hf_config_path = None
+            rollout_model_cfg.tokenizer_path = rollout_model_path
+            rollout_model_cfg.local_tokenizer_path = None
+            rollout_model_cfg.hf_config = None
+            rollout_model_cfg.generation_config = None
+            rollout_model_cfg.tokenizer = None
+            rollout_model_cfg.processor = None
+            rollout_model_cfg.__post_init__()
+            logger.info(
+                "Using dedicated rollout model path for vLLM startup: %s (trainer path remains %s)",
+                rollout_model_cfg.local_path,
+                model_cfg.local_path,
+            )
+            return rollout_model_cfg
+        return model_cfg
 
     def _validate_configs(self) -> None:
         """Validate config/model_config after initialisation."""
@@ -910,6 +938,13 @@ class vLLMHttpServer:
 
         if quantization is not None and self.config.quantization_config_file is not None:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file
+
+        logger.info(
+            "Resolved rollout quantization config: quantization=%s quantization_config_file=%s hf_override_keys=%s",
+            quantization,
+            self.config.quantization_config_file,
+            sorted(hf_overrides.keys()),
+        )
 
         return quantization, hf_overrides
 

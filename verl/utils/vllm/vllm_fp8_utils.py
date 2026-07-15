@@ -183,7 +183,13 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
 
         # Cast the weight into fp8 and its scale factor
         if torch.distributed.get_rank() == 0:
-            logger.debug(f"Quantizing to FP8 blockwise: {k}")
+            logger.info(
+                "Quantizing rollout weight to %s: %s shape=%s dtype=%s",
+                "MXFP8" if is_mxfp8_npu else "FP8",
+                k,
+                tuple(v.shape),
+                v.dtype,
+            )
         if is_mxfp8_npu:
             param_lp, param_scale = torch_npu.npu_dynamic_mx_quant(
                 v.to(dtype),
@@ -227,6 +233,13 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
     vllm_dtype = model_runner.vllm_config.model_config.dtype
 
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
+    logger.info(
+        "load_quanted_weights start: is_drafter=%s is_mxfp8_npu=%s quant_config_type=%s dtype=%s",
+        is_drafter,
+        is_mxfp8_npu,
+        type(quant_config).__name__ if quant_config is not None else None,
+        vllm_dtype,
+    )
 
     if is_mxfp8_npu:
         # For MXFP8 on NPU, we need to restore weights to original shapes
@@ -254,6 +267,12 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
         # Re-apply MXFP8 transformations after weight loading
         apply_mxfp8_transformation_after_loading(model)
 
+    logger.info(
+        "load_quanted_weights done: is_drafter=%s is_mxfp8_npu=%s loaded_params=%s",
+        is_drafter,
+        is_mxfp8_npu,
+        len(loaded_params) if loaded_params is not None else None,
+    )
     return loaded_params
 
 
