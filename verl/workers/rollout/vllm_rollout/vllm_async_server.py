@@ -42,7 +42,12 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.utils import (
+    get_max_position_embeddings,
+    get_rollout_bootstrap_model_path,
+    qwen2_5_vl_dedup_image_tokens,
+    run_uvicorn,
+)
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -123,6 +128,7 @@ class vLLMHttpServer:
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
+        self.rollout_bootstrap_model_path = get_rollout_bootstrap_model_path(self.model_config, self.config)
         self._validate_configs()
 
         self.rollout_mode = rollout_mode
@@ -357,7 +363,7 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
-        server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
+        server_args = ["serve", self.rollout_bootstrap_model_path] + build_cli_args_from_config(args)
 
         if self.replica_rank == 0:
             pprint(server_args)

@@ -50,7 +50,7 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
-from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
+from verl.workers.rollout.utils import get_max_position_embeddings, get_rollout_bootstrap_model_path, run_uvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -151,6 +151,7 @@ class SGLangHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        self.rollout_bootstrap_model_path = get_rollout_bootstrap_model_path(self.model_config, self.config)
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
         if self.config.max_model_len is None:
             self.config.max_model_len = max_position_embeddings
@@ -283,7 +284,7 @@ class SGLangHttpServer:
                 raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
         infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
         args = {
-            "model_path": self.model_config.local_path,
+            "model_path": self.rollout_bootstrap_model_path,
             "dtype": self.config.dtype,
             "mem_fraction_static": self.config.gpu_memory_utilization,
             "disable_cuda_graph": self.config.enforce_eager,

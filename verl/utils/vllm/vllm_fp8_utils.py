@@ -106,17 +106,30 @@ def is_fp8_weight(name, model):
 
 
 def is_mxfp8_vllm_ascend(quant_config):
+    logger.info("Enter is_mxfp8_vllm_ascend")
     try:
         from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
 
-        if isinstance(quant_config, AscendModelSlimConfig):
-            quant_method = quant_config.quant_description.get("quant_method")
-            return quant_method in ["ascend"]
+        if not isinstance(quant_config, AscendModelSlimConfig):
+            logger.info("quant_config is not AscendModelSlimConfig")
+            return False
+
+        quant_description = getattr(quant_config, "quant_description", {}) or {}
+        quant_method = quant_description.get("quant_method")
+        if quant_method in ["ascend"]:
+            return True
+
+        # Some ModelSlim exports only contain per-parameter quant type entries such as
+        # `W8A8_MXFP8` and do not provide a top-level quant_method field. Detect those
+        # models directly so BF16 trainer weights still enter the low-precision reload path.
+        for value in quant_description.values():
+            if isinstance(value, str) and "MXFP8" in value.upper():
+                logger.info("Detected Ascend MXFP8 rollout from quant_description entries")
+                return True
         return False
     except ImportError:
         # vllm_ascend not installed, so this can't be an Ascend MXFP8 config
         return False
-
 
 def restore_mxfp8_weights_for_loading(model):
     for name, module in model.named_modules():

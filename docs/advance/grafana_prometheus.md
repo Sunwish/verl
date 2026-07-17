@@ -111,6 +111,9 @@ If use default path, this parameter can be omitted.
 - `actor_rollout_ref.rollout.prometheus.file="/tmp/ray/session_latest/metrics/prometheus/prometheus.yml"`
 
 served_model_name uses `model_path.split("/")[-1]` for data statistics by default.
+If rollout bootstraps from a separate path via `actor_rollout_ref.rollout.bootstrap_model_path`,
+this default still follows `actor_rollout_ref.model.path`; set `served_model_name` explicitly if
+you want dashboards to show the rollout bootstrap alias instead.
 Users can also customize other aliases:
 
 - `actor_rollout_ref.rollout.prometheus.served_model_name="Qwen3-235B"`

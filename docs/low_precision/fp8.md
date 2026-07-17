@@ -49,6 +49,14 @@ Or via command line:
 actor_rollout_ref.rollout.quantization=fp8
 ```
 
+When rollout needs to bootstrap from a different checkpoint directory than training
+(for example BF16 training with a quantized rollout startup artifact), keep
+`actor_rollout_ref.model.path` pointing to the training model and set:
+
+```bash
+actor_rollout_ref.rollout.bootstrap_model_path=/path/to/rollout/bootstrap/model
+```
+
 ### Experiments and Outcomes
 
 #### Qwen3-8B-Base Dense Model

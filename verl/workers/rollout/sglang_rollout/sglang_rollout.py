@@ -45,6 +45,7 @@ from verl.workers.rollout.sglang_rollout.utils import (
     SGLANG_LORA_NAME,
     get_named_tensor_buckets,
 )
+from verl.workers.rollout.utils import get_rollout_bootstrap_model_path
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -244,7 +245,7 @@ class ServerAdapter(BaseRollout):
         )
 
         self._engine = AsyncHttpServerAdapter(
-            model_path=self.model_config.local_path,
+            model_path=get_rollout_bootstrap_model_path(self.model_config, self.config),
             host=host,
             port=server_port,
             launch_server=False,

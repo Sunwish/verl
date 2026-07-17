@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+from typing import Optional
 
 import numpy as np
 import ray
@@ -21,6 +22,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI
 
+from verl.utils.fs import copy_to_local
 from verl.workers.config.rollout import PrometheusConfig
 
 logger = logging.getLogger(__file__)
@@ -111,6 +113,20 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
         return prompt_ids[mask].tolist()
     else:
         return prompt_ids
+
+
+def get_rollout_bootstrap_model_path(model_config, rollout_config) -> str:
+    """Resolve the model directory used to bootstrap rollout servers.
+
+    This path is rollout-only: training-side tokenizer / HF config loading stays
+    attached to ``actor_rollout_ref.model``. When a rollout-specific bootstrap
+    path is provided, materialize it locally with the same ``use_shm`` policy as
+    the shared model config.
+    """
+    bootstrap_model_path: Optional[str] = getattr(rollout_config, "bootstrap_model_path", None)
+    if bootstrap_model_path is None:
+        return model_config.local_path
+    return copy_to_local(bootstrap_model_path, use_shm=model_config.use_shm)
 
 
 def update_prometheus_config(config: PrometheusConfig, server_addresses: list[str], rollout_name: str | None = None):

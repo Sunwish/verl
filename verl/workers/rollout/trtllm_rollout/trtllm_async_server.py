@@ -29,7 +29,12 @@ from verl.utils.net_utils import is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.utils import (
+    get_max_position_embeddings,
+    get_rollout_bootstrap_model_path,
+    qwen2_5_vl_dedup_image_tokens,
+    run_uvicorn,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -108,6 +113,7 @@ class TRTLLMHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        self.rollout_bootstrap_model_path = get_rollout_bootstrap_model_path(self.model_config, self.config)
         self.is_reward_model = is_reward_model
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
         if self.config.max_model_len is None:
@@ -224,7 +230,7 @@ class TRTLLMHttpServer:
                 raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
 
         llm_kwargs = {
-            "model": self.model_config.local_path,
+            "model": self.rollout_bootstrap_model_path,
             "backend": "pytorch",
             "dtype": self.config.dtype,
             "enable_chunked_prefill": self.config.enable_chunked_prefill,
@@ -300,7 +306,7 @@ class TRTLLMHttpServer:
         if "generator" in init_params:
             trtllm_server = OpenAIServer(
                 generator=self.llm,
-                model=self.model_config.local_path,
+                model=self.rollout_bootstrap_model_path,
                 tool_parser=None,
                 server_role=None,
                 metadata_server_cfg=None,
@@ -308,7 +314,7 @@ class TRTLLMHttpServer:
         else:
             trtllm_server = OpenAIServer(
                 llm=self.llm,
-                model=self.model_config.local_path,
+                model=self.rollout_bootstrap_model_path,
                 tool_parser=None,
                 server_role=None,
                 metadata_server_cfg=None,

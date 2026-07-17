@@ -267,6 +267,8 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = True
 
+    bootstrap_model_path: Optional[str] = None
+
     quantization: Optional[str] = None
 
     quantization_config_file: Optional[str] = None
