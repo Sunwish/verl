@@ -38,7 +38,7 @@ actor_rollout_ref:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `fsdp_config.qat.enable` | Enable QAT | `False` |
-| `fsdp_config.qat.mode` | Quantization mode | `"w4a16"` |
+| `fsdp_config.qat.mode` | Quantization mode (`"w4a16"`, `"w4a4"`, or `"mxfp8"`) | `"w4a16"` |
 | `fsdp_config.qat.group_size` | Quantization group size | `16` |
 | `fsdp_config.qat.ignore_patterns` | Layers to skip. Supports `re:` prefix for regex, otherwise substring match | `["lm_head", "embed_tokens", "re:.*mlp.gate$"]` |
 | `fsdp_config.qat.quantization_config_path` | vLLM quantization config JSON path | Required |
@@ -74,8 +74,9 @@ actor_rollout_ref:
 ## Support Matrix
 
 - NVFP4 W4A16 (weight-only FP4 quantization)
+- MXFP8 QAT on the FSDP training path (weight fake-quant + high-precision matmul, Ascend rollout path)
 - Dense models and MoE models
-- FSDP and Megatron training backends
+- FSDP and Megatron training backends for NVFP4; FSDP for MXFP8
 - Full quantization and FFN-only quantization strategies
 - Verified on Qwen3-8B-Base and Qwen3-30B-A3B-Base
 

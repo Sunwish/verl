@@ -84,13 +84,25 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
     return True
 
 
+def _is_verl_qat_module(module: nn.Module) -> bool:
+    return bool(getattr(module, "_is_verl_qat_linear", False))
+
+
+def _get_qat_linear_cls(mode: str):
+    from verl.utils.qat.linear import QATMode, QATLinear
+    from verl.utils.qat.mxfp8_linear import MXFP8QATLinear
+
+    qat_mode = QATMode(mode.lower())
+    if qat_mode == QATMode.MXFP8:
+        return qat_mode, MXFP8QATLinear
+    return qat_mode, QATLinear
+
+
 def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
 ) -> nn.Module:
-    """Apply QAT to a model by replacing nn.Linear with QATLinear."""
-    from verl.utils.qat.linear import QATLinear, QATMode
-
+    """Apply QAT to a model by replacing nn.Linear with a mode-specific QAT layer."""
     if not isinstance(config, QATConfig):
         config = QATConfig(**config)
 
@@ -98,7 +110,9 @@ def apply_qat(
         logger.info("QAT is disabled, returning original model")
         return model
 
-    mode = QATMode(config.mode.lower())
+    mode, qat_linear_cls = _get_qat_linear_cls(config.mode)
+    if mode.value == "mxfp8" and config.group_size != 32:
+        raise ValueError(f"MXFP8 QAT requires group_size=32, got: {config.group_size}")
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
 
     modules_to_replace = []
@@ -110,10 +124,10 @@ def apply_qat(
 
     converted_count = 0
     for name, module in modules_to_replace:
-        if isinstance(module, QATLinear):
+        if _is_verl_qat_module(module):
             continue
 
-        fake_quant_module = QATLinear.from_linear(
+        fake_quant_module = qat_linear_cls.from_linear(
             module,
             mode=mode,
             group_size=config.group_size,
@@ -147,9 +161,11 @@ def setup_fusion_siblings(model: nn.Module):
     """Setup fusion siblings for QKV and GateUp layers."""
     import weakref
 
-    from verl.utils.qat.linear import QATLinear
-
-    qat_modules = {name: m for name, m in model.named_modules() if isinstance(m, QATLinear)}
+    qat_modules = {
+        name: m
+        for name, m in model.named_modules()
+        if _is_verl_qat_module(m) and bool(getattr(m, "supports_qat_fusion", False))
+    }
 
     counts = {}
     for group_name, suffixes in FUSION_PATTERNS.items():
@@ -182,15 +198,16 @@ def enable_qat_fuse(model: nn.Module):
 
 
 def invalidate_all_scales(model: nn.Module):
-    """Clear all cached weight scales after optimizer.step()."""
-    from verl.utils.qat.linear import QATLinear
-
+    """Clear all cached quantization state after optimizer.step()."""
     count = 0
     for module in model.modules():
-        if isinstance(module, QATLinear):
-            module._weight_blockwise_scale = None
-            module._weight_global_scale = None
-            module._cached_weight_amax = None
+        if _is_verl_qat_module(module):
+            if hasattr(module, "invalidate_quant_state"):
+                module.invalidate_quant_state()
+            else:
+                module._weight_blockwise_scale = None
+                module._weight_global_scale = None
+                module._cached_weight_amax = None
             count += 1
 
-    logger.debug(f"[QAT Fuse] Invalidated scales for {count} QATLinear layers")
+    logger.debug(f"[QAT Fuse] Invalidated scales for {count} QAT layers")

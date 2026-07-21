@@ -872,6 +872,10 @@ class vLLMHttpServer:
             qat_config = QATConfig(**qat_config_dict)
             quantization_config_dict = load_quantization_config(qat_config)
             quant_method = quantization_config_dict.get("quant_method", None)
+            is_mxfp8_qat = qat_config.mode == "mxfp8"
+            has_mxfp8_entry = any(
+                isinstance(value, str) and "MXFP8" in value.upper() for value in quantization_config_dict.values()
+            )
 
             if quant_method == "modelopt":
                 from verl.utils.modelopt import apply_modelopt_nvfp4_patches
@@ -883,6 +887,10 @@ class vLLMHttpServer:
 
                 apply_qat_patches()
                 quantization = "compressed-tensors"
+            elif is_mxfp8_qat and (quant_method == "ascend" or has_mxfp8_entry):
+                quantization = "ascend"
+                apply_vllm_fp8_patches()
+                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
             else:
                 raise ValueError(f"Unsupported quant_method: {quant_method}")
 

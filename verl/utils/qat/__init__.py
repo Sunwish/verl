@@ -15,11 +15,12 @@
 """
 QAT (Quantization-Aware Training) module for verl.
 
-Supports NVFP4 (W4A4 and W4A16) quantization modes for FSDP training.
+Supports NVFP4 (W4A4 and W4A16) and MXFP8 quantization modes for FSDP training.
 
 Module Structure:
 - core.py: QATConfig, apply_qat, enable_qat_fuse (training setup)
-- linear.py: QATLinear layer with Triton kernels for fake quantization
+- linear.py: NVFP4 QATLinear layer with Triton kernels for fake quantization
+- mxfp8_linear.py: MXFP8 fake-quant linear layer for high-precision matmul training
 - quantizer.py: QATQuantizer for true quantization + scale computation utilities
 - vllm_patch.py: Patches for vLLM dynamic weight loading
 

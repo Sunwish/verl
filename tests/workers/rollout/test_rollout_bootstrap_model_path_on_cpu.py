@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from omegaconf import OmegaConf
+from unittest.mock import patch
 
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.utils import get_rollout_bootstrap_model_path
@@ -219,6 +220,27 @@ def test_sglang_server_adapter_uses_bootstrap_model_path(monkeypatch):
     asyncio.run(sglang_rollout.ServerAdapter._init_server_adapter(adapter))
 
     assert captured["kwargs"]["model_path"] == "/tmp/quantized-model"
+
+
+def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch):
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout import vllm_async_server as vllm_server
+
+    server = object.__new__(vllm_server.vLLMHttpServer)
+    server.config = SimpleNamespace(quantization=None, quantization_config_file=None, qat={"enable": True, "mode": "mxfp8"})
+    server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
+
+    quant_config = {"quant_method": "ascend", "layer.weight": "W8A8_MXFP8"}
+    monkeypatch.setattr(vllm_server, "is_torch_npu_available", lambda check_device=False: False)
+
+    with patch("verl.utils.qat.load_quantization_config", return_value=quant_config), patch(
+        "verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches"
+    ) as mock_apply_patches:
+        quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
+
+    assert quantization == "ascend"
+    assert hf_overrides["quantization_config"] == quant_config
+    mock_apply_patches.assert_called_once()
 
 
 def test_trtllm_launch_server_uses_bootstrap_model_path(monkeypatch):

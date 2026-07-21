@@ -130,6 +130,8 @@ class QATQuantizer:
         param_dtype: Optional[torch.dtype] = None,
     ):
         self.mode = mode.lower()
+        if self.mode == "mxfp8":
+            raise ValueError("QATQuantizer only supports NVFP4 modes; MXFP8 uses rollout-side online quantization")
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
         self.group_size = group_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]

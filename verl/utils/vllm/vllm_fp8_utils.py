@@ -131,6 +131,18 @@ def is_mxfp8_vllm_ascend(quant_config):
         # vllm_ascend not installed, so this can't be an Ascend MXFP8 config
         return False
 
+
+def quantize_mxfp8_weight_ascend(weight: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch_npu
+
+    weight_q, weight_scale = torch_npu.npu_dynamic_mx_quant(
+        weight.to(dtype),
+        axis=-1,
+        dst_type=torch_npu.float8_e4m3fn,
+    )
+    weight_scale = weight_scale.flatten(-2, -1)
+    return weight_q, weight_scale.squeeze(-1)
+
 def restore_mxfp8_weights_for_loading(model):
     for name, module in model.named_modules():
         if (
@@ -183,8 +195,6 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     fp8_state.seen_params.clear()
     fp8_state.fp8_param_names.clear()
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
-    if is_mxfp8_npu:
-        import torch_npu
     # vLLM v0.11-v0.12 renamed weight_scale_inv → weight_scale in process_weights_after_loading,
     # so load_weights expects "_scale" suffix. v0.14+ keeps weight_scale_inv, so expects "_scale_inv".
     _use_scale_not_scale_inv = version.parse("0.11.0") <= version.parse(vllm.__version__) < version.parse("0.14.0")
@@ -198,12 +208,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         if torch.distributed.get_rank() == 0:
             logger.debug(f"Quantizing to FP8 blockwise: {k}")
         if is_mxfp8_npu:
-            param_lp, param_scale = torch_npu.npu_dynamic_mx_quant(
-                v.to(dtype),
-                axis=-1,
-                dst_type=torch_npu.float8_e4m3fn,
-            )
-            param_scale = param_scale.flatten(-2, -1)
+            param_lp, param_scale = quantize_mxfp8_weight_ascend(v, dtype)
         else:
             param_lp, param_scale = scaled_fp8_blockwise(
                 v.to(dtype),

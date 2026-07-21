@@ -190,11 +190,14 @@ class QATMode(str, Enum):
 
     W4A4 = "w4a4"  # Weight 4-bit, Activation 4-bit (dynamic)
     W4A16 = "w4a16"  # Weight 4-bit, Activation 16-bit (weight only)
+    MXFP8 = "mxfp8"  # Weight MXFP8 fake quantization, activation 16-bit
 
 
 class QATLinear(nn.Linear):
     """QAT FakeQuantized Linear layer with FSDP compatibility."""
 
+    supports_qat_fusion = True
+    _is_verl_qat_linear = True
     _UNINITIALIZED_SCALE = -1.0
 
     def __init__(
@@ -362,6 +365,11 @@ class QATLinear(nn.Linear):
         global_amax = (FP4_E2M1_MAX * FP8_E4M3_MAX) / self.input_global_scale.to(x.device)
         result = STEFP4QuantTriton.apply(x_2d, global_amax, self.group_size)
         return result.view(original_shape)
+
+    def invalidate_quant_state(self):
+        self._weight_blockwise_scale = None
+        self._weight_global_scale = None
+        self._cached_weight_amax = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with fake quantization."""
