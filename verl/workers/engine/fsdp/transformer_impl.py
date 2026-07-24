@@ -500,6 +500,7 @@ class FSDPEngine(BaseEngine):
                 "group_size": self._qat_config.group_size,
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
+                "mxfp8_quant_backend": self._qat_config.mxfp8_quant_backend,
             },
         )
         if self._qat_config.mode in {"w4a4", "w4a16"}:

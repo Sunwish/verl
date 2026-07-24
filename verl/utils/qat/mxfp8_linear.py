@@ -27,13 +27,23 @@ import torch.nn.functional as F
 
 from verl.utils.qat.linear import QATMode
 
-__all__ = ["MXFP8QATLinear", "quantize_mxfp8_tensor"]
+__all__ = ["MXFP8QATLinear", "normalize_mxfp8_quant_backend", "quantize_mxfp8_tensor"]
 
 _MXFP8_BLOCK_SIZE = 32
 _MXFP8_EMAX = 8
 _MXFP8_SCALE_EMAX = 127
 _MXFP8_MIN_PRIVATE_EXP = -6
 _MXFP8_MANTISSA_SCALE = 8.0
+_MXFP8_QUANT_BACKENDS = {"npu", "torch"}
+
+
+def normalize_mxfp8_quant_backend(backend: str) -> str:
+    backend = backend.lower()
+    if backend not in _MXFP8_QUANT_BACKENDS:
+        raise ValueError(
+            f"Unsupported MXFP8 quant backend: {backend}. Supported backends: {sorted(_MXFP8_QUANT_BACKENDS)}"
+        )
+    return backend
 
 
 def _dequantize_mxfp8(weight_q: torch.Tensor, weight_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -89,13 +99,24 @@ def _quantize_mxfp8_torch(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return quant, tensor_scale
 
 
-def quantize_mxfp8_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_mxfp8_npu(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch_npu
+
+    tensor_q, tensor_scale = torch_npu.npu_dynamic_mx_quant(
+        tensor,
+        axis=-1,
+        dst_type=torch_npu.float8_e4m3fn,
+    )
+    tensor_scale = tensor_scale.flatten(-2, -1)
+    return tensor_q, tensor_scale.squeeze(-1)
+
+
+def quantize_mxfp8_tensor(tensor: torch.Tensor, quant_backend: str = "torch") -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor along its last dimension using MXFP8 blocks."""
     _check_mxfp8_2d_tensor(tensor)
-    if tensor.device.type == "npu":
-        from verl.utils.vllm.vllm_fp8_utils import quantize_mxfp8_weight_ascend
-
-        return quantize_mxfp8_weight_ascend(tensor, tensor.dtype)
+    quant_backend = normalize_mxfp8_quant_backend(quant_backend)
+    if quant_backend == "npu":
+        return _quantize_mxfp8_npu(tensor)
 
     return _quantize_mxfp8_torch(tensor)
 
@@ -114,6 +135,7 @@ class MXFP8QATLinear(nn.Linear):
         mode: QATMode = QATMode.W8A16_MXFP8,
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
+        mxfp8_quant_backend: str = "npu",
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -127,6 +149,7 @@ class MXFP8QATLinear(nn.Linear):
         self.mode = mode
         self.group_size = group_size
         self.activation_observer = activation_observer
+        self.mxfp8_quant_backend = normalize_mxfp8_quant_backend(mxfp8_quant_backend)
         self.fake_quant_enabled = True
         self._last_weight_scale: Optional[torch.Tensor] = None
         self._last_input_scale: Optional[torch.Tensor] = None
@@ -138,6 +161,7 @@ class MXFP8QATLinear(nn.Linear):
         mode: QATMode = QATMode.W8A16_MXFP8,
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
+        mxfp8_quant_backend: str = "npu",
     ) -> "MXFP8QATLinear":
         has_bias = linear.bias is not None
         new_linear = cls(
@@ -147,6 +171,7 @@ class MXFP8QATLinear(nn.Linear):
             mode=mode,
             group_size=group_size,
             activation_observer=activation_observer,
+            mxfp8_quant_backend=mxfp8_quant_backend,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
         )
@@ -163,7 +188,7 @@ class MXFP8QATLinear(nn.Linear):
         self._last_input_scale = None
 
     def _fake_quantize_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        weight_q, weight_scale = quantize_mxfp8_tensor(weight)
+        weight_q, weight_scale = quantize_mxfp8_tensor(weight, quant_backend=self.mxfp8_quant_backend)
         self._last_weight_scale = weight_scale.detach()
         weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype)
         return weight + (weight_fq - weight).detach()
@@ -171,7 +196,7 @@ class MXFP8QATLinear(nn.Linear):
     def _fake_quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
-        x_q, x_scale = quantize_mxfp8_tensor(x_2d)
+        x_q, x_scale = quantize_mxfp8_tensor(x_2d, quant_backend=self.mxfp8_quant_backend)
         self._last_input_scale = x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1])
         x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
         return x + (x_fq - x).detach()
@@ -188,5 +213,6 @@ class MXFP8QATLinear(nn.Linear):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, mode={self.mode.value}, "
-            f"group_size={self.group_size}, fake_quant_enabled={self.fake_quant_enabled}"
+            f"group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
+            f"fake_quant_enabled={self.fake_quant_enabled}"
         )

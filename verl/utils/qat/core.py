@@ -36,6 +36,7 @@ class QATConfig(BaseConfig):
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
+    mxfp8_quant_backend: str = "npu"
     quantization_config_path: Optional[str] = None
 
 
@@ -127,12 +128,15 @@ def apply_qat(
         if _is_verl_qat_module(module):
             continue
 
-        fake_quant_module = qat_linear_cls.from_linear(
-            module,
-            mode=mode,
-            group_size=config.group_size,
-            activation_observer=config.activation_observer,
-        )
+        from_linear_kwargs = {
+            "mode": mode,
+            "group_size": config.group_size,
+            "activation_observer": config.activation_observer,
+        }
+        if mode.value in {"w8a16_mxfp8", "w8a8_mxfp8"}:
+            from_linear_kwargs["mxfp8_quant_backend"] = config.mxfp8_quant_backend
+
+        fake_quant_module = qat_linear_cls.from_linear(module, **from_linear_kwargs)
 
         _set_module(model, name, fake_quant_module)
         converted_count += 1

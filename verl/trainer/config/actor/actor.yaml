@@ -317,6 +317,10 @@ qat:
   # Activation observer for W4A4 mode: "static_minmax", "memoryless_minmax", or "minmax"
   activation_observer: "static_minmax"
 
+  # MXFP8 quantization backend: "npu" uses torch_npu, and "torch" uses verl's torch implementation.
+  # Future optimized variants can be added here.
+  mxfp8_quant_backend: "npu"
+
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
 

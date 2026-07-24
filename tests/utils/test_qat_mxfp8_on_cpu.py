@@ -34,10 +34,11 @@ class _TinyModel(nn.Module):
 def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode):
     model = _TinyModel()
 
-    apply_qat(model, QATConfig(enable=True, mode=mode, group_size=32))
+    apply_qat(model, QATConfig(enable=True, mode=mode, group_size=32, mxfp8_quant_backend="torch"))
 
     assert isinstance(model.proj, MXFP8QATLinear)
     assert model.proj.mode == QATMode(mode)
+    assert model.proj.mxfp8_quant_backend == "torch"
     assert isinstance(model.lm_head, nn.Linear)
 
 
@@ -56,8 +57,15 @@ def test_apply_qat_mxfp8_requires_group_size_32():
         apply_qat(model, QATConfig(enable=True, mode="w8a8_mxfp8", group_size=16))
 
 
+def test_mxfp8_qat_linear_rejects_unknown_quant_backend():
+    with pytest.raises(ValueError, match="Unsupported MXFP8 quant backend"):
+        MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="rotate")
+
+
 def test_w8a16_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
-    linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A16_MXFP8, dtype=torch.bfloat16)
+    linear = MXFP8QATLinear(
+        32, 8, bias=True, mode=QATMode.W8A16_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
+    )
     with torch.no_grad():
         linear.weight.copy_(torch.linspace(-3.25, 3.25, steps=8 * 32, dtype=torch.bfloat16).view(8, 32))
         linear.bias.zero_()
@@ -79,8 +87,12 @@ def test_w8a16_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
 
 
 def test_w8a8_mxfp8_qat_linear_fake_quantizes_activation():
-    linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A8_MXFP8, dtype=torch.bfloat16)
-    w8a16_linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A16_MXFP8, dtype=torch.bfloat16)
+    linear = MXFP8QATLinear(
+        32, 8, bias=True, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
+    )
+    w8a16_linear = MXFP8QATLinear(
+        32, 8, bias=True, mode=QATMode.W8A16_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
+    )
     with torch.no_grad():
         weight = torch.linspace(-2.0, 2.0, steps=8 * 32, dtype=torch.bfloat16).view(8, 32)
         bias = torch.linspace(-0.25, 0.25, steps=8, dtype=torch.bfloat16)
@@ -102,7 +114,9 @@ def test_w8a8_mxfp8_qat_linear_fake_quantizes_activation():
 
 
 def test_w8a8_mxfp8_qat_linear_supports_3d_activation():
-    linear = MXFP8QATLinear(32, 8, bias=False, mode=QATMode.W8A8_MXFP8, dtype=torch.bfloat16)
+    linear = MXFP8QATLinear(
+        32, 8, bias=False, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
+    )
     with torch.no_grad():
         linear.weight.copy_(torch.linspace(-2.0, 2.0, steps=8 * 32, dtype=torch.bfloat16).view(8, 32))
 
@@ -119,7 +133,7 @@ def test_w8a8_mxfp8_qat_linear_supports_3d_activation():
 def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     model = nn.Module()
     model.nvfp4 = QATLinear(32, 8, mode=QATMode.W4A16, group_size=16)
-    model.mxfp8 = MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8)
+    model.mxfp8 = MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch")
 
     model.nvfp4._weight_blockwise_scale = torch.ones(1)
     model.nvfp4._weight_global_scale = torch.ones(1)

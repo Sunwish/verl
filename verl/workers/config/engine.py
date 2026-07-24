@@ -135,6 +135,7 @@ class QATEngineConfig(BaseConfig):
         group_size (int): Group size for blockwise quantization, default 16
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
+        mxfp8_quant_backend (str): MXFP8 quantization backend, "npu" or "torch"
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
     """
 
@@ -143,6 +144,7 @@ class QATEngineConfig(BaseConfig):
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
+    mxfp8_quant_backend: str = "npu"
     quantization_config_path: Optional[str] = None
 
 

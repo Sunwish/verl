@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
 import types
 from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from omegaconf import OmegaConf
-from unittest.mock import patch
 
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.utils import get_rollout_bootstrap_model_path
@@ -229,7 +229,9 @@ def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
 
     server = object.__new__(vllm_server.vLLMHttpServer)
     server.config = SimpleNamespace(
-        quantization=None, quantization_config_file=None, qat={"enable": True, "mode": qat_mode}
+        quantization=None,
+        quantization_config_file=None,
+        qat={"enable": True, "mode": qat_mode, "mxfp8_quant_backend": "torch"},
     )
     server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
 
@@ -243,6 +245,7 @@ def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
 
     assert quantization == "ascend"
     assert hf_overrides["quantization_config"] == quant_config
+    assert os.environ[vllm_server.MXFP8_QUANT_BACKEND_ENV] == "torch"
     mock_apply_patches.assert_called_once()
 
 
