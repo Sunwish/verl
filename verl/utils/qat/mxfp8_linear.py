@@ -30,6 +30,10 @@ from verl.utils.qat.linear import QATMode
 __all__ = ["MXFP8QATLinear", "quantize_mxfp8_tensor"]
 
 _MXFP8_BLOCK_SIZE = 32
+_MXFP8_EMAX = 8
+_MXFP8_SCALE_EMAX = 127
+_MXFP8_MIN_PRIVATE_EXP = -6
+_MXFP8_MANTISSA_SCALE = 8.0
 
 
 def _dequantize_mxfp8(weight_q: torch.Tensor, weight_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -42,7 +46,9 @@ def _dequantize_mxfp8(weight_q: torch.Tensor, weight_scale: torch.Tensor, dtype:
     return dequant.reshape_as(weight_q).to(dtype)
 
 
-def _check_mxfp8_last_dim(tensor: torch.Tensor):
+def _check_mxfp8_2d_tensor(tensor: torch.Tensor):
+    if tensor.dim() != 2:
+        raise ValueError(f"MXFP8 quantization only supports 2D tensors, got shape={tuple(tensor.shape)}")
     if tensor.shape[-1] % _MXFP8_BLOCK_SIZE != 0:
         raise ValueError(
             f"MXFP8 quantization requires the last dimension to be divisible by {_MXFP8_BLOCK_SIZE}, "
@@ -51,21 +57,41 @@ def _check_mxfp8_last_dim(tensor: torch.Tensor):
 
 
 def _quantize_mxfp8_torch(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    _check_mxfp8_last_dim(tensor)
+    _check_mxfp8_2d_tensor(tensor)
     tensor_fp32 = tensor.to(torch.float32)
+    original_shape = tensor_fp32.shape
+    max_norm = torch.finfo(torch.float8_e4m3fn).max
     num_blocks = tensor.shape[-1] // _MXFP8_BLOCK_SIZE
-    blocked = tensor_fp32.reshape(*tensor.shape[:-1], num_blocks, _MXFP8_BLOCK_SIZE)
-    amax = blocked.abs().amax(dim=-1).clamp(min=torch.finfo(torch.float32).tiny)
-    scale_biased = (torch.floor(torch.log2(amax)) + 127.0).clamp(0, 254)
-    tensor_scale = scale_biased.to(torch.uint8)
-    descale = torch.exp2(scale_biased - 127.0)
-    quant = (blocked / descale.unsqueeze(-1)).reshape_as(tensor_fp32).to(torch.float8_e4m3fn)
+    blocked = tensor_fp32.reshape(tensor.shape[0], num_blocks, _MXFP8_BLOCK_SIZE)
+
+    amax = blocked.abs().amax(dim=-1)
+    amax_safe = torch.where(amax == 0, torch.full_like(amax, torch.finfo(torch.float32).tiny), amax)
+    shared_exp = torch.floor(torch.log2(amax_safe)) - _MXFP8_EMAX
+    shared_exp = torch.where(shared_exp > _MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
+
+    scale_factor = torch.pow(2.0, shared_exp.unsqueeze(-1))
+    normalized = blocked / scale_factor
+    abs_norm = normalized.abs()
+    private_exp = torch.floor(torch.log2(abs_norm + (abs_norm == 0).float()))
+    private_exp = private_exp.clamp(min=_MXFP8_MIN_PRIVATE_EXP)
+
+    private_scale = torch.pow(2.0, private_exp)
+    scaled = normalized / private_scale * _MXFP8_MANTISSA_SCALE
+    quantized = torch.sign(scaled) * torch.floor(torch.abs(scaled) + 0.5)
+    quantized = quantized / _MXFP8_MANTISSA_SCALE * private_scale
+    quantized = torch.clamp(quantized, min=-max_norm, max=max_norm)
+    quantized = torch.where(torch.isinf(normalized), normalized, quantized)
+    quantized = torch.where(torch.isnan(normalized), normalized, quantized)
+
+    quant = quantized.reshape(original_shape).to(torch.float8_e4m3fn)
+    shared_exp_fixed = torch.nan_to_num(shared_exp, nan=-127.0)
+    tensor_scale = torch.clamp(shared_exp_fixed + 127.0, 0, 255).round().to(torch.uint8)
     return quant, tensor_scale
 
 
 def quantize_mxfp8_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor along its last dimension using MXFP8 blocks."""
-    _check_mxfp8_last_dim(tensor)
+    _check_mxfp8_2d_tensor(tensor)
     if tensor.device.type == "npu":
         from verl.utils.vllm.vllm_fp8_utils import quantize_mxfp8_weight_ascend
 
@@ -143,9 +169,11 @@ class MXFP8QATLinear(nn.Linear):
         return weight + (weight_fq - weight).detach()
 
     def _fake_quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        x_q, x_scale = quantize_mxfp8_tensor(x)
-        self._last_input_scale = x_scale.detach()
-        x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype)
+        original_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1])
+        x_q, x_scale = quantize_mxfp8_tensor(x_2d)
+        self._last_input_scale = x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1])
+        x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
         return x + (x_fq - x).detach()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
