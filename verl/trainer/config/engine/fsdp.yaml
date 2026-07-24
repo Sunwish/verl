@@ -72,9 +72,10 @@ qat:
   enable: false
 
   # Quantization mode: "w4a16" (weight-only). "w4a4" is experimental and not recommended.
+  # MXFP8 modes: "w8a16_mxfp8" (weight-only), "w8a8_mxfp8" (weight + activation).
   mode: "w4a16"
 
-  # Quantization group size (NVFP4 requires 16)
+  # Quantization group size (NVFP4 requires 16, MXFP8 requires 32)
   group_size: 16
 
   # Patterns to ignore (e.g., lm_head, embed_tokens)

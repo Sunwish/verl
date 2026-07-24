@@ -30,12 +30,14 @@ class _TinyModel(nn.Module):
         self.lm_head = nn.Linear(32, 16, bias=False)
 
 
-def test_apply_qat_mxfp8_replaces_eligible_linear_layers():
+@pytest.mark.parametrize("mode", ["w8a16_mxfp8", "w8a8_mxfp8"])
+def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode):
     model = _TinyModel()
 
-    apply_qat(model, QATConfig(enable=True, mode="mxfp8", group_size=32))
+    apply_qat(model, QATConfig(enable=True, mode=mode, group_size=32))
 
     assert isinstance(model.proj, MXFP8QATLinear)
+    assert model.proj.mode == QATMode(mode)
     assert isinstance(model.lm_head, nn.Linear)
 
 
@@ -51,11 +53,11 @@ def test_apply_qat_mxfp8_requires_group_size_32():
     model = _TinyModel()
 
     with pytest.raises(ValueError, match="group_size=32"):
-        apply_qat(model, QATConfig(enable=True, mode="mxfp8", group_size=16))
+        apply_qat(model, QATConfig(enable=True, mode="w8a8_mxfp8", group_size=16))
 
 
-def test_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
-    linear = MXFP8QATLinear(32, 8, bias=True, dtype=torch.bfloat16)
+def test_w8a16_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
+    linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A16_MXFP8, dtype=torch.bfloat16)
     with torch.no_grad():
         linear.weight.copy_(torch.linspace(-3.25, 3.25, steps=8 * 32, dtype=torch.bfloat16).view(8, 32))
         linear.bias.zero_()
@@ -72,18 +74,43 @@ def test_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
     assert enabled_out.shape == expected.shape
     assert enabled_out.dtype == expected.dtype
     assert linear._last_weight_scale is not None
+    assert linear._last_input_scale is None
     assert not torch.allclose(enabled_out, expected)
+
+
+def test_w8a8_mxfp8_qat_linear_fake_quantizes_activation():
+    linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A8_MXFP8, dtype=torch.bfloat16)
+    w8a16_linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A16_MXFP8, dtype=torch.bfloat16)
+    with torch.no_grad():
+        weight = torch.linspace(-2.0, 2.0, steps=8 * 32, dtype=torch.bfloat16).view(8, 32)
+        bias = torch.linspace(-0.25, 0.25, steps=8, dtype=torch.bfloat16)
+        linear.weight.copy_(weight)
+        linear.bias.copy_(bias)
+        w8a16_linear.weight.copy_(weight)
+        w8a16_linear.bias.copy_(bias)
+
+    x = torch.linspace(-1.25, 1.75, steps=64, dtype=torch.bfloat16).view(2, 32)
+
+    w8a8_out = linear(x)
+    w8a16_out = w8a16_linear(x)
+
+    assert w8a8_out.shape == w8a16_out.shape
+    assert w8a8_out.dtype == w8a16_out.dtype
+    assert linear._last_weight_scale is not None
+    assert linear._last_input_scale is not None
+    assert not torch.allclose(w8a8_out, w8a16_out)
 
 
 def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     model = nn.Module()
     model.nvfp4 = QATLinear(32, 8, mode=QATMode.W4A16, group_size=16)
-    model.mxfp8 = MXFP8QATLinear(32, 8)
+    model.mxfp8 = MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8)
 
     model.nvfp4._weight_blockwise_scale = torch.ones(1)
     model.nvfp4._weight_global_scale = torch.ones(1)
     model.nvfp4._cached_weight_amax = torch.ones(1)
     model.mxfp8._last_weight_scale = torch.ones((8, 1), dtype=torch.uint8)
+    model.mxfp8._last_input_scale = torch.ones((1, 1), dtype=torch.uint8)
 
     invalidate_all_scales(model)
 
@@ -91,3 +118,4 @@ def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     assert model.nvfp4._weight_global_scale is None
     assert model.nvfp4._cached_weight_amax is None
     assert model.mxfp8._last_weight_scale is None
+    assert model.mxfp8._last_input_scale is None

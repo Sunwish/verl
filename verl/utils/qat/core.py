@@ -89,11 +89,11 @@ def _is_verl_qat_module(module: nn.Module) -> bool:
 
 
 def _get_qat_linear_cls(mode: str):
-    from verl.utils.qat.linear import QATMode, QATLinear
+    from verl.utils.qat.linear import QATLinear, QATMode
     from verl.utils.qat.mxfp8_linear import MXFP8QATLinear
 
     qat_mode = QATMode(mode.lower())
-    if qat_mode == QATMode.MXFP8:
+    if qat_mode in {QATMode.W8A16_MXFP8, QATMode.W8A8_MXFP8}:
         return qat_mode, MXFP8QATLinear
     return qat_mode, QATLinear
 
@@ -111,7 +111,7 @@ def apply_qat(
         return model
 
     mode, qat_linear_cls = _get_qat_linear_cls(config.mode)
-    if mode.value == "mxfp8" and config.group_size != 32:
+    if mode.value in {"w8a16_mxfp8", "w8a8_mxfp8"} and config.group_size != 32:
         raise ValueError(f"MXFP8 QAT requires group_size=32, got: {config.group_size}")
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
 
