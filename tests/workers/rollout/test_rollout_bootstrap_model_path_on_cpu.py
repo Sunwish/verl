@@ -222,12 +222,15 @@ def test_sglang_server_adapter_uses_bootstrap_model_path(monkeypatch):
     assert captured["kwargs"]["model_path"] == "/tmp/quantized-model"
 
 
-def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch):
+@pytest.mark.parametrize("qat_mode", ["w8a16_mxfp8", "w8a8_mxfp8"])
+def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
     pytest.importorskip("vllm")
     from verl.workers.rollout.vllm_rollout import vllm_async_server as vllm_server
 
     server = object.__new__(vllm_server.vLLMHttpServer)
-    server.config = SimpleNamespace(quantization=None, quantization_config_file=None, qat={"enable": True, "mode": "mxfp8"})
+    server.config = SimpleNamespace(
+        quantization=None, quantization_config_file=None, qat={"enable": True, "mode": qat_mode}
+    )
     server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
 
     quant_config = {"quant_method": "ascend", "layer.weight": "W8A8_MXFP8"}

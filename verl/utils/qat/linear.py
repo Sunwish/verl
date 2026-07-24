@@ -190,7 +190,8 @@ class QATMode(str, Enum):
 
     W4A4 = "w4a4"  # Weight 4-bit, Activation 4-bit (dynamic)
     W4A16 = "w4a16"  # Weight 4-bit, Activation 16-bit (weight only)
-    MXFP8 = "mxfp8"  # Weight MXFP8 fake quantization, activation 16-bit
+    W8A16_MXFP8 = "w8a16_mxfp8"  # Weight MXFP8 fake quantization, activation 16-bit
+    W8A8_MXFP8 = "w8a8_mxfp8"  # Weight and activation MXFP8 fake quantization
 
 
 class QATLinear(nn.Linear):
