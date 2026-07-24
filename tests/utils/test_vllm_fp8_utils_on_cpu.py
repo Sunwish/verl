@@ -21,7 +21,7 @@ import torch
 
 pytest.importorskip("vllm")
 
-from verl.utils.vllm.vllm_fp8_utils import is_mxfp8_vllm_ascend, quant_weights
+from verl.utils.vllm.vllm_fp8_utils import MXFP8_QUANT_BACKEND_ENV, is_mxfp8_vllm_ascend, quant_weights
 
 
 class _FakeAscendModelSlimConfig:
@@ -63,6 +63,25 @@ def test_quant_weights_mxfp8_emits_scale_suffix(monkeypatch):
         ),
     )
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    model = object()
+    weights = [("layer.weight", torch.randn(4, 32, dtype=torch.bfloat16))]
+
+    with patch("verl.utils.vllm.vllm_fp8_utils.is_fp8_weight", return_value=True), patch(
+        "torch.distributed.get_rank", return_value=0
+    ):
+        outputs = list(quant_weights(weights, model, quant_config, dtype=torch.bfloat16))
+
+    assert outputs[0][0] == "layer.weight"
+    assert outputs[1][0] == "layer.weight_scale"
+    assert outputs[1][1].shape == (4,)
+    assert outputs[1][1].dtype == torch.uint8
+
+
+def test_quant_weights_mxfp8_torch_backend_emits_scale_suffix(monkeypatch):
+    _install_fake_vllm_ascend(monkeypatch)
+    monkeypatch.setenv(MXFP8_QUANT_BACKEND_ENV, "torch")
+    quant_config = _FakeAscendModelSlimConfig({"quant_method": "ascend"})
 
     model = object()
     weights = [("layer.weight", torch.randn(4, 32, dtype=torch.bfloat16))]
