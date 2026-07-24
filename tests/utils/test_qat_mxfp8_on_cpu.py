@@ -101,6 +101,21 @@ def test_w8a8_mxfp8_qat_linear_fake_quantizes_activation():
     assert not torch.allclose(w8a8_out, w8a16_out)
 
 
+def test_w8a8_mxfp8_qat_linear_supports_3d_activation():
+    linear = MXFP8QATLinear(32, 8, bias=False, mode=QATMode.W8A8_MXFP8, dtype=torch.bfloat16)
+    with torch.no_grad():
+        linear.weight.copy_(torch.linspace(-2.0, 2.0, steps=8 * 32, dtype=torch.bfloat16).view(8, 32))
+
+    x = torch.linspace(-1.25, 1.75, steps=2 * 3 * 32, dtype=torch.bfloat16).view(2, 3, 32)
+
+    out = linear(x)
+
+    assert out.shape == (2, 3, 8)
+    assert out.dtype == x.dtype
+    assert linear._last_input_scale is not None
+    assert linear._last_input_scale.shape == (2, 3, 1)
+
+
 def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     model = nn.Module()
     model.nvfp4 = QATLinear(32, 8, mode=QATMode.W4A16, group_size=16)
