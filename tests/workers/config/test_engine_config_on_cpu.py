@@ -14,7 +14,7 @@
 
 import pytest
 
-from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig
+from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig, QATEngineConfig
 
 
 class TestMcoreEngineConfig:
@@ -65,3 +65,19 @@ class TestFSDPEngineConfigCPU:
         test_policy = {"layer_class": "TransformerBlock"}
         config = FSDPEngineConfig(wrap_policy=test_policy)
         assert config.wrap_policy == test_policy
+
+
+class TestQATEngineConfig:
+    def test_mxfp8_rounding_mode_defaults_to_round(self):
+        config = QATEngineConfig()
+        assert config.mxfp8_rounding_mode == "round"
+
+    def test_rejects_stochastic_rounding_with_npu_backend(self):
+        with pytest.raises(ValueError, match="mxfp8_quant_backend='torch'"):
+            QATEngineConfig(
+                enable=True,
+                mode="w8a8_mxfp8",
+                group_size=32,
+                mxfp8_quant_backend="npu",
+                mxfp8_rounding_mode="hash",
+            )

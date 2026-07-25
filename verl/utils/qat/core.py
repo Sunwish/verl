@@ -27,6 +27,7 @@ from verl.base_config import BaseConfig
 logger = logging.getLogger(__name__)
 
 _MXFP8_MODES = {"w8a16_mxfp8", "w8a8_mxfp8"}
+_MXFP8_ROUNDING_MODES = {"round", "random", "hash"}
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 
 
@@ -40,11 +41,25 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     mxfp8_quant_backend: str = "npu"
+    mxfp8_rounding_mode: str = "round"
     mxfp8_probe_quant_error: bool = False
     mxfp8_probe_quant_error_output_path: Optional[str] = None
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
+        mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
+        if mxfp8_rounding_mode not in _MXFP8_ROUNDING_MODES:
+            raise ValueError(
+                f"Unsupported MXFP8 rounding mode: {self.mxfp8_rounding_mode}. "
+                f"Supported modes: {sorted(_MXFP8_ROUNDING_MODES)}"
+            )
+        if (
+            self.enable
+            and self.mode.lower() in _MXFP8_MODES
+            and mxfp8_rounding_mode != "round"
+            and self.mxfp8_quant_backend.lower() != "torch"
+        ):
+            raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
         if self.mxfp8_probe_quant_error:
             if not self.enable:
                 raise ValueError("mxfp8_probe_quant_error requires QAT enable=True")
@@ -135,7 +150,10 @@ def apply_qat(
     mode, qat_linear_cls = _get_qat_linear_cls(config.mode)
     if mode.value in _MXFP8_MODES and config.group_size != 32:
         raise ValueError(f"MXFP8 QAT requires group_size=32, got: {config.group_size}")
-    logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
+    logger.info(
+        f"Applying QAT with mode={mode.value}, group_size={config.group_size}, "
+        f"mxfp8_rounding_mode={config.mxfp8_rounding_mode}"
+    )
     if mode.value in _MXFP8_MODES:
         from verl.utils.qat.mxfp8_linear import configure_mxfp8_probe
 
@@ -170,6 +188,7 @@ def apply_qat(
         if mode.value in _MXFP8_MODES:
             layer_type, layer_index = _infer_mxfp8_layer_metadata(name)
             from_linear_kwargs["mxfp8_quant_backend"] = config.mxfp8_quant_backend
+            from_linear_kwargs["mxfp8_rounding_mode"] = config.mxfp8_rounding_mode
             from_linear_kwargs["mxfp8_probe_quant_error"] = config.mxfp8_probe_quant_error
             from_linear_kwargs["layer_name"] = name
             from_linear_kwargs["layer_type"] = layer_type

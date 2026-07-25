@@ -34,6 +34,7 @@ from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 logger = logging.getLogger(__name__)
 
 MXFP8_QUANT_BACKEND_ENV = "VERL_MXFP8_QUANT_BACKEND"
+MXFP8_ROUNDING_MODE_ENV = "VERL_MXFP8_ROUNDING_MODE"
 
 
 # Ref: https://github.com/NVIDIA-NeMo/RL/commit/bc24887c72a6e1b2699a228bc87c588546dfe6b7
@@ -143,13 +144,26 @@ def get_mxfp8_quant_backend(default: str = "npu") -> str:
     return normalize_mxfp8_quant_backend(backend)
 
 
+def get_mxfp8_rounding_mode(default: str = "round") -> str:
+    rounding_mode = os.environ.get(MXFP8_ROUNDING_MODE_ENV, default)
+
+    from verl.utils.qat.mxfp8_linear import normalize_mxfp8_rounding_mode
+
+    return normalize_mxfp8_rounding_mode(rounding_mode)
+
+
 def quantize_mxfp8_weight_ascend(
-    weight: torch.Tensor, dtype: torch.dtype, quant_backend: str = "npu"
+    weight: torch.Tensor, dtype: torch.dtype, quant_backend: str = "npu", rounding_mode: str = "round"
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, quantize_mxfp8_tensor
+    from verl.utils.qat.mxfp8_linear import (
+        normalize_mxfp8_quant_backend,
+        normalize_mxfp8_rounding_mode,
+        quantize_mxfp8_tensor,
+    )
 
     quant_backend = normalize_mxfp8_quant_backend(quant_backend)
-    return quantize_mxfp8_tensor(weight.to(dtype), quant_backend=quant_backend)
+    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
+    return quantize_mxfp8_tensor(weight.to(dtype), quant_backend=quant_backend, rounding_mode=rounding_mode)
 
 
 def restore_mxfp8_weights_for_loading(model):
@@ -205,6 +219,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     fp8_state.fp8_param_names.clear()
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
     mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu")
+    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="round") if is_mxfp8_npu else "round"
     # vLLM v0.11-v0.12 renamed weight_scale_inv → weight_scale in process_weights_after_loading,
     # so load_weights expects "_scale" suffix. v0.14+ keeps weight_scale_inv, so expects "_scale_inv".
     _use_scale_not_scale_inv = version.parse("0.11.0") <= version.parse(vllm.__version__) < version.parse("0.14.0")
@@ -218,7 +233,12 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         if torch.distributed.get_rank() == 0:
             logger.debug(f"Quantizing to FP8 blockwise: {k}")
         if is_mxfp8_npu:
-            param_lp, param_scale = quantize_mxfp8_weight_ascend(v, dtype, quant_backend=mxfp8_quant_backend)
+            param_lp, param_scale = quantize_mxfp8_weight_ascend(
+                v,
+                dtype,
+                quant_backend=mxfp8_quant_backend,
+                rounding_mode=mxfp8_rounding_mode,
+            )
         else:
             param_lp, param_scale = scaled_fp8_blockwise(
                 v.to(dtype),

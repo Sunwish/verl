@@ -61,11 +61,21 @@ def _reset_mxfp8_probe_state():
 def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode):
     model = _TinyModel()
 
-    apply_qat(model, QATConfig(enable=True, mode=mode, group_size=32, mxfp8_quant_backend="torch"))
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode=mode,
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="hash",
+        ),
+    )
 
     assert isinstance(model.proj, MXFP8QATLinear)
     assert model.proj.mode == QATMode(mode)
     assert model.proj.mxfp8_quant_backend == "torch"
+    assert model.proj.mxfp8_rounding_mode == "hash"
     assert isinstance(model.lm_head, nn.Linear)
 
 
@@ -143,6 +153,22 @@ def test_apply_qat_mxfp8_requires_group_size_32():
 def test_mxfp8_qat_linear_rejects_unknown_quant_backend():
     with pytest.raises(ValueError, match="Unsupported MXFP8 quant backend"):
         MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="rotate")
+
+
+def test_mxfp8_qat_linear_rejects_unknown_rounding_mode():
+    with pytest.raises(ValueError, match="Unsupported MXFP8 rounding mode"):
+        MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch", mxfp8_rounding_mode="nearest")
+
+
+def test_mxfp8_qat_config_rejects_stochastic_rounding_with_npu_backend():
+    with pytest.raises(ValueError, match="mxfp8_quant_backend='torch'"):
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="npu",
+            mxfp8_rounding_mode="random",
+        )
 
 
 def test_w8a16_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():

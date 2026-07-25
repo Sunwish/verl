@@ -231,7 +231,7 @@ def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
     server.config = SimpleNamespace(
         quantization=None,
         quantization_config_file=None,
-        qat={"enable": True, "mode": qat_mode, "mxfp8_quant_backend": "torch"},
+        qat={"enable": True, "mode": qat_mode, "mxfp8_quant_backend": "torch", "mxfp8_rounding_mode": "hash"},
     )
     server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
 
@@ -246,6 +246,7 @@ def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
     assert quantization == "ascend"
     assert hf_overrides["quantization_config"] == quant_config
     assert os.environ[vllm_server.MXFP8_QUANT_BACKEND_ENV] == "torch"
+    assert os.environ[vllm_server.MXFP8_ROUNDING_MODE_ENV] == "hash"
     mock_apply_patches.assert_called_once()
 
 
