@@ -56,6 +56,7 @@ actor_rollout_ref:
         - re:.*mlp.gate$
         activation_observer: static_minmax
         mxfp8_quant_backend: npu
+        mxfp8_rounding_mode: round
         mxfp8_probe_quant_error: false
         mxfp8_probe_quant_error_output_path: null
         quantization_config_path: null
@@ -233,6 +234,7 @@ actor_rollout_ref:
         - re:.*mlp.gate$
         activation_observer: static_minmax
         mxfp8_quant_backend: npu
+        mxfp8_rounding_mode: round
         mxfp8_probe_quant_error: false
         mxfp8_probe_quant_error_output_path: null
         quantization_config_path: null
@@ -528,6 +530,7 @@ critic:
       - re:.*mlp.gate$
       activation_observer: static_minmax
       mxfp8_quant_backend: npu
+      mxfp8_rounding_mode: round
       mxfp8_probe_quant_error: false
       mxfp8_probe_quant_error_output_path: null
       quantization_config_path: null

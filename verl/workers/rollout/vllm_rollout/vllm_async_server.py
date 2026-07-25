@@ -39,7 +39,7 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
-from verl.utils.vllm.vllm_fp8_utils import MXFP8_QUANT_BACKEND_ENV, apply_vllm_fp8_patches
+from verl.utils.vllm.vllm_fp8_utils import MXFP8_QUANT_BACKEND_ENV, MXFP8_ROUNDING_MODE_ENV, apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
@@ -874,9 +874,10 @@ class vLLMHttpServer:
             quant_method = quantization_config_dict.get("quant_method", None)
             is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
             if is_mxfp8_qat:
-                from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend
+                from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
 
                 os.environ[MXFP8_QUANT_BACKEND_ENV] = normalize_mxfp8_quant_backend(qat_config.mxfp8_quant_backend)
+                os.environ[MXFP8_ROUNDING_MODE_ENV] = normalize_mxfp8_rounding_mode(qat_config.mxfp8_rounding_mode)
             has_mxfp8_entry = any(
                 isinstance(value, str) and "MXFP8" in value.upper() for value in quantization_config_dict.values()
             )

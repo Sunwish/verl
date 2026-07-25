@@ -501,6 +501,7 @@ class FSDPEngine(BaseEngine):
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
                 "mxfp8_quant_backend": self._qat_config.mxfp8_quant_backend,
+                "mxfp8_rounding_mode": self._qat_config.mxfp8_rounding_mode,
                 "mxfp8_probe_quant_error": self._qat_config.mxfp8_probe_quant_error,
                 "mxfp8_probe_quant_error_output_path": self._qat_config.mxfp8_probe_quant_error_output_path,
             },

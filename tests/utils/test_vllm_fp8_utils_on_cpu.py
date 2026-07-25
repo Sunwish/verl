@@ -21,7 +21,12 @@ import torch
 
 pytest.importorskip("vllm")
 
-from verl.utils.vllm.vllm_fp8_utils import MXFP8_QUANT_BACKEND_ENV, is_mxfp8_vllm_ascend, quant_weights
+from verl.utils.vllm.vllm_fp8_utils import (
+    MXFP8_QUANT_BACKEND_ENV,
+    MXFP8_ROUNDING_MODE_ENV,
+    is_mxfp8_vllm_ascend,
+    quant_weights,
+)
 
 
 class _FakeAscendModelSlimConfig:
@@ -81,6 +86,7 @@ def test_quant_weights_mxfp8_emits_scale_suffix(monkeypatch):
 def test_quant_weights_mxfp8_torch_backend_emits_scale_suffix(monkeypatch):
     _install_fake_vllm_ascend(monkeypatch)
     monkeypatch.setenv(MXFP8_QUANT_BACKEND_ENV, "torch")
+    monkeypatch.setenv(MXFP8_ROUNDING_MODE_ENV, "hash")
     quant_config = _FakeAscendModelSlimConfig({"quant_method": "ascend"})
 
     model = object()

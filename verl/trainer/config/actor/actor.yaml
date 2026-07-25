@@ -321,6 +321,10 @@ qat:
   # Future optimized variants can be added here.
   mxfp8_quant_backend: "npu"
 
+  # MXFP8 rounding mode for the torch backend: "round", "random", or "hash".
+  # Non-default stochastic modes require mxfp8_quant_backend: "torch".
+  mxfp8_rounding_mode: "round"
+
   # Enable MXFP8 quantization error probing.
   # When true, MXFP8 QAT layers log per-layer weight/activation quantization errors
   # while matmul still uses the original high-precision tensors.

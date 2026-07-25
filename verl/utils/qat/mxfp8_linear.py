@@ -39,6 +39,7 @@ __all__ = [
     "configure_mxfp8_probe",
     "mxfp8_probe_step_context",
     "normalize_mxfp8_quant_backend",
+    "normalize_mxfp8_rounding_mode",
     "quantize_mxfp8_tensor",
     "reset_mxfp8_probe",
     "set_mxfp8_probe_step",
@@ -53,6 +54,12 @@ _MXFP8_SCALE_EMAX = 127
 _MXFP8_MIN_PRIVATE_EXP = -6
 _MXFP8_MANTISSA_SCALE = 8.0
 _MXFP8_QUANT_BACKENDS = {"npu", "torch"}
+_MXFP8_ROUNDING_MODES = {"round", "random", "hash"}
+_MXFP8_HASH_MULTIPLIER = 1664525
+_MXFP8_HASH_INCREMENT = 1013904223
+_MXFP8_HASH_MODULUS = 2**32
+_MXFP8_HASH_RANDOM_SHIFT = 2**8
+_MXFP8_HASH_RANDOM_LEVELS = 2**24
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 
 
@@ -175,6 +182,7 @@ def _record_mxfp8_quant_error(
     error_value: float,
     qat_mode: str,
     quant_backend: str,
+    rounding_mode: str,
 ):
     step = _MXFP8_PROBE_RECORDER.current_step
     _MXFP8_PROBE_RECORDER.record(
@@ -188,6 +196,7 @@ def _record_mxfp8_quant_error(
             "mode": qat_mode,
             "quant_backend": quant_backend,
             "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+            "rounding_mode": rounding_mode,
             "step": int(step) if step is not None else None,
         }
     )
@@ -200,6 +209,16 @@ def normalize_mxfp8_quant_backend(backend: str) -> str:
             f"Unsupported MXFP8 quant backend: {backend}. Supported backends: {sorted(_MXFP8_QUANT_BACKENDS)}"
         )
     return backend
+
+
+def normalize_mxfp8_rounding_mode(rounding_mode: str) -> str:
+    rounding_mode = rounding_mode.lower()
+    if rounding_mode not in _MXFP8_ROUNDING_MODES:
+        raise ValueError(
+            f"Unsupported MXFP8 rounding mode: {rounding_mode}. "
+            f"Supported modes: {sorted(_MXFP8_ROUNDING_MODES)}"
+        )
+    return rounding_mode
 
 
 def _dequantize_mxfp8(weight_q: torch.Tensor, weight_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -222,8 +241,33 @@ def _check_mxfp8_2d_tensor(tensor: torch.Tensor):
         )
 
 
-def _quantize_mxfp8_torch(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _round_mxfp8_scaled_abs(abs_scaled: torch.Tensor, rounding_mode: str) -> torch.Tensor:
+    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
+    if rounding_mode == "round":
+        return torch.floor(abs_scaled + 0.5)
+
+    floor_val = torch.floor(abs_scaled)
+    frac = abs_scaled - floor_val
+    if rounding_mode == "random":
+        rand = torch.rand_like(frac)
+    elif rounding_mode == "hash":
+        int_bits = abs_scaled.contiguous().view(torch.int32).detach().to(torch.int64)
+        uint_bits = torch.remainder(int_bits, _MXFP8_HASH_MODULUS)
+        hashed = torch.remainder(
+            uint_bits * _MXFP8_HASH_MULTIPLIER + _MXFP8_HASH_INCREMENT,
+            _MXFP8_HASH_MODULUS,
+        )
+        rand_bits = torch.div(hashed, _MXFP8_HASH_RANDOM_SHIFT, rounding_mode="floor")
+        rand = rand_bits.to(torch.float32) * (1.0 / float(_MXFP8_HASH_RANDOM_LEVELS))
+    else:
+        raise ValueError(f"Unsupported MXFP8 rounding mode: {rounding_mode}")
+
+    return floor_val + (rand < frac).to(floor_val.dtype)
+
+
+def _quantize_mxfp8_torch(tensor: torch.Tensor, rounding_mode: str = "round") -> tuple[torch.Tensor, torch.Tensor]:
     _check_mxfp8_2d_tensor(tensor)
+    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
     tensor_fp32 = tensor.to(torch.float32)
     original_shape = tensor_fp32.shape
     max_norm = torch.finfo(torch.float8_e4m3fn).max
@@ -243,7 +287,7 @@ def _quantize_mxfp8_torch(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
     private_scale = torch.pow(2.0, private_exp)
     scaled = normalized / private_scale * _MXFP8_MANTISSA_SCALE
-    quantized = torch.sign(scaled) * torch.floor(torch.abs(scaled) + 0.5)
+    quantized = torch.sign(scaled) * _round_mxfp8_scaled_abs(torch.abs(scaled), rounding_mode)
     quantized = quantized / _MXFP8_MANTISSA_SCALE * private_scale
     quantized = torch.clamp(quantized, min=-max_norm, max=max_norm)
     quantized = torch.where(torch.isinf(normalized), normalized, quantized)
@@ -267,14 +311,19 @@ def _quantize_mxfp8_npu(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     return tensor_q, tensor_scale.squeeze(-1)
 
 
-def quantize_mxfp8_tensor(tensor: torch.Tensor, quant_backend: str = "torch") -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_mxfp8_tensor(
+    tensor: torch.Tensor, quant_backend: str = "torch", rounding_mode: str = "round"
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor along its last dimension using MXFP8 blocks."""
     _check_mxfp8_2d_tensor(tensor)
     quant_backend = normalize_mxfp8_quant_backend(quant_backend)
+    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
     if quant_backend == "npu":
+        if rounding_mode != "round":
+            raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
         return _quantize_mxfp8_npu(tensor)
 
-    return _quantize_mxfp8_torch(tensor)
+    return _quantize_mxfp8_torch(tensor, rounding_mode=rounding_mode)
 
 
 class MXFP8QATLinear(nn.Linear):
@@ -292,6 +341,7 @@ class MXFP8QATLinear(nn.Linear):
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
         mxfp8_quant_backend: str = "npu",
+        mxfp8_rounding_mode: str = "round",
         mxfp8_probe_quant_error: bool = False,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
@@ -310,6 +360,9 @@ class MXFP8QATLinear(nn.Linear):
         self.group_size = group_size
         self.activation_observer = activation_observer
         self.mxfp8_quant_backend = normalize_mxfp8_quant_backend(mxfp8_quant_backend)
+        self.mxfp8_rounding_mode = normalize_mxfp8_rounding_mode(mxfp8_rounding_mode)
+        if self.mxfp8_quant_backend == "npu" and self.mxfp8_rounding_mode != "round":
+            raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
         self.mxfp8_probe_quant_error = mxfp8_probe_quant_error
         self._mxfp8_layer_name = layer_name
         self._mxfp8_layer_type = layer_type if layer_type is not None else _infer_mxfp8_layer_type(layer_name)
@@ -326,6 +379,7 @@ class MXFP8QATLinear(nn.Linear):
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
         mxfp8_quant_backend: str = "npu",
+        mxfp8_rounding_mode: str = "round",
         mxfp8_probe_quant_error: bool = False,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
@@ -340,6 +394,7 @@ class MXFP8QATLinear(nn.Linear):
             group_size=group_size,
             activation_observer=activation_observer,
             mxfp8_quant_backend=mxfp8_quant_backend,
+            mxfp8_rounding_mode=mxfp8_rounding_mode,
             mxfp8_probe_quant_error=mxfp8_probe_quant_error,
             layer_name=layer_name,
             layer_type=layer_type,
@@ -372,11 +427,14 @@ class MXFP8QATLinear(nn.Linear):
             error_value=diff.mean().item(),
             qat_mode=self.mode.value,
             quant_backend=self.mxfp8_quant_backend,
+            rounding_mode=self.mxfp8_rounding_mode,
         )
 
     def _fake_quantize_weight(self, weight: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            weight_q, weight_scale = quantize_mxfp8_tensor(weight, quant_backend=self.mxfp8_quant_backend)
+            weight_q, weight_scale = quantize_mxfp8_tensor(
+                weight, quant_backend=self.mxfp8_quant_backend, rounding_mode=self.mxfp8_rounding_mode
+            )
             self._last_weight_scale = weight_scale.detach()
             weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype)
             if self.mxfp8_probe_quant_error:
@@ -388,7 +446,9 @@ class MXFP8QATLinear(nn.Linear):
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
         with torch.no_grad():
-            x_q, x_scale = quantize_mxfp8_tensor(x_2d, quant_backend=self.mxfp8_quant_backend)
+            x_q, x_scale = quantize_mxfp8_tensor(
+                x_2d, quant_backend=self.mxfp8_quant_backend, rounding_mode=self.mxfp8_rounding_mode
+            )
             self._last_input_scale = x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1])
             x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
             if self.mxfp8_probe_quant_error:
@@ -409,6 +469,7 @@ class MXFP8QATLinear(nn.Linear):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, mode={self.mode.value}, "
             f"group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
+            f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, "
             f"mxfp8_probe_quant_error={self.mxfp8_probe_quant_error}, "
             f"fake_quant_enabled={self.fake_quant_enabled}"
         )
