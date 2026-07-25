@@ -26,6 +26,9 @@ from verl.base_config import BaseConfig
 
 logger = logging.getLogger(__name__)
 
+_MXFP8_MODES = {"w8a16_mxfp8", "w8a8_mxfp8"}
+_MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+
 
 @dataclass
 class QATConfig(BaseConfig):
@@ -37,7 +40,18 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     mxfp8_quant_backend: str = "npu"
+    mxfp8_probe_quant_error: bool = False
+    mxfp8_probe_quant_error_output_path: Optional[str] = None
     quantization_config_path: Optional[str] = None
+
+    def __post_init__(self):
+        if self.mxfp8_probe_quant_error:
+            if not self.enable:
+                raise ValueError("mxfp8_probe_quant_error requires QAT enable=True")
+            if self.mode.lower() not in _MXFP8_MODES:
+                raise ValueError("mxfp8_probe_quant_error only supports w8a16_mxfp8/w8a8_mxfp8 modes")
+            if not self.mxfp8_probe_quant_error_output_path:
+                raise ValueError("mxfp8_probe_quant_error_output_path is required when mxfp8_probe_quant_error=True")
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
@@ -99,6 +113,13 @@ def _get_qat_linear_cls(mode: str):
     return qat_mode, QATLinear
 
 
+def _infer_mxfp8_layer_metadata(name: str) -> tuple[Optional[str], Optional[int]]:
+    layer_type = name.rsplit(".", 1)[-1]
+    match = _MXFP8_LAYER_IDX_RE.search(name)
+    layer_index = int(match.group(1)) if match else None
+    return layer_type, layer_index
+
+
 def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
@@ -112,9 +133,22 @@ def apply_qat(
         return model
 
     mode, qat_linear_cls = _get_qat_linear_cls(config.mode)
-    if mode.value in {"w8a16_mxfp8", "w8a8_mxfp8"} and config.group_size != 32:
+    if mode.value in _MXFP8_MODES and config.group_size != 32:
         raise ValueError(f"MXFP8 QAT requires group_size=32, got: {config.group_size}")
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
+    if mode.value in _MXFP8_MODES:
+        from verl.utils.qat.mxfp8_linear import configure_mxfp8_probe
+
+        configure_mxfp8_probe(
+            enabled=config.mxfp8_probe_quant_error,
+            output_path=config.mxfp8_probe_quant_error_output_path,
+            rank0_only=True,
+        )
+        if config.mxfp8_probe_quant_error:
+            logger.warning(
+                "MXFP8 quant error probe enabled; writing JSONL records to %s",
+                config.mxfp8_probe_quant_error_output_path,
+            )
 
     modules_to_replace = []
     for name, module in model.named_modules():
@@ -133,8 +167,13 @@ def apply_qat(
             "group_size": config.group_size,
             "activation_observer": config.activation_observer,
         }
-        if mode.value in {"w8a16_mxfp8", "w8a8_mxfp8"}:
+        if mode.value in _MXFP8_MODES:
+            layer_type, layer_index = _infer_mxfp8_layer_metadata(name)
             from_linear_kwargs["mxfp8_quant_backend"] = config.mxfp8_quant_backend
+            from_linear_kwargs["mxfp8_probe_quant_error"] = config.mxfp8_probe_quant_error
+            from_linear_kwargs["layer_name"] = name
+            from_linear_kwargs["layer_type"] = layer_type
+            from_linear_kwargs["layer_index"] = layer_index
 
         fake_quant_module = qat_linear_cls.from_linear(module, **from_linear_kwargs)
 

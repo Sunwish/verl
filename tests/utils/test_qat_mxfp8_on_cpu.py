@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,7 +22,7 @@ import pytest
 
 from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales
 from verl.utils.qat.linear import QATLinear, QATMode
-from verl.utils.qat.mxfp8_linear import MXFP8QATLinear
+from verl.utils.qat.mxfp8_linear import MXFP8QATLinear, mxfp8_probe_step_context, reset_mxfp8_probe
 
 
 class _TinyModel(nn.Module):
@@ -28,6 +30,31 @@ class _TinyModel(nn.Module):
         super().__init__()
         self.proj = nn.Linear(32, 16, bias=False)
         self.lm_head = nn.Linear(32, 16, bias=False)
+
+
+class _ProbeLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(32, 16, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        return self.q_proj(x)
+
+
+class _ProbeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_ProbeLayer()])
+
+    def forward(self, x):
+        return self.layers[0](x)
+
+
+@pytest.fixture(autouse=True)
+def _reset_mxfp8_probe_state():
+    reset_mxfp8_probe()
+    yield
+    reset_mxfp8_probe()
 
 
 @pytest.mark.parametrize("mode", ["w8a16_mxfp8", "w8a8_mxfp8"])
@@ -40,6 +67,62 @@ def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode):
     assert model.proj.mode == QATMode(mode)
     assert model.proj.mxfp8_quant_backend == "torch"
     assert isinstance(model.lm_head, nn.Linear)
+
+
+def test_mxfp8_qat_probe_mode_logs_layer_metadata_and_preserves_output(tmp_path):
+    model = _ProbeModel()
+    output_path = tmp_path / "mxfp8_probe.jsonl"
+
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_probe_quant_error=True,
+            mxfp8_probe_quant_error_output_path=str(output_path),
+        ),
+    )
+
+    assert isinstance(model.layers[0].q_proj, MXFP8QATLinear)
+    assert model.layers[0].q_proj.mxfp8_probe_quant_error is True
+    assert model.layers[0].q_proj._mxfp8_layer_type == "q_proj"
+    assert model.layers[0].q_proj._mxfp8_layer_index == 0
+
+    with torch.no_grad():
+        model.layers[0].q_proj.weight.copy_(torch.linspace(-2.0, 2.0, steps=16 * 32, dtype=torch.bfloat16).view(16, 32))
+
+    x = torch.linspace(-1.0, 1.0, steps=64, dtype=torch.bfloat16).view(2, 32)
+    baseline = F.linear(x, model.layers[0].q_proj.weight)
+
+    with torch.no_grad(), mxfp8_probe_step_context(17):
+        out = model(x)
+
+    assert torch.allclose(out, baseline)
+    reset_mxfp8_probe()
+
+    records = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
+    assert len(records) == 2
+    assert records[0]["error_type"] == "weight"
+    assert records[1]["error_type"] == "activation"
+    for record in records:
+        assert record["step"] == 17
+        assert record["layer_name"] == "layers.0.q_proj"
+        assert record["layer_type"] == "q_proj"
+        assert record["layer_index"] == 0
+        assert record["error_metric"] == "mae"
+
+
+def test_mxfp8_qat_probe_mode_requires_output_path():
+    with pytest.raises(ValueError, match="mxfp8_probe_quant_error_output_path"):
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_probe_quant_error=True,
+        )
 
 
 def test_apply_qat_w4a16_still_uses_nvfp4_qat_linear():

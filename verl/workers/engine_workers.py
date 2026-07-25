@@ -248,6 +248,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        global_steps = tu.pop(data, key="global_steps", default=None)
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -298,6 +299,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
+                if global_steps is not None:
+                    tu.assign_non_tensor(mini_batch_td, global_steps=global_steps)
                 actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
 
@@ -327,6 +330,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
         # global_token_num should be a list of number of tokens of each seq in this batch
         global_token_num = tu.get(data, key="global_token_num")
+        global_steps = tu.get(data, key="global_steps", default=None)
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
@@ -342,6 +346,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         for key, val in default_keys.items():
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
+        if global_steps is not None:
+            tu.assign_non_tensor(data, global_steps=global_steps)
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
