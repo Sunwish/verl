@@ -501,6 +501,8 @@ class FSDPEngine(BaseEngine):
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
                 "mxfp8_quant_backend": self._qat_config.mxfp8_quant_backend,
+                "mxfp8_probe_quant_error": self._qat_config.mxfp8_probe_quant_error,
+                "mxfp8_probe_quant_error_output_path": self._qat_config.mxfp8_probe_quant_error_output_path,
             },
         )
         if self._qat_config.mode in {"w4a4", "w4a16"}:
@@ -639,10 +641,23 @@ class FSDPEngine(BaseEngine):
         # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
+        batch_global_steps = tu.get(data, key="global_steps", default=None)
+        probe_step_ctx = nullcontext()
 
         for micro_batch in micro_batches:
+            global_steps = tu.get(micro_batch, key="global_steps", default=batch_global_steps)
+            if global_steps is not None:
+                from verl.utils.qat.mxfp8_linear import mxfp8_probe_step_context
+
+                probe_step_ctx = mxfp8_probe_step_context(global_steps)
+            else:
+                probe_step_ctx = nullcontext()
+
             with ctx:
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                with probe_step_ctx:
+                    loss, meta_info = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
 
                 if not forward_only:
                     if scaler is not None:

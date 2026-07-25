@@ -136,6 +136,8 @@ class QATEngineConfig(BaseConfig):
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         mxfp8_quant_backend (str): MXFP8 quantization backend, "npu" or "torch"
+        mxfp8_probe_quant_error (bool): Whether to log MXFP8 quantization error probes
+        mxfp8_probe_quant_error_output_path (Optional[str]): JSONL file path for MXFP8 probe logs
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
     """
 
@@ -145,7 +147,18 @@ class QATEngineConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     mxfp8_quant_backend: str = "npu"
+    mxfp8_probe_quant_error: bool = False
+    mxfp8_probe_quant_error_output_path: Optional[str] = None
     quantization_config_path: Optional[str] = None
+
+    def __post_init__(self):
+        if self.mxfp8_probe_quant_error:
+            if not self.enable:
+                raise ValueError("mxfp8_probe_quant_error requires QAT enable=True")
+            if self.mode.lower() not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
+                raise ValueError("mxfp8_probe_quant_error only supports w8a16_mxfp8/w8a8_mxfp8 modes")
+            if not self.mxfp8_probe_quant_error_output_path:
+                raise ValueError("mxfp8_probe_quant_error_output_path is required when mxfp8_probe_quant_error=True")
 
 
 @dataclass

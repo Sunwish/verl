@@ -19,6 +19,13 @@ actual matmul in high precision. W8A16 quantizes weights only; W8A8 quantizes
 both weights and activations.
 """
 
+import atexit
+import json
+import logging
+import os
+import re
+import threading
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -27,7 +34,18 @@ import torch.nn.functional as F
 
 from verl.utils.qat.linear import QATMode
 
-__all__ = ["MXFP8QATLinear", "normalize_mxfp8_quant_backend", "quantize_mxfp8_tensor"]
+__all__ = [
+    "MXFP8QATLinear",
+    "configure_mxfp8_probe",
+    "mxfp8_probe_step_context",
+    "normalize_mxfp8_quant_backend",
+    "quantize_mxfp8_tensor",
+    "reset_mxfp8_probe",
+    "set_mxfp8_probe_step",
+]
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _MXFP8_BLOCK_SIZE = 32
 _MXFP8_EMAX = 8
@@ -35,6 +53,144 @@ _MXFP8_SCALE_EMAX = 127
 _MXFP8_MIN_PRIVATE_EXP = -6
 _MXFP8_MANTISSA_SCALE = 8.0
 _MXFP8_QUANT_BACKENDS = {"npu", "torch"}
+_MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+
+
+class _MXFP8ProbeRecorder:
+    def __init__(self):
+        self.enabled = False
+        self.output_path: Optional[str] = None
+        self.rank0_only = True
+        self.current_step: Optional[int] = None
+        self._fp = None
+        self._lock = threading.Lock()
+        self._atexit_registered = False
+
+    def configure(self, enabled: bool, output_path: Optional[str], rank0_only: bool = True):
+        with self._lock:
+            self._close_locked()
+            self.enabled = enabled
+            self.output_path = output_path if enabled else None
+            self.rank0_only = rank0_only
+            self.current_step = None
+
+    def set_step(self, step: Optional[int]):
+        self.current_step = step
+
+    def _is_rank0(self) -> bool:
+        if not self.rank0_only:
+            return True
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return True
+        return torch.distributed.get_rank() == 0
+
+    def _ensure_open_locked(self):
+        if self._fp is not None or self.output_path is None:
+            return
+        output_dir = os.path.dirname(os.path.abspath(self.output_path)) or "."
+        os.makedirs(output_dir, exist_ok=True)
+        self._fp = open(self.output_path, "a", encoding="utf-8")
+        if not self._atexit_registered:
+            atexit.register(self.close)
+            self._atexit_registered = True
+
+    def _close_locked(self):
+        if self._fp is not None:
+            self._fp.close()
+            self._fp = None
+
+    def close(self):
+        with self._lock:
+            self._close_locked()
+
+    def reset(self):
+        with self._lock:
+            self._close_locked()
+            self.enabled = False
+            self.output_path = None
+            self.rank0_only = True
+            self.current_step = None
+
+    def record(self, record: dict):
+        if not self.enabled or not self._is_rank0():
+            return
+
+        payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        logger.warning("[MXFP8 probe] %s", payload)
+
+        if self.output_path is None:
+            return
+
+        with self._lock:
+            self._ensure_open_locked()
+            if self._fp is not None:
+                self._fp.write(payload + "\n")
+                self._fp.flush()
+
+
+_MXFP8_PROBE_RECORDER = _MXFP8ProbeRecorder()
+
+
+def configure_mxfp8_probe(enabled: bool, output_path: Optional[str], rank0_only: bool = True):
+    _MXFP8_PROBE_RECORDER.configure(enabled=enabled, output_path=output_path, rank0_only=rank0_only)
+
+
+def reset_mxfp8_probe():
+    _MXFP8_PROBE_RECORDER.reset()
+
+
+def set_mxfp8_probe_step(step: Optional[int]):
+    _MXFP8_PROBE_RECORDER.set_step(step)
+
+
+@contextmanager
+def mxfp8_probe_step_context(step: Optional[int]):
+    previous_step = _MXFP8_PROBE_RECORDER.current_step
+    _MXFP8_PROBE_RECORDER.set_step(step)
+    try:
+        yield
+    finally:
+        _MXFP8_PROBE_RECORDER.set_step(previous_step)
+
+
+def _infer_mxfp8_layer_type(layer_name: Optional[str]) -> Optional[str]:
+    if layer_name is None:
+        return None
+    return layer_name.rsplit(".", 1)[-1]
+
+
+def _infer_mxfp8_layer_index(layer_name: Optional[str]) -> Optional[int]:
+    if layer_name is None:
+        return None
+    match = _MXFP8_LAYER_IDX_RE.search(layer_name)
+    return int(match.group(1)) if match else None
+
+
+def _record_mxfp8_quant_error(
+    *,
+    layer_name: Optional[str],
+    layer_type: Optional[str],
+    layer_index: Optional[int],
+    error_type: str,
+    error_value: float,
+    qat_mode: str,
+    quant_backend: str,
+):
+    step = _MXFP8_PROBE_RECORDER.current_step
+    _MXFP8_PROBE_RECORDER.record(
+        {
+            "error_metric": "mae",
+            "error_type": error_type,
+            "error_value": float(error_value),
+            "layer_index": layer_index,
+            "layer_name": layer_name,
+            "layer_type": layer_type,
+            "mode": qat_mode,
+            "quant_backend": quant_backend,
+            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+            "step": int(step) if step is not None else None,
+        }
+    )
 
 
 def normalize_mxfp8_quant_backend(backend: str) -> str:
@@ -136,6 +292,10 @@ class MXFP8QATLinear(nn.Linear):
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
         mxfp8_quant_backend: str = "npu",
+        mxfp8_probe_quant_error: bool = False,
+        layer_name: Optional[str] = None,
+        layer_type: Optional[str] = None,
+        layer_index: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -150,6 +310,10 @@ class MXFP8QATLinear(nn.Linear):
         self.group_size = group_size
         self.activation_observer = activation_observer
         self.mxfp8_quant_backend = normalize_mxfp8_quant_backend(mxfp8_quant_backend)
+        self.mxfp8_probe_quant_error = mxfp8_probe_quant_error
+        self._mxfp8_layer_name = layer_name
+        self._mxfp8_layer_type = layer_type if layer_type is not None else _infer_mxfp8_layer_type(layer_name)
+        self._mxfp8_layer_index = layer_index if layer_index is not None else _infer_mxfp8_layer_index(layer_name)
         self.fake_quant_enabled = True
         self._last_weight_scale: Optional[torch.Tensor] = None
         self._last_input_scale: Optional[torch.Tensor] = None
@@ -162,6 +326,10 @@ class MXFP8QATLinear(nn.Linear):
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
         mxfp8_quant_backend: str = "npu",
+        mxfp8_probe_quant_error: bool = False,
+        layer_name: Optional[str] = None,
+        layer_type: Optional[str] = None,
+        layer_index: Optional[int] = None,
     ) -> "MXFP8QATLinear":
         has_bias = linear.bias is not None
         new_linear = cls(
@@ -172,6 +340,10 @@ class MXFP8QATLinear(nn.Linear):
             group_size=group_size,
             activation_observer=activation_observer,
             mxfp8_quant_backend=mxfp8_quant_backend,
+            mxfp8_probe_quant_error=mxfp8_probe_quant_error,
+            layer_name=layer_name,
+            layer_type=layer_type,
+            layer_index=layer_index,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
         )
@@ -187,18 +359,41 @@ class MXFP8QATLinear(nn.Linear):
         self._last_weight_scale = None
         self._last_input_scale = None
 
+    def _record_quant_error(self, error_type: str, original: torch.Tensor, quantized: torch.Tensor):
+        if not self.mxfp8_probe_quant_error:
+            return
+
+        diff = (quantized.to(torch.float32) - original.detach().to(torch.float32)).abs()
+        _record_mxfp8_quant_error(
+            layer_name=self._mxfp8_layer_name,
+            layer_type=self._mxfp8_layer_type,
+            layer_index=self._mxfp8_layer_index,
+            error_type=error_type,
+            error_value=diff.mean().item(),
+            qat_mode=self.mode.value,
+            quant_backend=self.mxfp8_quant_backend,
+        )
+
     def _fake_quantize_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        weight_q, weight_scale = quantize_mxfp8_tensor(weight, quant_backend=self.mxfp8_quant_backend)
-        self._last_weight_scale = weight_scale.detach()
-        weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype)
+        with torch.no_grad():
+            weight_q, weight_scale = quantize_mxfp8_tensor(weight, quant_backend=self.mxfp8_quant_backend)
+            self._last_weight_scale = weight_scale.detach()
+            weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype)
+            if self.mxfp8_probe_quant_error:
+                self._record_quant_error("weight", weight, weight_fq)
+                return weight
         return weight + (weight_fq - weight).detach()
 
     def _fake_quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
-        x_q, x_scale = quantize_mxfp8_tensor(x_2d, quant_backend=self.mxfp8_quant_backend)
-        self._last_input_scale = x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1])
-        x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
+        with torch.no_grad():
+            x_q, x_scale = quantize_mxfp8_tensor(x_2d, quant_backend=self.mxfp8_quant_backend)
+            self._last_input_scale = x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1])
+            x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
+            if self.mxfp8_probe_quant_error:
+                self._record_quant_error("activation", x, x_fq)
+                return x
         return x + (x_fq - x).detach()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -214,5 +409,6 @@ class MXFP8QATLinear(nn.Linear):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, mode={self.mode.value}, "
             f"group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
+            f"mxfp8_probe_quant_error={self.mxfp8_probe_quant_error}, "
             f"fake_quant_enabled={self.fake_quant_enabled}"
         )

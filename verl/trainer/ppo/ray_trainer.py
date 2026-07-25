@@ -1321,6 +1321,7 @@ class RayPPOTrainer:
             epochs=ppo_epochs,
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
+            global_steps=self.global_steps,
             compute_loss=True,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)

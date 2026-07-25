@@ -92,5 +92,14 @@ qat:
   # Future optimized variants can be added here.
   mxfp8_quant_backend: "npu"
 
+  # Enable MXFP8 quantization error probing.
+  # When true, MXFP8 QAT layers log per-layer weight/activation quantization errors
+  # while matmul still uses the original high-precision tensors.
+  # Activation errors are emitted when mode is "w8a8_mxfp8".
+  mxfp8_probe_quant_error: false
+
+  # JSONL file path for MXFP8 probe records.
+  mxfp8_probe_quant_error_output_path: null
+
   # Path to vLLM quantization config JSON file
   quantization_config_path: null

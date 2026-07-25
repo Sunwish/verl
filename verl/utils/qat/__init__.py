@@ -38,6 +38,12 @@ from verl.utils.qat.core import (
     invalidate_all_scales,
     load_quantization_config,
 )
+from verl.utils.qat.mxfp8_linear import (
+    configure_mxfp8_probe,
+    mxfp8_probe_step_context,
+    reset_mxfp8_probe,
+    set_mxfp8_probe_step,
+)
 from verl.utils.qat.vllm_patch import (
     apply_qat_patches,
     manual_process_weights_after_loading,
@@ -51,6 +57,10 @@ __all__ = [
     "load_quantization_config",
     "enable_qat_fuse",
     "invalidate_all_scales",
+    "configure_mxfp8_probe",
+    "mxfp8_probe_step_context",
+    "reset_mxfp8_probe",
+    "set_mxfp8_probe_step",
     # vLLM Patch
     "apply_qat_patches",
     "manual_process_weights_after_loading",
