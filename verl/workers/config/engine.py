@@ -20,6 +20,7 @@ from typing import Any, Callable, Literal, Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
+from verl.utils.qat.mxfp8_rotation import MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN, MXFP8RotationConfig, validate_mxfp8_rotation_config
 
 from ...utils.profiler import ProfilerConfig
 from .model import HFModelConfig
@@ -151,6 +152,10 @@ class QATEngineConfig(BaseConfig):
     mxfp8_rounding_mode: str = "round"
     mxfp8_probe_quant_error: bool = False
     mxfp8_probe_quant_error_output_path: Optional[str] = None
+    mxfp8_rotation_enable: bool = False
+    mxfp8_rotation_kind: str = MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN
+    mxfp8_rotation_block_size: int = 32
+    mxfp8_rotation_seed: int = 0
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
@@ -174,6 +179,16 @@ class QATEngineConfig(BaseConfig):
                 raise ValueError("mxfp8_probe_quant_error only supports w8a16_mxfp8/w8a8_mxfp8 modes")
             if not self.mxfp8_probe_quant_error_output_path:
                 raise ValueError("mxfp8_probe_quant_error_output_path is required when mxfp8_probe_quant_error=True")
+        rotation_config = MXFP8RotationConfig(
+            enable=self.mxfp8_rotation_enable,
+            kind=self.mxfp8_rotation_kind,
+            block_size=self.mxfp8_rotation_block_size,
+            seed=self.mxfp8_rotation_seed,
+        )
+        if rotation_config.enable:
+            if self.mode.lower() not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
+                raise ValueError("mxfp8_rotation_enable only supports w8a16_mxfp8/w8a8_mxfp8 modes")
+            validate_mxfp8_rotation_config(rotation_config, group_size=self.group_size)
 
 
 @dataclass

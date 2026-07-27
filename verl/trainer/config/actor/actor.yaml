@@ -334,6 +334,18 @@ qat:
   # JSONL file path for MXFP8 probe records.
   mxfp8_probe_quant_error_output_path: null
 
+  # Enable global block-wise Hadamard/random-sign rotation before MXFP8 quantization.
+  mxfp8_rotation_enable: false
+
+  # Rotation implementation. First supported mode repeats one 32x32 block along the hidden dimension.
+  mxfp8_rotation_kind: "block_hadamard_sign"
+
+  # Must match MXFP8 group_size for the first implementation.
+  mxfp8_rotation_block_size: 32
+
+  # Deterministic random sign seed for the global 32x32 block.
+  mxfp8_rotation_seed: 0
+
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
 

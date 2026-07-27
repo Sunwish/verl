@@ -875,9 +875,25 @@ class vLLMHttpServer:
             is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
             if is_mxfp8_qat:
                 from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
+                from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, mxfp8_rotation_config_to_dict
 
                 os.environ[MXFP8_QUANT_BACKEND_ENV] = normalize_mxfp8_quant_backend(qat_config.mxfp8_quant_backend)
                 os.environ[MXFP8_ROUNDING_MODE_ENV] = normalize_mxfp8_rounding_mode(qat_config.mxfp8_rounding_mode)
+                quantization_config_dict["group_size"] = qat_config.group_size
+                rotation_config = MXFP8RotationConfig(
+                    enable=qat_config.mxfp8_rotation_enable,
+                    kind=qat_config.mxfp8_rotation_kind,
+                    block_size=qat_config.mxfp8_rotation_block_size,
+                    seed=qat_config.mxfp8_rotation_seed,
+                )
+                quantization_config_dict.update(mxfp8_rotation_config_to_dict(rotation_config))
+                if rotation_config.enable:
+                    logger.warning(
+                        "MXFP8 block rotation injected for vLLM rollout: kind=%s, block_size=%s, seed=%s",
+                        rotation_config.kind,
+                        rotation_config.block_size,
+                        rotation_config.seed,
+                    )
             has_mxfp8_entry = any(
                 isinstance(value, str) and "MXFP8" in value.upper() for value in quantization_config_dict.values()
             )
