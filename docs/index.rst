@@ -129,6 +129,7 @@ verl is fast with:
    :caption: Low Precision
 
    low_precision/fp8.md
+   low_precision/mxfp8_qat.md
    low_precision/nvfp4_qat.md
 
 .. toctree::
