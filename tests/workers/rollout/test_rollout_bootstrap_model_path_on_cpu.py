@@ -244,7 +244,13 @@ def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
         quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
 
     assert quantization == "ascend"
-    assert hf_overrides["quantization_config"] == quant_config
+    assert hf_overrides["quantization_config"]["quant_method"] == "ascend"
+    assert hf_overrides["quantization_config"]["group_size"] == 32
+    assert hf_overrides["quantization_config"]["mxfp8_rotation_enable"] is False
+    assert hf_overrides["quantization_config"]["mxfp8_rotation_kind"] == "block_hadamard_sign"
+    assert hf_overrides["quantization_config"]["mxfp8_rotation_block_size"] == 32
+    assert hf_overrides["quantization_config"]["mxfp8_rotation_seed"] == 0
+    assert hf_overrides["quantization_config"]["layer.weight"] == "W8A8_MXFP8"
     assert os.environ[vllm_server.MXFP8_QUANT_BACKEND_ENV] == "torch"
     assert os.environ[vllm_server.MXFP8_ROUNDING_MODE_ENV] == "hash"
     mock_apply_patches.assert_called_once()

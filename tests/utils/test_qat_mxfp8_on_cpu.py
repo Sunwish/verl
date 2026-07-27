@@ -23,6 +23,7 @@ import pytest
 from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales
 from verl.utils.qat.linear import QATLinear, QATMode
 from verl.utils.qat.mxfp8_linear import MXFP8QATLinear, mxfp8_probe_step_context, reset_mxfp8_probe
+from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, apply_mxfp8_block_rotation
 
 
 class _TinyModel(nn.Module):
@@ -77,6 +78,20 @@ def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode):
     assert model.proj.mxfp8_quant_backend == "torch"
     assert model.proj.mxfp8_rounding_mode == "hash"
     assert isinstance(model.lm_head, nn.Linear)
+
+
+def test_mxfp8_block_rotation_preserves_linear_equivalence():
+    cfg = MXFP8RotationConfig(enable=True, block_size=32, seed=11)
+    x = torch.randn(3, 64, dtype=torch.float32)
+    weight = torch.randn(5, 64, dtype=torch.float32)
+
+    rotated_x = apply_mxfp8_block_rotation(x, cfg)
+    rotated_w = apply_mxfp8_block_rotation(weight, cfg)
+
+    baseline = F.linear(x, weight)
+    rotated = F.linear(rotated_x, rotated_w)
+
+    assert torch.allclose(rotated, baseline, atol=1e-5, rtol=1e-5)
 
 
 def test_mxfp8_qat_probe_mode_logs_layer_metadata_and_preserves_output(tmp_path):

@@ -101,3 +101,43 @@ def test_quant_weights_mxfp8_torch_backend_emits_scale_suffix(monkeypatch):
     assert outputs[1][0] == "layer.weight_scale"
     assert outputs[1][1].shape == (4,)
     assert outputs[1][1].dtype == torch.uint8
+
+
+def test_quant_weights_mxfp8_applies_rotation_before_quantization(monkeypatch):
+    _install_fake_vllm_ascend(monkeypatch)
+    quant_config = _FakeAscendModelSlimConfig(
+        {
+            "quant_method": "ascend",
+            "mxfp8_rotation_enable": True,
+            "mxfp8_rotation_kind": "block_hadamard_sign",
+            "mxfp8_rotation_block_size": 32,
+            "mxfp8_rotation_seed": 7,
+        }
+    )
+
+    model = object()
+    weight = torch.randn(4, 32, dtype=torch.bfloat16)
+    weights = [("layer.weight", weight)]
+    captured = {}
+
+    def fake_rotate(tensor, config):
+        captured["rotate_input"] = tensor.clone()
+        captured["rotate_config"] = config
+        return tensor + 1
+
+    def fake_quantize(tensor, dtype, quant_backend="npu", rounding_mode="round"):
+        captured["quant_input"] = tensor.clone()
+        return tensor.to(torch.float32), torch.ones((tensor.shape[0], 1), dtype=torch.uint8)
+
+    with patch("verl.utils.vllm.vllm_fp8_utils.is_fp8_weight", return_value=True), patch(
+        "verl.utils.vllm.vllm_fp8_utils.apply_mxfp8_block_rotation", side_effect=fake_rotate
+    ) as mock_rotate, patch("verl.utils.vllm.vllm_fp8_utils.quantize_mxfp8_weight_ascend", side_effect=fake_quantize), patch(
+        "torch.distributed.get_rank", return_value=0
+    ):
+        outputs = list(quant_weights(weights, model, quant_config, dtype=torch.bfloat16))
+
+    assert mock_rotate.called
+    assert torch.allclose(captured["quant_input"], weight + 1)
+    assert outputs[0][0] == "layer.weight"
+    assert outputs[1][0] == "layer.weight_scale"
+    assert outputs[1][1].shape == (4,)

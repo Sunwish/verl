@@ -504,6 +504,10 @@ class FSDPEngine(BaseEngine):
                 "mxfp8_rounding_mode": self._qat_config.mxfp8_rounding_mode,
                 "mxfp8_probe_quant_error": self._qat_config.mxfp8_probe_quant_error,
                 "mxfp8_probe_quant_error_output_path": self._qat_config.mxfp8_probe_quant_error_output_path,
+                "mxfp8_rotation_enable": self._qat_config.mxfp8_rotation_enable,
+                "mxfp8_rotation_kind": self._qat_config.mxfp8_rotation_kind,
+                "mxfp8_rotation_block_size": self._qat_config.mxfp8_rotation_block_size,
+                "mxfp8_rotation_seed": self._qat_config.mxfp8_rotation_seed,
             },
         )
         if self._qat_config.mode in {"w4a4", "w4a16"}:

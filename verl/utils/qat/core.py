@@ -23,6 +23,12 @@ from typing import Any, Optional
 import torch.nn as nn
 
 from verl.base_config import BaseConfig
+from verl.utils.qat.mxfp8_rotation import (
+    MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN,
+    MXFP8RotationConfig,
+    normalize_mxfp8_rotation_kind,
+    validate_mxfp8_rotation_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,10 @@ class QATConfig(BaseConfig):
     mxfp8_rounding_mode: str = "round"
     mxfp8_probe_quant_error: bool = False
     mxfp8_probe_quant_error_output_path: Optional[str] = None
+    mxfp8_rotation_enable: bool = False
+    mxfp8_rotation_kind: str = MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN
+    mxfp8_rotation_block_size: int = 32
+    mxfp8_rotation_seed: int = 0
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
@@ -67,6 +77,16 @@ class QATConfig(BaseConfig):
                 raise ValueError("mxfp8_probe_quant_error only supports w8a16_mxfp8/w8a8_mxfp8 modes")
             if not self.mxfp8_probe_quant_error_output_path:
                 raise ValueError("mxfp8_probe_quant_error_output_path is required when mxfp8_probe_quant_error=True")
+        rotation_config = MXFP8RotationConfig(
+            enable=self.mxfp8_rotation_enable,
+            kind=normalize_mxfp8_rotation_kind(self.mxfp8_rotation_kind),
+            block_size=self.mxfp8_rotation_block_size,
+            seed=self.mxfp8_rotation_seed,
+        )
+        if rotation_config.enable:
+            if self.mode.lower() not in _MXFP8_MODES:
+                raise ValueError("mxfp8_rotation_enable only supports w8a16_mxfp8/w8a8_mxfp8 modes")
+            validate_mxfp8_rotation_config(rotation_config, group_size=self.group_size)
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
@@ -167,6 +187,13 @@ def apply_qat(
                 "MXFP8 quant error probe enabled; writing JSONL records to %s",
                 config.mxfp8_probe_quant_error_output_path,
             )
+        if config.mxfp8_rotation_enable:
+            logger.warning(
+                "MXFP8 block rotation enabled for QAT: kind=%s, block_size=%s, seed=%s",
+                config.mxfp8_rotation_kind,
+                config.mxfp8_rotation_block_size,
+                config.mxfp8_rotation_seed,
+            )
 
     modules_to_replace = []
     for name, module in model.named_modules():
@@ -190,6 +217,10 @@ def apply_qat(
             from_linear_kwargs["mxfp8_quant_backend"] = config.mxfp8_quant_backend
             from_linear_kwargs["mxfp8_rounding_mode"] = config.mxfp8_rounding_mode
             from_linear_kwargs["mxfp8_probe_quant_error"] = config.mxfp8_probe_quant_error
+            from_linear_kwargs["mxfp8_rotation_enable"] = config.mxfp8_rotation_enable
+            from_linear_kwargs["mxfp8_rotation_kind"] = config.mxfp8_rotation_kind
+            from_linear_kwargs["mxfp8_rotation_block_size"] = config.mxfp8_rotation_block_size
+            from_linear_kwargs["mxfp8_rotation_seed"] = config.mxfp8_rotation_seed
             from_linear_kwargs["layer_name"] = name
             from_linear_kwargs["layer_type"] = layer_type
             from_linear_kwargs["layer_index"] = layer_index

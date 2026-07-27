@@ -30,6 +30,7 @@ except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
 
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
+from verl.utils.qat.mxfp8_rotation import apply_mxfp8_block_rotation, get_mxfp8_rotation_config
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,14 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
     mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu")
     mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="round") if is_mxfp8_npu else "round"
+    rotation_config = get_mxfp8_rotation_config(getattr(quant_config, "quant_description", {}) or {})
+    if is_mxfp8_npu and rotation_config.enable and torch.distributed.get_rank() == 0:
+        logger.warning(
+            "MXFP8 block rotation enabled for rollout weight sync: kind=%s, block_size=%s, seed=%s",
+            rotation_config.kind,
+            rotation_config.block_size,
+            rotation_config.seed,
+        )
     # vLLM v0.11-v0.12 renamed weight_scale_inv → weight_scale in process_weights_after_loading,
     # so load_weights expects "_scale" suffix. v0.14+ keeps weight_scale_inv, so expects "_scale_inv".
     _use_scale_not_scale_inv = version.parse("0.11.0") <= version.parse(vllm.__version__) < version.parse("0.14.0")
@@ -233,6 +242,8 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         if torch.distributed.get_rank() == 0:
             logger.debug(f"Quantizing to FP8 blockwise: {k}")
         if is_mxfp8_npu:
+            if rotation_config.enable:
+                v = apply_mxfp8_block_rotation(v, rotation_config)
             param_lp, param_scale = quantize_mxfp8_weight_ascend(
                 v,
                 dtype,

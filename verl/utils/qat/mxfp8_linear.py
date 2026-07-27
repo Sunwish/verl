@@ -33,6 +33,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from verl.utils.qat.linear import QATMode
+from verl.utils.qat.mxfp8_rotation import (
+    MXFP8RotationConfig,
+    apply_mxfp8_block_rotation,
+    normalize_mxfp8_rotation_kind,
+    validate_mxfp8_rotation_config,
+)
 
 __all__ = [
     "MXFP8QATLinear",
@@ -343,6 +349,10 @@ class MXFP8QATLinear(nn.Linear):
         mxfp8_quant_backend: str = "npu",
         mxfp8_rounding_mode: str = "round",
         mxfp8_probe_quant_error: bool = False,
+        mxfp8_rotation_enable: bool = False,
+        mxfp8_rotation_kind: str = "block_hadamard_sign",
+        mxfp8_rotation_block_size: int = _MXFP8_BLOCK_SIZE,
+        mxfp8_rotation_seed: int = 0,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -364,6 +374,13 @@ class MXFP8QATLinear(nn.Linear):
         if self.mxfp8_quant_backend == "npu" and self.mxfp8_rounding_mode != "round":
             raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
         self.mxfp8_probe_quant_error = mxfp8_probe_quant_error
+        self.mxfp8_rotation_config = MXFP8RotationConfig(
+            enable=mxfp8_rotation_enable,
+            kind=normalize_mxfp8_rotation_kind(mxfp8_rotation_kind),
+            block_size=mxfp8_rotation_block_size,
+            seed=mxfp8_rotation_seed,
+        )
+        validate_mxfp8_rotation_config(self.mxfp8_rotation_config, group_size=self.group_size)
         self._mxfp8_layer_name = layer_name
         self._mxfp8_layer_type = layer_type if layer_type is not None else _infer_mxfp8_layer_type(layer_name)
         self._mxfp8_layer_index = layer_index if layer_index is not None else _infer_mxfp8_layer_index(layer_name)
@@ -381,6 +398,10 @@ class MXFP8QATLinear(nn.Linear):
         mxfp8_quant_backend: str = "npu",
         mxfp8_rounding_mode: str = "round",
         mxfp8_probe_quant_error: bool = False,
+        mxfp8_rotation_enable: bool = False,
+        mxfp8_rotation_kind: str = "block_hadamard_sign",
+        mxfp8_rotation_block_size: int = _MXFP8_BLOCK_SIZE,
+        mxfp8_rotation_seed: int = 0,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -396,6 +417,10 @@ class MXFP8QATLinear(nn.Linear):
             mxfp8_quant_backend=mxfp8_quant_backend,
             mxfp8_rounding_mode=mxfp8_rounding_mode,
             mxfp8_probe_quant_error=mxfp8_probe_quant_error,
+            mxfp8_rotation_enable=mxfp8_rotation_enable,
+            mxfp8_rotation_kind=mxfp8_rotation_kind,
+            mxfp8_rotation_block_size=mxfp8_rotation_block_size,
+            mxfp8_rotation_seed=mxfp8_rotation_seed,
             layer_name=layer_name,
             layer_type=layer_type,
             layer_index=layer_index,
@@ -442,6 +467,11 @@ class MXFP8QATLinear(nn.Linear):
                 return weight
         return weight + (weight_fq - weight).detach()
 
+    def _rotate_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.mxfp8_rotation_config.enable:
+            return tensor
+        return apply_mxfp8_block_rotation(tensor, self.mxfp8_rotation_config)
+
     def _fake_quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
@@ -460,8 +490,10 @@ class MXFP8QATLinear(nn.Linear):
         if not self.fake_quant_enabled:
             return F.linear(x, self.weight, self.bias)
 
-        weight_fq = self._fake_quantize_weight(self.weight)
-        x_fq = self._fake_quantize_activation(x) if self.mode == QATMode.W8A8_MXFP8 else x
+        rotated_weight = self._rotate_tensor(self.weight)
+        rotated_x = self._rotate_tensor(x)
+        weight_fq = self._fake_quantize_weight(rotated_weight)
+        x_fq = self._fake_quantize_activation(rotated_x) if self.mode == QATMode.W8A8_MXFP8 else rotated_x
         return F.linear(x_fq, weight_fq, self.bias)
 
     def extra_repr(self) -> str:
@@ -470,6 +502,10 @@ class MXFP8QATLinear(nn.Linear):
             f"bias={self.bias is not None}, mode={self.mode.value}, "
             f"group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
             f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, "
+            f"mxfp8_rotation_enable={self.mxfp8_rotation_config.enable}, "
+            f"mxfp8_rotation_kind={self.mxfp8_rotation_config.kind}, "
+            f"mxfp8_rotation_block_size={self.mxfp8_rotation_config.block_size}, "
+            f"mxfp8_rotation_seed={self.mxfp8_rotation_config.seed}, "
             f"mxfp8_probe_quant_error={self.mxfp8_probe_quant_error}, "
             f"fake_quant_enabled={self.fake_quant_enabled}"
         )
