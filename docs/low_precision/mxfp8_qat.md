@@ -70,7 +70,7 @@ actor_rollout_ref:
 | `fsdp_config.qat.quantization_config_path` | vLLM quantization config JSON | Required when QAT is enabled |
 | `fsdp_config.qat.mxfp8_quant_backend` | Quantization backend | `npu` or `torch` |
 | `fsdp_config.qat.mxfp8_rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
-| `fsdp_config.qat.mxfp8_probe_quant_error` | Log per-layer quantization error | `False` |
+| `fsdp_config.qat.mxfp8_probe_quant_error` | Log aggregated per-layer quantization error | `False` |
 | `fsdp_config.qat.mxfp8_probe_quant_error_output_path` | JSONL output path for probes | Required if probes are enabled |
 
 ---
@@ -120,18 +120,20 @@ per-parameter descriptors that contain `MXFP8`.
 
 ## Probe Logging
 
-Enable `mxfp8_probe_quant_error` when you want to inspect quantization error layer by layer. The probe records include:
+Enable `mxfp8_probe_quant_error` when you want to inspect quantization error by step, layer index, layer type, and
+error type. The probe aggregates all matching layer events and writes one final MAE record for each group. Records with
+`step: null` are skipped.
 
-- layer name
 - layer type
 - layer index
 - error type
-- error value
+- aggregated error value
 - quantization backend
 - rounding mode
+- rank
 - training step
 
-The output format is JSONL, one record per layer event.
+The output format is JSONL, one rank-0 record per `(step, error_type, layer_index, layer_type)` group.
 
 ---
 

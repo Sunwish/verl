@@ -78,17 +78,23 @@ class _MXFP8ProbeRecorder:
         self.output_path: Optional[str] = None
         self.rank0_only = True
         self.current_step: Any = None
+        self._aggregates: dict[tuple, dict[str, Any]] = {}
         self._fp = None
         self._lock = threading.Lock()
         self._atexit_registered = False
 
     def configure(self, enabled: bool, output_path: Optional[str], rank0_only: bool = True):
         with self._lock:
+            self._flush_locked()
             self._close_locked()
             self.enabled = enabled
             self.output_path = output_path if enabled else None
             self.rank0_only = rank0_only
             self.current_step = None
+            self._aggregates.clear()
+            if enabled and output_path is not None and not self._atexit_registered:
+                atexit.register(self.close)
+                self._atexit_registered = True
 
     def set_step(self, step: Any):
         self.current_step = step
@@ -115,33 +121,77 @@ class _MXFP8ProbeRecorder:
             self._fp.close()
             self._fp = None
 
+    def _flush_locked(self):
+        if not self._aggregates:
+            return
+
+        records = []
+        for aggregate in self._aggregates.values():
+            element_count = aggregate["element_count"]
+            if element_count <= 0:
+                continue
+            record = aggregate["record"].copy()
+            record["error_value"] = aggregate["error_sum"] / element_count
+            records.append(record)
+
+        records.sort(key=_mxfp8_probe_record_sort_key)
+        for record in records:
+            payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+            logger.warning("[MXFP8 probe] %s", payload)
+
+            if self.output_path is None:
+                continue
+            self._ensure_open_locked()
+            if self._fp is not None:
+                self._fp.write(payload + "\n")
+
+        if self._fp is not None:
+            self._fp.flush()
+        self._aggregates.clear()
+
     def close(self):
         with self._lock:
+            self._flush_locked()
             self._close_locked()
 
     def reset(self):
         with self._lock:
+            self._flush_locked()
             self._close_locked()
             self.enabled = False
             self.output_path = None
             self.rank0_only = True
             self.current_step = None
+            self._aggregates.clear()
 
-    def record(self, record: dict):
+    def record(self, record: dict, error_sum: float, element_count: int):
         if not self.enabled or not self._is_rank0():
             return
 
-        payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
-        logger.warning("[MXFP8 probe] %s", payload)
-
-        if self.output_path is None:
+        if record.get("step") is None or element_count <= 0:
             return
 
+        key = (
+            _freeze_mxfp8_probe_value(record.get("step")),
+            record.get("error_type"),
+            record.get("layer_index"),
+            record.get("layer_type"),
+            record.get("mode"),
+            record.get("quant_backend"),
+            record.get("rounding_mode"),
+            record.get("rank"),
+        )
         with self._lock:
-            self._ensure_open_locked()
-            if self._fp is not None:
-                self._fp.write(payload + "\n")
-                self._fp.flush()
+            aggregate = self._aggregates.setdefault(
+                key,
+                {
+                    "record": record,
+                    "error_sum": 0.0,
+                    "element_count": 0,
+                },
+            )
+            aggregate["error_sum"] += float(error_sum)
+            aggregate["element_count"] += int(element_count)
 
 
 _MXFP8_PROBE_RECORDER = _MXFP8ProbeRecorder()
@@ -188,6 +238,24 @@ def _infer_mxfp8_layer_index(layer_name: Optional[str]) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def _freeze_mxfp8_probe_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(_freeze_mxfp8_probe_value(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(sorted((key, _freeze_mxfp8_probe_value(item)) for key, item in value.items()))
+    return value
+
+
+def _mxfp8_probe_record_sort_key(record: dict) -> tuple:
+    return (
+        json.dumps(record.get("step"), sort_keys=True),
+        str(record.get("error_type")),
+        record.get("layer_index") if record.get("layer_index") is not None else -1,
+        str(record.get("layer_type")),
+        str(record.get("rank")),
+    )
+
+
 def _normalize_mxfp8_probe_step(step: Any) -> Any:
     if step is None:
         return None
@@ -212,11 +280,11 @@ def _normalize_mxfp8_probe_step(step: Any) -> Any:
 
 def _record_mxfp8_quant_error(
     *,
-    layer_name: Optional[str],
     layer_type: Optional[str],
     layer_index: Optional[int],
     error_type: str,
-    error_value: float,
+    error_sum: float,
+    element_count: int,
     qat_mode: str,
     quant_backend: str,
     rounding_mode: str,
@@ -226,16 +294,16 @@ def _record_mxfp8_quant_error(
         {
             "error_metric": "mae",
             "error_type": error_type,
-            "error_value": float(error_value),
             "layer_index": layer_index,
-            "layer_name": layer_name,
             "layer_type": layer_type,
             "mode": qat_mode,
             "quant_backend": quant_backend,
             "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
             "rounding_mode": rounding_mode,
             "step": _normalize_mxfp8_probe_step(step),
-        }
+        },
+        error_sum=error_sum,
+        element_count=element_count,
     )
 
 
@@ -494,11 +562,11 @@ class MXFP8QATLinear(nn.Linear):
 
         diff = (quantized.to(torch.float32) - original.detach().to(torch.float32)).abs()
         _record_mxfp8_quant_error(
-            layer_name=self._mxfp8_layer_name,
             layer_type=self._mxfp8_layer_type,
             layer_index=self._mxfp8_layer_index,
             error_type=error_type,
-            error_value=diff.mean().item(),
+            error_sum=diff.sum().item(),
+            element_count=diff.numel(),
             qat_mode=self.mode.value,
             quant_backend=self.mxfp8_quant_backend,
             rounding_mode=self.mxfp8_rounding_mode,
