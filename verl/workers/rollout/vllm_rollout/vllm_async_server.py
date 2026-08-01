@@ -364,6 +364,15 @@ class vLLMHttpServer:
             args.update({"enable_return_routed_experts": True})
 
         server_args = ["serve", self.rollout_bootstrap_model_path] + build_cli_args_from_config(args)
+        if self.replica_rank == 0 and self.node_rank == 0:
+            logger.warning(
+                "vLLM rollout server launching with bootstrap model path: rollout_bootstrap_model_path=%s, "
+                "training_model_path=%s, quantization=%s, qat_enable=%s",
+                self.rollout_bootstrap_model_path,
+                self.model_config.local_path,
+                quantization,
+                bool((getattr(self.config, "qat", {}) or {}).get("enable", False)),
+            )
 
         if self.replica_rank == 0:
             pprint(server_args)
@@ -877,8 +886,10 @@ class vLLMHttpServer:
                 from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
                 from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, mxfp8_rotation_config_to_dict
 
-                os.environ[MXFP8_QUANT_BACKEND_ENV] = normalize_mxfp8_quant_backend(qat_config.mxfp8_quant_backend)
-                os.environ[MXFP8_ROUNDING_MODE_ENV] = normalize_mxfp8_rounding_mode(qat_config.mxfp8_rounding_mode)
+                mxfp8_quant_backend = normalize_mxfp8_quant_backend(qat_config.mxfp8_quant_backend)
+                mxfp8_rounding_mode = normalize_mxfp8_rounding_mode(qat_config.mxfp8_rounding_mode)
+                os.environ[MXFP8_QUANT_BACKEND_ENV] = mxfp8_quant_backend
+                os.environ[MXFP8_ROUNDING_MODE_ENV] = mxfp8_rounding_mode
                 quantization_config_dict["group_size"] = qat_config.group_size
                 rotation_config = MXFP8RotationConfig(
                     enable=qat_config.mxfp8_rotation_enable,
@@ -887,6 +898,18 @@ class vLLMHttpServer:
                     seed=qat_config.mxfp8_rotation_seed,
                 )
                 quantization_config_dict.update(mxfp8_rotation_config_to_dict(rotation_config))
+                logger.warning(
+                    "MXFP8 QAT rollout quantization configured: mode=%s, quant_backend=%s, rounding_mode=%s, "
+                    "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+                    qat_config.mode.lower(),
+                    mxfp8_quant_backend,
+                    mxfp8_rounding_mode,
+                    qat_config.group_size,
+                    rotation_config.enable,
+                    rotation_config.kind,
+                    rotation_config.block_size,
+                    rotation_config.seed,
+                )
                 if rotation_config.enable:
                     logger.warning(
                         "MXFP8 block rotation injected for vLLM rollout: kind=%s, block_size=%s, seed=%s",
@@ -912,6 +935,12 @@ class vLLMHttpServer:
                 quantization = "ascend"
                 apply_vllm_fp8_patches()
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+                logger.warning(
+                    "MXFP8 QAT rollout quantization activated: quantization=ascend, quant_method=%s, "
+                    "has_mxfp8_entry=%s, fp8_patch_enabled=True",
+                    quant_method,
+                    has_mxfp8_entry,
+                )
             else:
                 raise ValueError(f"Unsupported quant_method: {quant_method}")
 
@@ -922,6 +951,15 @@ class vLLMHttpServer:
             _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
+
+            if quantization == "ascend":
+                logger.warning(
+                    "Ascend rollout quantization configured: bootstrap_model_path=%s, "
+                    "quantization_config_file=%s, live weight sync will inspect vLLM quant_config "
+                    "and quantize incoming trainer weights when MXFP8 is detected",
+                    self.rollout_bootstrap_model_path,
+                    self.config.quantization_config_file,
+                )
 
             if quantization == "fp8":
                 # Ignore MoE router layers for FP8 quantization

@@ -67,6 +67,8 @@ _MXFP8_HASH_MODULUS = 2**32
 _MXFP8_HASH_RANDOM_SHIFT = 2**8
 _MXFP8_HASH_RANDOM_LEVELS = 2**24
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+_MXFP8_RUNTIME_LOGGED: set[tuple] = set()
+_MXFP8_RUNTIME_LOG_LOCK = threading.Lock()
 
 
 class _MXFP8ProbeRecorder:
@@ -146,6 +148,12 @@ _MXFP8_PROBE_RECORDER = _MXFP8ProbeRecorder()
 
 def configure_mxfp8_probe(enabled: bool, output_path: Optional[str], rank0_only: bool = True):
     _MXFP8_PROBE_RECORDER.configure(enabled=enabled, output_path=output_path, rank0_only=rank0_only)
+    logger.warning(
+        "MXFP8 QAT quant error probe configured: enabled=%s, output_path=%s, rank0_only=%s",
+        enabled,
+        output_path,
+        rank0_only,
+    )
 
 
 def reset_mxfp8_probe():
@@ -225,6 +233,14 @@ def normalize_mxfp8_rounding_mode(rounding_mode: str) -> str:
             f"Supported modes: {sorted(_MXFP8_ROUNDING_MODES)}"
         )
     return rounding_mode
+
+
+def _warn_mxfp8_runtime_once(key: tuple, message: str, *args):
+    with _MXFP8_RUNTIME_LOG_LOCK:
+        if key in _MXFP8_RUNTIME_LOGGED:
+            return
+        _MXFP8_RUNTIME_LOGGED.add(key)
+    logger.warning(message, *args)
 
 
 def _dequantize_mxfp8(weight_q: torch.Tensor, weight_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -324,6 +340,14 @@ def quantize_mxfp8_tensor(
     _check_mxfp8_2d_tensor(tensor)
     quant_backend = normalize_mxfp8_quant_backend(quant_backend)
     rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
+    _warn_mxfp8_runtime_once(
+        ("quantizer", quant_backend, rounding_mode, tensor.device.type),
+        "MXFP8 quantizer path executed: backend=%s, rounding_mode=%s, device=%s, tensor_shape=%s",
+        quant_backend,
+        rounding_mode,
+        tensor.device,
+        tuple(tensor.shape),
+    )
     if quant_backend == "npu":
         if rounding_mode != "round":
             raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
@@ -494,6 +518,27 @@ class MXFP8QATLinear(nn.Linear):
         rotated_x = self._rotate_tensor(x)
         weight_fq = self._fake_quantize_weight(rotated_weight)
         x_fq = self._fake_quantize_activation(rotated_x) if self.mode == QATMode.W8A8_MXFP8 else rotated_x
+        _warn_mxfp8_runtime_once(
+            (
+                "qat_forward",
+                self.mode.value,
+                self.mxfp8_quant_backend,
+                self.mxfp8_rounding_mode,
+                self.mxfp8_probe_quant_error,
+                self.mxfp8_rotation_config.enable,
+            ),
+            "MXFP8 QAT fake quant executed in training forward: mode=%s, layer=%s, quant_backend=%s, "
+            "rounding_mode=%s, weight_fake_quant=True, activation_fake_quant=%s, probe_quant_error=%s, "
+            "rotation_enable=%s, input_shape=%s",
+            self.mode.value,
+            self._mxfp8_layer_name,
+            self.mxfp8_quant_backend,
+            self.mxfp8_rounding_mode,
+            self.mode == QATMode.W8A8_MXFP8,
+            self.mxfp8_probe_quant_error,
+            self.mxfp8_rotation_config.enable,
+            tuple(x.shape),
+        )
         return F.linear(x_fq, weight_fq, self.bias)
 
     def extra_repr(self) -> str:

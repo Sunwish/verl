@@ -167,7 +167,8 @@ def quantize_mxfp8_weight_ascend(
     return quantize_mxfp8_tensor(weight.to(dtype), quant_backend=quant_backend, rounding_mode=rounding_mode)
 
 
-def restore_mxfp8_weights_for_loading(model):
+def restore_mxfp8_weights_for_loading(model) -> int:
+    restored_count = 0
     for name, module in model.named_modules():
         if (
             hasattr(module, "_mxfp8_transformed")
@@ -176,6 +177,8 @@ def restore_mxfp8_weights_for_loading(model):
             and hasattr(module.quant_method.quant_method, "restore_weights_for_rl_loading")
         ):
             module.quant_method.quant_method.restore_weights_for_rl_loading(module)
+            restored_count += 1
+    return restored_count
 
 
 def apply_mxfp8_transformation_after_loading(model):
@@ -191,8 +194,9 @@ def apply_mxfp8_transformation_after_loading(model):
         from vllm.model_executor.layers.linear import LinearBase
     except ImportError:
         logger.warning("Could not import LinearBase, skipping MXFP8 transformation")
-        return
+        return 0
 
+    transformed_count = 0
     for name, module in model.named_modules():
         if (isinstance(module, LinearBase) or isinstance(module, FusedMoE)) and hasattr(
             module, "_mxfp8_original_shapes"
@@ -200,9 +204,11 @@ def apply_mxfp8_transformation_after_loading(model):
             if hasattr(module, "quant_method") and hasattr(module.quant_method, "process_weights_after_loading"):
                 logger.debug(f"Applying MXFP8 transformation for module: {name}")
                 module.quant_method.process_weights_after_loading(module)
+                transformed_count += 1
+    return transformed_count
 
 
-def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
+def quant_weights(weights, model, quant_config, dtype=torch.bfloat16, stats: dict | None = None):
     """Quantize weights to FP8 format using a memory-efficient generator.
 
 
@@ -235,9 +241,14 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
 
     for k, v in weights:
         if not is_fp8_weight(k, model):
+            if stats is not None:
+                stats["passthrough_tensor_count"] = stats.get("passthrough_tensor_count", 0) + 1
             yield (k, v)
             continue
 
+        if stats is not None:
+            stats.setdefault("quantized_param_names", set()).add(k)
+            stats["quantized_tensor_count"] = stats.get("quantized_tensor_count", 0) + 1
         # Cast the weight into fp8 and its scale factor
         if torch.distributed.get_rank() == 0:
             logger.debug(f"Quantizing to FP8 blockwise: {k}")
@@ -262,17 +273,23 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
 
         # Yield the scale with appropriate naming based on vLLM version
         if is_mxfp8_npu:
+            if stats is not None:
+                stats["scale_tensor_count"] = stats.get("scale_tensor_count", 0) + 1
             yield (k + "_scale", param_scale)
         elif _use_scale_not_scale_inv and "expert" not in k:
+            if stats is not None:
+                stats["scale_tensor_count"] = stats.get("scale_tensor_count", 0) + 1
             yield (k + "_scale", param_scale)
         else:
+            if stats is not None:
+                stats["scale_tensor_count"] = stats.get("scale_tensor_count", 0) + 1
             yield (k + "_scale_inv", param_scale)
 
         # Explicitly delete original tensor reference to help GC
         del v, param_lp, param_scale
 
 
-def load_quanted_weights(weights, model_runner, is_drafter=False):
+def load_quanted_weights(weights, model_runner, is_drafter=False, return_stats=False):
     if is_drafter:
         drafter = getattr(model_runner, "drafter", None)
         model = drafter.model if drafter is not None and hasattr(drafter, "model") else None
@@ -286,15 +303,34 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
     vllm_dtype = model_runner.vllm_config.model_config.dtype
 
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
+    mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu") if is_mxfp8_npu else None
+    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="round") if is_mxfp8_npu else None
+    rotation_config = get_mxfp8_rotation_config(getattr(quant_config, "quant_description", {}) or {})
+    quant_stats = {
+        "is_mxfp8": is_mxfp8_npu,
+        "quantized_param_names": set(),
+        "quantized_tensor_count": 0,
+        "scale_tensor_count": 0,
+        "passthrough_tensor_count": 0,
+        "quant_backend": mxfp8_quant_backend,
+        "rounding_mode": mxfp8_rounding_mode,
+        "rotation_enable": rotation_config.enable,
+        "rotation_kind": rotation_config.kind,
+        "rotation_block_size": rotation_config.block_size,
+        "rotation_seed": rotation_config.seed,
+        "vllm_dtype": str(vllm_dtype),
+        "is_drafter": is_drafter,
+    }
 
+    restored_count = 0
     if is_mxfp8_npu:
         # For MXFP8 on NPU, we need to restore weights to original shapes
         # before loading, then re-apply transformation after loading.
         # This is because process_weights_after_loading transposes the weights,
         # but the weight_loader expects original shapes.
-        restore_mxfp8_weights_for_loading(model)
+        restored_count = restore_mxfp8_weights_for_loading(model)
 
-    weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
+    weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype, stats=quant_stats)
 
     # Monkey patch the param class to their subclass, as certain models
     # will check the param type to call the proper weightloader
@@ -309,10 +345,16 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
         if hasattr(param, "subclass_type"):
             param.__class__ = param.orig_type
 
+    transformed_count = 0
     if is_mxfp8_npu:
         # Re-apply MXFP8 transformations after weight loading
-        apply_mxfp8_transformation_after_loading(model)
+        transformed_count = apply_mxfp8_transformation_after_loading(model)
 
+    quant_stats["loaded_param_count"] = len(loaded_params) if loaded_params is not None else 0
+    quant_stats["restored_layer_count"] = restored_count
+    quant_stats["transformed_layer_count"] = transformed_count
+    if return_stats:
+        return loaded_params, quant_stats
     return loaded_params
 
 

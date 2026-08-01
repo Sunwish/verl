@@ -83,6 +83,35 @@ def test_quant_weights_mxfp8_emits_scale_suffix(monkeypatch):
     assert outputs[1][1].dtype == torch.uint8
 
 
+def test_quant_weights_mxfp8_records_quantization_stats(monkeypatch):
+    _install_fake_vllm_ascend(monkeypatch)
+    quant_config = _FakeAscendModelSlimConfig({"quant_method": "ascend"})
+
+    fake_torch_npu = types.SimpleNamespace(
+        float8_e4m3fn=torch.float8_e4m3fn,
+        npu_dynamic_mx_quant=lambda tensor, axis, dst_type: (
+            tensor.to(torch.float8_e4m3fn),
+            torch.randint(1, 10, (tensor.shape[0], tensor.shape[1] // 32, 1), dtype=torch.uint8),
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    stats = {}
+    model = object()
+    weights = [("layer.weight", torch.randn(4, 32, dtype=torch.bfloat16)), ("layer.bias", torch.ones(4))]
+
+    with patch("verl.utils.vllm.vllm_fp8_utils.is_fp8_weight", side_effect=[True, False]), patch(
+        "torch.distributed.get_rank", return_value=0
+    ):
+        outputs = list(quant_weights(weights, model, quant_config, dtype=torch.bfloat16, stats=stats))
+
+    assert len(outputs) == 3
+    assert stats["quantized_param_names"] == {"layer.weight"}
+    assert stats["quantized_tensor_count"] == 1
+    assert stats["scale_tensor_count"] == 1
+    assert stats["passthrough_tensor_count"] == 1
+
+
 def test_quant_weights_mxfp8_torch_backend_emits_scale_suffix(monkeypatch):
     _install_fake_vllm_ascend(monkeypatch)
     monkeypatch.setenv(MXFP8_QUANT_BACKEND_ENV, "torch")

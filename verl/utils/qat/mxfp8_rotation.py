@@ -21,12 +21,15 @@ is repeated along the hidden dimension, matching the MXFP8 group size.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 MXFP8_ROTATION_ENABLE_KEY = "mxfp8_rotation_enable"
 MXFP8_ROTATION_KIND_KEY = "mxfp8_rotation_kind"
@@ -43,6 +46,7 @@ _DEFAULT_BLOCK_SIZE = 32
 _DEFAULT_SEED = 0
 _MAX_TORCH_SEED = 2**63 - 1
 _ROTATION_MATRIX_CACHE: dict[tuple[str, int, int, str, str], torch.Tensor] = {}
+_ROTATION_LOGGED: set[tuple[str, int, int, str, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -203,6 +207,26 @@ def apply_mxfp8_block_rotation(
     matrix = _get_block_rotation_matrix(config, device=tensor.device, dtype=work_dtype)
     if transpose:
         matrix = matrix.t()
+    log_key = (
+        normalize_mxfp8_rotation_kind(config.kind),
+        int(config.block_size),
+        _normalize_seed(config.seed),
+        str(tensor.device),
+        str(work_dtype),
+    )
+    if log_key not in _ROTATION_LOGGED:
+        _ROTATION_LOGGED.add(log_key)
+        logger.warning(
+            "MXFP8 rotation matrix applied: kind=%s, block_size=%s, seed=%s, transpose=%s, "
+            "device=%s, work_dtype=%s, tensor_shape=%s",
+            config.kind,
+            config.block_size,
+            config.seed,
+            transpose,
+            tensor.device,
+            work_dtype,
+            tuple(tensor.shape),
+        )
 
     tensor_2d = tensor.reshape(-1, last_dim).to(work_dtype)
     tensor_blocked = tensor_2d.reshape(tensor_2d.shape[0], last_dim // config.block_size, config.block_size)
