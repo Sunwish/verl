@@ -130,7 +130,7 @@ def test_mxfp8_qat_probe_mode_logs_layer_metadata_and_preserves_output(tmp_path)
     x = torch.linspace(-1.0, 1.0, steps=64, dtype=torch.bfloat16).view(2, 32)
     baseline = F.linear(x, model.layers[0].q_proj.weight)
 
-    with torch.no_grad(), mxfp8_probe_step_context(17):
+    with torch.no_grad(), mxfp8_probe_step_context([17, 17]):
         out = model(x)
 
     assert torch.allclose(out, baseline)

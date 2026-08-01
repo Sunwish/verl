@@ -26,7 +26,7 @@ import os
 import re
 import threading
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -76,7 +76,7 @@ class _MXFP8ProbeRecorder:
         self.enabled = False
         self.output_path: Optional[str] = None
         self.rank0_only = True
-        self.current_step: Optional[int] = None
+        self.current_step: Any = None
         self._fp = None
         self._lock = threading.Lock()
         self._atexit_registered = False
@@ -89,7 +89,7 @@ class _MXFP8ProbeRecorder:
             self.rank0_only = rank0_only
             self.current_step = None
 
-    def set_step(self, step: Optional[int]):
+    def set_step(self, step: Any):
         self.current_step = step
 
     def _is_rank0(self) -> bool:
@@ -160,12 +160,12 @@ def reset_mxfp8_probe():
     _MXFP8_PROBE_RECORDER.reset()
 
 
-def set_mxfp8_probe_step(step: Optional[int]):
+def set_mxfp8_probe_step(step: Any):
     _MXFP8_PROBE_RECORDER.set_step(step)
 
 
 @contextmanager
-def mxfp8_probe_step_context(step: Optional[int]):
+def mxfp8_probe_step_context(step: Any):
     previous_step = _MXFP8_PROBE_RECORDER.current_step
     _MXFP8_PROBE_RECORDER.set_step(step)
     try:
@@ -185,6 +185,28 @@ def _infer_mxfp8_layer_index(layer_name: Optional[str]) -> Optional[int]:
         return None
     match = _MXFP8_LAYER_IDX_RE.search(layer_name)
     return int(match.group(1)) if match else None
+
+
+def _normalize_mxfp8_probe_step(step: Any) -> Any:
+    if step is None:
+        return None
+    if isinstance(step, torch.Tensor):
+        if step.numel() == 0:
+            return None
+        if step.numel() == 1:
+            return int(step.item())
+        step = step.detach().cpu().tolist()
+    if isinstance(step, tuple):
+        step = list(step)
+    if isinstance(step, list):
+        if not step:
+            return None
+        normalized_steps = [_normalize_mxfp8_probe_step(item) for item in step]
+        first_step = normalized_steps[0]
+        if all(item == first_step for item in normalized_steps):
+            return first_step
+        return normalized_steps
+    return int(step)
 
 
 def _record_mxfp8_quant_error(
@@ -211,7 +233,7 @@ def _record_mxfp8_quant_error(
             "quant_backend": quant_backend,
             "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
             "rounding_mode": rounding_mode,
-            "step": int(step) if step is not None else None,
+            "step": _normalize_mxfp8_probe_step(step),
         }
     )
 
