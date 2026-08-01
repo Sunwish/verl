@@ -656,7 +656,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.train_mini_batch(data=data)
+        try:
+            output = self.actor.train_mini_batch(data=data)
+        finally:
+            from verl.utils.qat.mxfp8_linear import flush_mxfp8_probe
+
+            flush_mxfp8_probe()
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

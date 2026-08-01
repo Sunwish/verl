@@ -43,6 +43,7 @@ from verl.utils.qat.mxfp8_rotation import (
 __all__ = [
     "MXFP8QATLinear",
     "configure_mxfp8_probe",
+    "flush_mxfp8_probe",
     "mxfp8_probe_step_context",
     "normalize_mxfp8_quant_backend",
     "normalize_mxfp8_rounding_mode",
@@ -79,6 +80,7 @@ class _MXFP8ProbeRecorder:
         self.rank0_only = True
         self.current_step: Any = None
         self._aggregates: dict[tuple, dict[str, Any]] = {}
+        self._last_recorded_step_key: Any = None
         self._fp = None
         self._lock = threading.Lock()
         self._atexit_registered = False
@@ -92,6 +94,7 @@ class _MXFP8ProbeRecorder:
             self.rank0_only = rank0_only
             self.current_step = None
             self._aggregates.clear()
+            self._last_recorded_step_key = None
             if enabled and output_path is not None and not self._atexit_registered:
                 atexit.register(self.close)
                 self._atexit_registered = True
@@ -148,11 +151,16 @@ class _MXFP8ProbeRecorder:
         if self._fp is not None:
             self._fp.flush()
         self._aggregates.clear()
+        self._last_recorded_step_key = None
 
     def close(self):
         with self._lock:
             self._flush_locked()
             self._close_locked()
+
+    def flush(self):
+        with self._lock:
+            self._flush_locked()
 
     def reset(self):
         with self._lock:
@@ -163,6 +171,7 @@ class _MXFP8ProbeRecorder:
             self.rank0_only = True
             self.current_step = None
             self._aggregates.clear()
+            self._last_recorded_step_key = None
 
     def record(self, record: dict, error_sum: float, element_count: int):
         if not self.enabled or not self._is_rank0():
@@ -171,8 +180,9 @@ class _MXFP8ProbeRecorder:
         if record.get("step") is None or element_count <= 0:
             return
 
+        step_key = _freeze_mxfp8_probe_value(record.get("step"))
         key = (
-            _freeze_mxfp8_probe_value(record.get("step")),
+            step_key,
             record.get("error_type"),
             record.get("layer_index"),
             record.get("layer_type"),
@@ -182,6 +192,9 @@ class _MXFP8ProbeRecorder:
             record.get("rank"),
         )
         with self._lock:
+            if self._last_recorded_step_key is not None and self._last_recorded_step_key != step_key:
+                self._flush_locked()
+            self._last_recorded_step_key = step_key
             aggregate = self._aggregates.setdefault(
                 key,
                 {
@@ -205,6 +218,10 @@ def configure_mxfp8_probe(enabled: bool, output_path: Optional[str], rank0_only:
         output_path,
         rank0_only,
     )
+
+
+def flush_mxfp8_probe():
+    _MXFP8_PROBE_RECORDER.flush()
 
 
 def reset_mxfp8_probe():
