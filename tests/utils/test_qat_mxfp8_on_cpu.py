@@ -51,10 +51,10 @@ class _ProbeLayer(nn.Module):
 class _ProbeModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.layers = nn.ModuleList([_ProbeLayer()])
+        self.layers = nn.ModuleList([_ProbeLayer(), _ProbeLayer()])
 
     def forward(self, x):
-        return self.layers[0](x)
+        return self.layers[0](x) + self.layers[1](x)
 
 
 @pytest.fixture(autouse=True)
@@ -108,7 +108,7 @@ def test_mxfp8_block_rotation_preserves_linear_equivalence():
     assert torch.allclose(rotated, baseline, atol=1e-5, rtol=1e-5)
 
 
-def test_mxfp8_qat_probe_mode_logs_layer_metadata_and_preserves_output(tmp_path):
+def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):
     model = _ProbeModel()
     output_path = tmp_path / "mxfp8_probe.jsonl"
 
@@ -128,28 +128,45 @@ def test_mxfp8_qat_probe_mode_logs_layer_metadata_and_preserves_output(tmp_path)
     assert model.layers[0].q_proj.mxfp8_probe_quant_error is True
     assert model.layers[0].q_proj._mxfp8_layer_type == "q_proj"
     assert model.layers[0].q_proj._mxfp8_layer_index == 0
+    assert model.layers[1].q_proj._mxfp8_layer_type == "q_proj"
+    assert model.layers[1].q_proj._mxfp8_layer_index == 1
 
     with torch.no_grad():
         model.layers[0].q_proj.weight.copy_(torch.linspace(-2.0, 2.0, steps=16 * 32, dtype=torch.bfloat16).view(16, 32))
+        model.layers[1].q_proj.weight.copy_(torch.linspace(-1.0, 3.0, steps=16 * 32, dtype=torch.bfloat16).view(16, 32))
 
     x = torch.linspace(-1.0, 1.0, steps=64, dtype=torch.bfloat16).view(2, 32)
-    baseline = F.linear(x, model.layers[0].q_proj.weight)
+    baseline = F.linear(x, model.layers[0].q_proj.weight) + F.linear(x, model.layers[1].q_proj.weight)
 
-    with torch.no_grad(), mxfp8_probe_step_context([17, 17]):
-        out = model(x)
+    with torch.no_grad():
+        with mxfp8_probe_step_context([17, 17]):
+            out = model(x)
+        with mxfp8_probe_step_context(17):
+            out_alt = model(-x)
+        with mxfp8_probe_step_context(None):
+            out_null = model(x)
 
     assert torch.allclose(out, baseline)
+    assert torch.allclose(
+        out_alt, F.linear(-x, model.layers[0].q_proj.weight) + F.linear(-x, model.layers[1].q_proj.weight)
+    )
+    assert torch.allclose(out_null, baseline)
     reset_mxfp8_probe()
 
     records = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
-    assert len(records) == 2
-    assert records[0]["error_type"] == "weight"
-    assert records[1]["error_type"] == "activation"
+    assert len(records) == 4
+    assert {
+        (record["step"], record["error_type"], record["layer_index"], record["layer_type"]) for record in records
+    } == {
+        (17, "weight", 0, "q_proj"),
+        (17, "activation", 0, "q_proj"),
+        (17, "weight", 1, "q_proj"),
+        (17, "activation", 1, "q_proj"),
+    }
     for record in records:
-        assert record["step"] == 17
-        assert record["layer_name"] == "layers.0.q_proj"
+        assert "layer_name" not in record
         assert record["layer_type"] == "q_proj"
-        assert record["layer_index"] == 0
+        assert record["layer_index"] in {0, 1}
         assert record["error_metric"] == "mae"
 
 
