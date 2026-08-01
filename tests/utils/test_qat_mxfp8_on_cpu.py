@@ -25,6 +25,7 @@ from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales
 from verl.utils.qat.linear import QATLinear, QATMode
 from verl.utils.qat.mxfp8_linear import (
     MXFP8QATLinear,
+    flush_mxfp8_probe,
     mxfp8_probe_step_context,
     quantize_mxfp8_tensor,
     reset_mxfp8_probe,
@@ -151,6 +152,8 @@ def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):
         out_alt, F.linear(-x, model.layers[0].q_proj.weight) + F.linear(-x, model.layers[1].q_proj.weight)
     )
     assert torch.allclose(out_null, baseline)
+    flush_mxfp8_probe()
+    assert output_path.exists()
     reset_mxfp8_probe()
 
     records = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
