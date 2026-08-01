@@ -177,6 +177,16 @@ def apply_qat(
     if mode.value in _MXFP8_MODES:
         from verl.utils.qat.mxfp8_linear import configure_mxfp8_probe
 
+        logger.warning(
+            "MXFP8 QAT requested on training model: mode=%s, group_size=%s, quant_backend=%s, "
+            "rounding_mode=%s, probe_quant_error=%s, rotation_enable=%s",
+            mode.value,
+            config.group_size,
+            config.mxfp8_quant_backend,
+            config.mxfp8_rounding_mode,
+            config.mxfp8_probe_quant_error,
+            config.mxfp8_rotation_enable,
+        )
         configure_mxfp8_probe(
             enabled=config.mxfp8_probe_quant_error,
             output_path=config.mxfp8_probe_quant_error_output_path,
@@ -231,6 +241,19 @@ def apply_qat(
         converted_count += 1
 
     logger.info(f"Successfully applied QAT to {converted_count} layers")
+    if mode.value in _MXFP8_MODES:
+        logger.warning(
+            "MXFP8 QAT applied to training model: mode=%s, converted_layers=%s, quant_backend=%s, "
+            "rounding_mode=%s, weight_fake_quant=True, activation_fake_quant=%s, probe_quant_error=%s, "
+            "rotation_enable=%s",
+            mode.value,
+            converted_count,
+            config.mxfp8_quant_backend,
+            config.mxfp8_rounding_mode,
+            mode.value == "w8a8_mxfp8",
+            config.mxfp8_probe_quant_error,
+            config.mxfp8_rotation_enable,
+        )
 
     return model
 

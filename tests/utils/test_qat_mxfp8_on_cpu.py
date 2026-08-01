@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import logging
 
 import torch
 import torch.nn as nn
@@ -59,7 +60,8 @@ def _reset_mxfp8_probe_state():
 
 
 @pytest.mark.parametrize("mode", ["w8a16_mxfp8", "w8a8_mxfp8"])
-def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode):
+def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode, caplog):
+    caplog.set_level(logging.WARNING)
     model = _TinyModel()
 
     apply_qat(
@@ -78,6 +80,13 @@ def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode):
     assert model.proj.mxfp8_quant_backend == "torch"
     assert model.proj.mxfp8_rounding_mode == "hash"
     assert isinstance(model.lm_head, nn.Linear)
+    assert any(
+        "MXFP8 QAT applied to training model" in record.message
+        and f"mode={mode}" in record.message
+        and "quant_backend=torch" in record.message
+        and "rounding_mode=hash" in record.message
+        for record in caplog.records
+    )
 
 
 def test_mxfp8_block_rotation_preserves_linear_equivalence():

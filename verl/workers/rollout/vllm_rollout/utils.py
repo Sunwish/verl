@@ -27,7 +27,12 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+from verl.utils.vllm.vllm_fp8_utils import (
+    apply_vllm_fp8_patches,
+    is_fp8_model,
+    is_mxfp8_vllm_ascend,
+    load_quanted_weights,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -178,6 +183,9 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+        instance._is_fp8_model = False
+        instance._is_mxfp8_model = False
+        instance._mxfp8_sync_stats = None
         return instance
 
     def _get_drafter_model(self):
@@ -233,9 +241,30 @@ class vLLMColocateWorkerExtension:
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
 
-        use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
-            self.model_runner.vllm_config
+        self._is_fp8_model = is_fp8_model(self.model_runner.vllm_config)
+        self._is_mxfp8_model = self._is_fp8_model and is_mxfp8_vllm_ascend(
+            self.model_runner.vllm_config.quant_config
         )
+        track_mxfp8_sync = self._is_mxfp8_model and not (peft_config and base_sync_done)
+        self._mxfp8_sync_stats = None
+        if track_mxfp8_sync:
+            self._mxfp8_sync_stats = {
+                "bucket_count": 0,
+                "quantized_param_names": set(),
+                "quantized_tensor_count": 0,
+                "scale_tensor_count": 0,
+                "passthrough_tensor_count": 0,
+                "loaded_param_count": 0,
+                "restored_layer_count": 0,
+                "transformed_layer_count": 0,
+            }
+            logger.warning(
+                "Ascend MXFP8 rollout weight sync active: incoming trainer weights will be quantized "
+                "before vLLM load, quant_config=%s",
+                self.model_runner.vllm_config.quant_config,
+            )
+
+        use_standard_weight_load = not (peft_config and base_sync_done) and not self._is_fp8_model
 
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
@@ -265,6 +294,34 @@ class vLLMColocateWorkerExtension:
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
         )
+
+        if self._mxfp8_sync_stats is not None:
+            stats = self._mxfp8_sync_stats
+            quantized_param_count = len(stats["quantized_param_names"])
+            if quantized_param_count:
+                logger.warning(
+                    "Ascend MXFP8 rollout weight sync completed: buckets=%s, quantized_params=%s, "
+                    "quantized_weight_tensors=%s, scale_tensors=%s, passthrough_tensors=%s, loaded_params=%s, "
+                    "backend=%s, rounding_mode=%s, rotation_enable=%s, restored_layers=%s, transformed_layers=%s",
+                    stats["bucket_count"],
+                    quantized_param_count,
+                    stats["quantized_tensor_count"],
+                    stats["scale_tensor_count"],
+                    stats["passthrough_tensor_count"],
+                    stats["loaded_param_count"],
+                    stats.get("quant_backend"),
+                    stats.get("rounding_mode"),
+                    stats.get("rotation_enable"),
+                    stats["restored_layer_count"],
+                    stats["transformed_layer_count"],
+                )
+            else:
+                logger.warning(
+                    "Ascend MXFP8 rollout weight sync completed with zero quantized parameters: buckets=%s, "
+                    "loaded_params=%s. Incoming trainer weights were not observed as MXFP8 weights.",
+                    stats["bucket_count"],
+                    stats["loaded_param_count"],
+                )
 
         if self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
@@ -301,10 +358,23 @@ class vLLMColocateWorkerExtension:
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(self.model_runner.vllm_config):
-                logger.info(f"FP8 model detected (async): {self.model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
-                loaded_params = load_quanted_weights(weights, self.model_runner)
-                logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
+                loaded_params, quant_stats = load_quanted_weights(
+                    weights, self.model_runner, return_stats=True
+                )
+                if self._mxfp8_sync_stats is not None:
+                    stats = self._mxfp8_sync_stats
+                    stats["bucket_count"] += 1
+                    stats["quantized_param_names"].update(quant_stats["quantized_param_names"])
+                    stats["quantized_tensor_count"] += quant_stats["quantized_tensor_count"]
+                    stats["scale_tensor_count"] += quant_stats["scale_tensor_count"]
+                    stats["passthrough_tensor_count"] += quant_stats["passthrough_tensor_count"]
+                    stats["loaded_param_count"] += quant_stats["loaded_param_count"]
+                    stats["restored_layer_count"] = quant_stats["restored_layer_count"]
+                    stats["transformed_layer_count"] = quant_stats["transformed_layer_count"]
+                    stats["quant_backend"] = quant_stats["quant_backend"]
+                    stats["rounding_mode"] = quant_stats["rounding_mode"]
+                    stats["rotation_enable"] = quant_stats["rotation_enable"]
                 # Keep the draft model in sync when present.
                 if self._use_mtp_drafter_weight_sync():
                     load_quanted_weights(weights, self.model_runner, is_drafter=True)

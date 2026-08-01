@@ -243,7 +243,12 @@ class ServerAdapter(BaseRollout):
                 await self.server_handle.set_global_steps.remote(global_steps)
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
-            logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+            logger.warning(
+                "Rollout weight transport completed: global_steps=%s, transfer_mode=%s, time_cost=%.2fs",
+                global_steps,
+                "shared_memory" if self.use_shm else "cuda_ipc",
+                time.time() - start_time,
+            )
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""

@@ -126,7 +126,16 @@ def get_rollout_bootstrap_model_path(model_config, rollout_config) -> str:
     bootstrap_model_path: Optional[str] = getattr(rollout_config, "bootstrap_model_path", None)
     if bootstrap_model_path is None:
         return model_config.local_path
-    return copy_to_local(bootstrap_model_path, use_shm=model_config.use_shm)
+    local_bootstrap_model_path = copy_to_local(bootstrap_model_path, use_shm=model_config.use_shm)
+    logger.warning(
+        "Rollout bootstrap model override enabled: bootstrap_model_path=%s, local_bootstrap_model_path=%s, "
+        "training_model_path=%s, use_shm=%s",
+        bootstrap_model_path,
+        local_bootstrap_model_path,
+        model_config.local_path,
+        model_config.use_shm,
+    )
+    return local_bootstrap_model_path
 
 
 def update_prometheus_config(config: PrometheusConfig, server_addresses: list[str], rollout_name: str | None = None):
