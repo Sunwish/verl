@@ -33,7 +33,8 @@ from verl.utils.qat.mxfp8_rotation import (
 logger = logging.getLogger(__name__)
 
 _MXFP8_MODES = {"w8a16_mxfp8", "w8a8_mxfp8"}
-_MXFP8_ROUNDING_MODES = {"round", "random", "hash"}
+_MXFP8_ROUNDING_MODES = {"rint", "round", "random", "hash"}
+_MXFP8_STOCHASTIC_ROUNDING_MODES = {"random", "hash"}
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 
 
@@ -47,7 +48,7 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     mxfp8_quant_backend: str = "npu"
-    mxfp8_rounding_mode: str = "round"
+    mxfp8_rounding_mode: str = "rint"
     mxfp8_probe_quant_error: bool = False
     mxfp8_probe_quant_error_output_path: Optional[str] = None
     mxfp8_rotation_enable: bool = False
@@ -66,7 +67,7 @@ class QATConfig(BaseConfig):
         if (
             self.enable
             and self.mode.lower() in _MXFP8_MODES
-            and mxfp8_rounding_mode != "round"
+            and mxfp8_rounding_mode in _MXFP8_STOCHASTIC_ROUNDING_MODES
             and self.mxfp8_quant_backend.lower() != "torch"
         ):
             raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")

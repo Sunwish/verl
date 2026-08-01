@@ -141,8 +141,8 @@ qat:
   activation_observer: null
   # MXFP8 quantization backend: "npu" uses torch_npu, and "torch" uses verl's torch implementation.
   mxfp8_quant_backend: "npu"
-  # MXFP8 rounding mode for the torch backend: "round", "random", or "hash".
-  mxfp8_rounding_mode: "round"
+  # MXFP8 rounding mode for the torch backend: "rint", "round", "random", or "hash".
+  mxfp8_rounding_mode: "rint"
   # Enable MXFP8 quantization error probing.
   mxfp8_probe_quant_error: false
   # JSONL file path for MXFP8 probe records.

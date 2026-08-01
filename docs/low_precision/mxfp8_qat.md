@@ -69,7 +69,7 @@ actor_rollout_ref:
 | `fsdp_config.qat.ignore_patterns` | Layers to skip | `["lm_head", "embed_tokens", "re:.*mlp.gate$"]` |
 | `fsdp_config.qat.quantization_config_path` | vLLM quantization config JSON | Required when QAT is enabled |
 | `fsdp_config.qat.mxfp8_quant_backend` | Quantization backend | `npu` or `torch` |
-| `fsdp_config.qat.mxfp8_rounding_mode` | Rounding mode | `round`, `random`, or `hash` |
+| `fsdp_config.qat.mxfp8_rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
 | `fsdp_config.qat.mxfp8_probe_quant_error` | Log per-layer quantization error | `False` |
 | `fsdp_config.qat.mxfp8_probe_quant_error_output_path` | JSONL output path for probes | Required if probes are enabled |
 
@@ -88,7 +88,8 @@ The rounding mode only affects the torch backend:
 
 | Mode | Behavior | Notes |
 |---|---|---|
-| `round` | Deterministic round-half-up | Default behavior |
+| `rint` | Deterministic round-to-nearest-even | Default behavior, matches rollout-side low-precision quantization |
+| `round` | Deterministic round-half-up | Legacy torch behavior |
 | `random` | Independent stochastic rounding | Best for noise studies |
 | `hash` | Deterministic pseudo-random rounding from tensor bits | Good when you want repeatable stochastic behavior |
 
@@ -151,6 +152,6 @@ The current stack was exercised on Qwen3-30B-A3B in the FSDP / vLLM-Ascend flow.
 
 Good starting points:
 
-- baseline parity checks: `mxfp8_quant_backend: "npu"` with `mxfp8_rounding_mode: "round"`
+- baseline parity checks: `mxfp8_quant_backend: "npu"` with `mxfp8_rounding_mode: "rint"`
 - repeatable stochastic studies: `mxfp8_quant_backend: "torch"` with `mxfp8_rounding_mode: "hash"`
 - exploratory noise injection: `mxfp8_quant_backend: "torch"` with `mxfp8_rounding_mode: "random"`

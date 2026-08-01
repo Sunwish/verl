@@ -68,9 +68,9 @@ class TestFSDPEngineConfigCPU:
 
 
 class TestQATEngineConfig:
-    def test_mxfp8_rounding_mode_defaults_to_round(self):
+    def test_mxfp8_rounding_mode_defaults_to_rint(self):
         config = QATEngineConfig()
-        assert config.mxfp8_rounding_mode == "round"
+        assert config.mxfp8_rounding_mode == "rint"
 
     def test_rejects_stochastic_rounding_with_npu_backend(self):
         with pytest.raises(ValueError, match="mxfp8_quant_backend='torch'"):
