@@ -145,7 +145,7 @@ def get_mxfp8_quant_backend(default: str = "npu") -> str:
     return normalize_mxfp8_quant_backend(backend)
 
 
-def get_mxfp8_rounding_mode(default: str = "round") -> str:
+def get_mxfp8_rounding_mode(default: str = "rint") -> str:
     rounding_mode = os.environ.get(MXFP8_ROUNDING_MODE_ENV, default)
 
     from verl.utils.qat.mxfp8_linear import normalize_mxfp8_rounding_mode
@@ -154,7 +154,7 @@ def get_mxfp8_rounding_mode(default: str = "round") -> str:
 
 
 def quantize_mxfp8_weight_ascend(
-    weight: torch.Tensor, dtype: torch.dtype, quant_backend: str = "npu", rounding_mode: str = "round"
+    weight: torch.Tensor, dtype: torch.dtype, quant_backend: str = "npu", rounding_mode: str = "rint"
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from verl.utils.qat.mxfp8_linear import (
         normalize_mxfp8_quant_backend,
@@ -226,7 +226,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16, stats: dic
     fp8_state.fp8_param_names.clear()
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
     mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu")
-    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="round") if is_mxfp8_npu else "round"
+    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="rint") if is_mxfp8_npu else "rint"
     rotation_config = get_mxfp8_rotation_config(getattr(quant_config, "quant_description", {}) or {})
     if is_mxfp8_npu and rotation_config.enable and torch.distributed.get_rank() == 0:
         logger.warning(
@@ -304,7 +304,7 @@ def load_quanted_weights(weights, model_runner, is_drafter=False, return_stats=F
 
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
     mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu") if is_mxfp8_npu else None
-    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="round") if is_mxfp8_npu else None
+    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="rint") if is_mxfp8_npu else None
     rotation_config = get_mxfp8_rotation_config(getattr(quant_config, "quant_description", {}) or {})
     quant_stats = {
         "is_mxfp8": is_mxfp8_npu,

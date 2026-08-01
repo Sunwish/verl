@@ -137,7 +137,7 @@ class QATEngineConfig(BaseConfig):
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         mxfp8_quant_backend (str): MXFP8 quantization backend, "npu" or "torch"
-        mxfp8_rounding_mode (str): MXFP8 rounding mode, "round", "random", or "hash"
+        mxfp8_rounding_mode (str): MXFP8 rounding mode, "rint", "round", "random", or "hash"
         mxfp8_probe_quant_error (bool): Whether to log MXFP8 quantization error probes
         mxfp8_probe_quant_error_output_path (Optional[str]): JSONL file path for MXFP8 probe logs
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
@@ -149,7 +149,7 @@ class QATEngineConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     mxfp8_quant_backend: str = "npu"
-    mxfp8_rounding_mode: str = "round"
+    mxfp8_rounding_mode: str = "rint"
     mxfp8_probe_quant_error: bool = False
     mxfp8_probe_quant_error_output_path: Optional[str] = None
     mxfp8_rotation_enable: bool = False
@@ -160,15 +160,15 @@ class QATEngineConfig(BaseConfig):
 
     def __post_init__(self):
         mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
-        if mxfp8_rounding_mode not in {"round", "random", "hash"}:
+        if mxfp8_rounding_mode not in {"rint", "round", "random", "hash"}:
             raise ValueError(
                 f"Unsupported MXFP8 rounding mode: {self.mxfp8_rounding_mode}. "
-                "Supported modes: ['hash', 'random', 'round']"
+                "Supported modes: ['hash', 'random', 'rint', 'round']"
             )
         if (
             self.enable
             and self.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
-            and mxfp8_rounding_mode != "round"
+            and mxfp8_rounding_mode in {"random", "hash"}
             and self.mxfp8_quant_backend.lower() != "torch"
         ):
             raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")

@@ -23,7 +23,12 @@ import pytest
 
 from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales
 from verl.utils.qat.linear import QATLinear, QATMode
-from verl.utils.qat.mxfp8_linear import MXFP8QATLinear, mxfp8_probe_step_context, reset_mxfp8_probe
+from verl.utils.qat.mxfp8_linear import (
+    MXFP8QATLinear,
+    mxfp8_probe_step_context,
+    quantize_mxfp8_tensor,
+    reset_mxfp8_probe,
+)
 from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, apply_mxfp8_block_rotation
 
 
@@ -193,6 +198,22 @@ def test_mxfp8_qat_config_rejects_stochastic_rounding_with_npu_backend():
             mxfp8_quant_backend="npu",
             mxfp8_rounding_mode="random",
         )
+
+
+def test_quantize_mxfp8_torch_defaults_to_rint_rounding_on_ties():
+    tensor = torch.zeros((1, 32), dtype=torch.float32)
+    tensor[0, 0] = 1.0
+    tensor[0, 1] = 1.0625 / 256.0
+
+    default_q, default_scale = quantize_mxfp8_tensor(tensor, quant_backend="torch")
+    rint_q, rint_scale = quantize_mxfp8_tensor(tensor, quant_backend="torch", rounding_mode="rint")
+    round_q, round_scale = quantize_mxfp8_tensor(tensor, quant_backend="torch", rounding_mode="round")
+
+    assert torch.equal(default_q, rint_q)
+    assert torch.equal(default_scale, rint_scale)
+    assert torch.equal(default_scale, round_scale)
+    assert default_q.to(torch.float32)[0, 1].item() == 1.0
+    assert round_q.to(torch.float32)[0, 1].item() == 1.125
 
 
 def test_w8a16_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
