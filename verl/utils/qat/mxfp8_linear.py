@@ -374,7 +374,9 @@ def _check_mxfp8_2d_tensor(tensor: torch.Tensor):
 def _round_mxfp8_scaled_abs(abs_scaled: torch.Tensor, rounding_mode: str) -> torch.Tensor:
     rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
     if rounding_mode == "rint":
-        return torch.rint(abs_scaled)
+        if hasattr(torch, "rint"):
+            return torch.rint(abs_scaled)
+        return torch.round(abs_scaled)
     if rounding_mode == "round":
         return torch.floor(abs_scaled + 0.5)
 

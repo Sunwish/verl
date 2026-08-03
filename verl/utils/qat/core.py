@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch.nn as nn
+from omegaconf import DictConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.qat.mxfp8_rotation import (
@@ -36,6 +37,38 @@ _MXFP8_MODES = {"w8a16_mxfp8", "w8a8_mxfp8"}
 _MXFP8_ROUNDING_MODES = {"rint", "round", "random", "hash"}
 _MXFP8_STOCHASTIC_ROUNDING_MODES = {"random", "hash"}
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+_EXPERT_LINEAR_RE = re.compile(r".*(?:experts\.[^.]+|shared_expert|shared_experts)\.(gate_proj|up_proj|down_proj)$")
+_INTERNAL_ROUTER_IGNORE_PATTERNS = [
+    r"re:.*mlp\.gate(?:\.|$)",
+    r"re:.*router(?:\.|$)",
+    r"re:.*shared_expert_gate(?:\.|$)",
+]
+_INTERNAL_EXPERT_DISABLE_IGNORE_PATTERNS = [
+    r"re:.*mlp\.experts(?:\.|$)",
+    r"re:.*experts\.[^.]+\.(gate_proj|up_proj|down_proj)(?:\.weight)?$",
+    r"re:.*shared_expert(?:\.|$)",
+    r"re:.*shared_expert\.(gate_proj|up_proj|down_proj)(?:\.weight)?$",
+    r"re:.*shared_experts(?:\.|$)",
+]
+
+
+@dataclass
+class QATExpertsConfig(BaseConfig):
+    """Configuration for expert-layer QAT within a broader QAT setup."""
+
+    enable: bool = False
+
+
+def _coerce_qat_experts_config(value: Any) -> QATExpertsConfig:
+    if value is None:
+        return QATExpertsConfig()
+    if isinstance(value, QATExpertsConfig):
+        return value
+    if isinstance(value, DictConfig):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        return QATExpertsConfig(**value)
+    raise TypeError(f"qat.experts must be a dict, DictConfig, or QATExpertsConfig; got {type(value).__name__}")
 
 
 @dataclass
@@ -47,6 +80,7 @@ class QATConfig(BaseConfig):
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
+    experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
     mxfp8_quant_backend: str = "npu"
     mxfp8_rounding_mode: str = "rint"
     mxfp8_probe_quant_error: bool = False
@@ -58,6 +92,7 @@ class QATConfig(BaseConfig):
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
+        object.__setattr__(self, "experts", _coerce_qat_experts_config(self.experts))
         mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
         if mxfp8_rounding_mode not in _MXFP8_ROUNDING_MODES:
             raise ValueError(
@@ -90,6 +125,29 @@ class QATConfig(BaseConfig):
             validate_mxfp8_rotation_config(rotation_config, group_size=self.group_size)
 
 
+def _matches_ignore_pattern(name: str, pattern: str) -> bool:
+    if pattern.startswith("re:"):
+        return re.match(pattern[3:], name) is not None
+    return pattern in name
+
+
+def _is_ignored(name: str, ignore_patterns: list[str]) -> bool:
+    return any(_matches_ignore_pattern(name, pattern) for pattern in ignore_patterns)
+
+
+def get_effective_ignore_patterns(qat_config: QATConfig) -> list[str]:
+    """Return the ignore list actually enforced for training and rollout handoff."""
+    effective_ignore = list(qat_config.ignore_patterns or [])
+    for pattern in _INTERNAL_ROUTER_IGNORE_PATTERNS:
+        if pattern not in effective_ignore:
+            effective_ignore.append(pattern)
+    if not qat_config.experts.enable:
+        for pattern in _INTERNAL_EXPERT_DISABLE_IGNORE_PATTERNS:
+            if pattern not in effective_ignore:
+                effective_ignore.append(pattern)
+    return effective_ignore
+
+
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
     """Load quantization config JSON file from QATConfig."""
     if not qat_config.quantization_config_path:
@@ -100,31 +158,127 @@ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
     with open(qat_config.quantization_config_path) as f:
         quant_config = json.load(f)
 
-    if qat_config.ignore_patterns:
+    effective_ignore = get_effective_ignore_patterns(qat_config)
+    if effective_ignore:
         original_ignore = quant_config.get("ignore", [])
-        quant_config["ignore"] = qat_config.ignore_patterns
-        if original_ignore != qat_config.ignore_patterns:
-            logger.info(f"Overriding JSON 'ignore' field: {original_ignore} -> {qat_config.ignore_patterns}")
+        quant_config["ignore"] = effective_ignore
+        if original_ignore != effective_ignore:
+            logger.info(f"Overriding JSON 'ignore' field: {original_ignore} -> {effective_ignore}")
 
     logger.info("Successfully loaded QAT quantization config")
     return quant_config
 
 
-def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
-    """Check if a module should be quantized."""
+def _is_packed_expert_block(name: str, module: nn.Module) -> bool:
+    if not name.endswith(".experts"):
+        return False
+    gate_up_proj = getattr(module, "gate_up_proj", None)
+    down_proj = getattr(module, "down_proj", None)
+    return bool(
+        gate_up_proj is not None
+        and down_proj is not None
+        and getattr(gate_up_proj, "dim", lambda: 0)() == 3
+        and getattr(down_proj, "dim", lambda: 0)() == 3
+    )
+
+
+def _packed_expert_weight_supports_group_size(
+    weight,
+    *,
+    input_dim: Optional[int],
+    output_dim: Optional[int],
+    group_size: int,
+) -> bool:
+    if weight is None or weight.dim() != 3 or input_dim is None or output_dim is None:
+        return False
+    if input_dim % group_size != 0:
+        return False
+    shape = tuple(weight.shape)
+    if shape[-1] == input_dim and shape[-2] == output_dim:
+        return True
+    if shape[-2] == input_dim and shape[-1] == output_dim:
+        return True
+    return False
+
+
+def _get_packed_expert_quant_plan(
+    name: str,
+    module: nn.Module,
+    config: QATConfig,
+    effective_ignore_patterns: list[str],
+) -> Optional[dict[str, bool]]:
+    if not config.experts.enable or not _is_packed_expert_block(name, module):
+        return None
+
+    hidden_dim = getattr(module, "hidden_dim", getattr(module, "hidden_size", None))
+    intermediate_dim = getattr(module, "intermediate_dim", getattr(module, "expert_dim", None))
+    if hidden_dim is None or intermediate_dim is None:
+        logger.warning("Skipping %s: packed expert module missing hidden_dim/intermediate_dim metadata", name)
+        return None
+
+    gate_up_name = f"{name}.gate_up_proj"
+    down_name = f"{name}.down_proj"
+
+    quantize_gate_up_proj = not _is_ignored(gate_up_name, effective_ignore_patterns)
+    quantize_down_proj = not _is_ignored(down_name, effective_ignore_patterns)
+
+    gate_up_proj = getattr(module, "gate_up_proj", None)
+    down_proj = getattr(module, "down_proj", None)
+
+    if quantize_gate_up_proj and not _packed_expert_weight_supports_group_size(
+        gate_up_proj,
+        input_dim=hidden_dim,
+        output_dim=2 * intermediate_dim,
+        group_size=config.group_size,
+    ):
+        logger.warning(
+            "Skipping packed expert sublayer %s: unsupported gate_up_proj layout/shape=%s for group_size=%s",
+            gate_up_name,
+            tuple(gate_up_proj.shape),
+            config.group_size,
+        )
+        quantize_gate_up_proj = False
+
+    if quantize_down_proj and not _packed_expert_weight_supports_group_size(
+        down_proj,
+        input_dim=intermediate_dim,
+        output_dim=hidden_dim,
+        group_size=config.group_size,
+    ):
+        logger.warning(
+            "Skipping packed expert sublayer %s: unsupported down_proj layout/shape=%s for group_size=%s",
+            down_name,
+            tuple(down_proj.shape),
+            config.group_size,
+        )
+        quantize_down_proj = False
+
+    if not (quantize_gate_up_proj or quantize_down_proj):
+        logger.warning("_get_packed_expert_quant_plan return None. quantize_gate_up_proj=%s, quantize_down_proj=%s", quantize_gate_up_proj, quantize_down_proj)
+        return None
+
+    return {
+        "quantize_gate_up_proj": quantize_gate_up_proj,
+        "quantize_down_proj": quantize_down_proj,
+    }
+
+
+def _should_quantize_linear(
+    name: str,
+    module: nn.Module,
+    config: QATConfig,
+    effective_ignore_patterns: list[str],
+) -> bool:
+    """Check if a linear module should be quantized."""
     if not isinstance(module, nn.Linear):
         return False
 
-    for pattern in config.ignore_patterns:
-        if pattern.startswith("re:"):
-            regex = pattern[3:]
-            if re.match(regex, name):
-                logger.debug(f"Ignoring {name} due to regex pattern: {regex}")
-                return False
-        else:
-            if pattern in name:
-                logger.debug(f"Ignoring {name} due to pattern: {pattern}")
-                return False
+    if _EXPERT_LINEAR_RE.match(name) and not config.experts.enable:
+        return False
+
+    if _is_ignored(name, effective_ignore_patterns):
+        logger.debug("Ignoring %s due to ignore_patterns", name)
+        return False
 
     if module.in_features % config.group_size != 0:
         logger.warning(
@@ -160,7 +314,7 @@ def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
 ) -> nn.Module:
-    """Apply QAT to a model by replacing nn.Linear with a mode-specific QAT layer."""
+    """Apply QAT to a model by replacing quantizable modules with mode-specific QAT wrappers."""
     if not isinstance(config, QATConfig):
         config = QATConfig(**config)
 
@@ -173,20 +327,21 @@ def apply_qat(
         raise ValueError(f"MXFP8 QAT requires group_size=32, got: {config.group_size}")
     logger.info(
         f"Applying QAT with mode={mode.value}, group_size={config.group_size}, "
-        f"mxfp8_rounding_mode={config.mxfp8_rounding_mode}"
+        f"mxfp8_rounding_mode={config.mxfp8_rounding_mode}, experts_enable={config.experts.enable}"
     )
     if mode.value in _MXFP8_MODES:
         from verl.utils.qat.mxfp8_linear import configure_mxfp8_probe
 
         logger.warning(
             "MXFP8 QAT requested on training model: mode=%s, group_size=%s, quant_backend=%s, "
-            "rounding_mode=%s, probe_quant_error=%s, rotation_enable=%s",
+            "rounding_mode=%s, probe_quant_error=%s, rotation_enable=%s, experts_enable=%s",
             mode.value,
             config.group_size,
             config.mxfp8_quant_backend,
             config.mxfp8_rounding_mode,
             config.mxfp8_probe_quant_error,
             config.mxfp8_rotation_enable,
+            config.experts.enable,
         )
         configure_mxfp8_probe(
             enabled=config.mxfp8_probe_quant_error,
@@ -206,15 +361,25 @@ def apply_qat(
                 config.mxfp8_rotation_seed,
             )
 
-    modules_to_replace = []
+    effective_ignore_patterns = get_effective_ignore_patterns(config)
+    linear_modules_to_replace = []
+    packed_expert_modules_to_replace = []
     for name, module in model.named_modules():
-        if _should_quantize(name, module, config):
-            modules_to_replace.append((name, module))
+        packed_expert_plan = _get_packed_expert_quant_plan(name, module, config, effective_ignore_patterns)
+        if packed_expert_plan is not None:
+            packed_expert_modules_to_replace.append((name, module, packed_expert_plan))
+            continue
+        if _should_quantize_linear(name, module, config, effective_ignore_patterns):
+            linear_modules_to_replace.append((name, module))
 
-    logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to QAT")
+    logger.info(
+        "Found %s linear layers and %s packed expert blocks to convert to QAT",
+        len(linear_modules_to_replace),
+        len(packed_expert_modules_to_replace),
+    )
 
     converted_count = 0
-    for name, module in modules_to_replace:
+    for name, module in linear_modules_to_replace:
         if _is_verl_qat_module(module):
             continue
 
@@ -239,14 +404,44 @@ def apply_qat(
         fake_quant_module = qat_linear_cls.from_linear(module, **from_linear_kwargs)
 
         _set_module(model, name, fake_quant_module)
+        logger.warning("apply_qat _set_module: %s", name)
         converted_count += 1
+
+    if mode.value in _MXFP8_MODES:
+        from verl.utils.qat.mxfp8_experts import MXFP8QATSparseMoeBlock
+
+        for name, module, packed_expert_plan in packed_expert_modules_to_replace:
+            if _is_verl_qat_module(module):
+                continue
+
+            _, layer_index = _infer_mxfp8_layer_metadata(name)
+            fake_quant_module = MXFP8QATSparseMoeBlock.from_module(
+                module,
+                mode=mode,
+                group_size=config.group_size,
+                activation_observer=config.activation_observer,
+                mxfp8_quant_backend=config.mxfp8_quant_backend,
+                mxfp8_rounding_mode=config.mxfp8_rounding_mode,
+                mxfp8_probe_quant_error=config.mxfp8_probe_quant_error,
+                mxfp8_rotation_enable=config.mxfp8_rotation_enable,
+                mxfp8_rotation_kind=config.mxfp8_rotation_kind,
+                mxfp8_rotation_block_size=config.mxfp8_rotation_block_size,
+                mxfp8_rotation_seed=config.mxfp8_rotation_seed,
+                layer_name=name,
+                layer_index=layer_index,
+                quantize_gate_up_proj=packed_expert_plan["quantize_gate_up_proj"],
+                quantize_down_proj=packed_expert_plan["quantize_down_proj"],
+            )
+            _set_module(model, name, fake_quant_module)
+            logger.warning("apply_qat _set_module: %s", name)
+            converted_count += 1
 
     logger.info(f"Successfully applied QAT to {converted_count} layers")
     if mode.value in _MXFP8_MODES:
         logger.warning(
             "MXFP8 QAT applied to training model: mode=%s, converted_layers=%s, quant_backend=%s, "
             "rounding_mode=%s, weight_fake_quant=True, activation_fake_quant=%s, probe_quant_error=%s, "
-            "rotation_enable=%s",
+            "rotation_enable=%s, experts_enable=%s",
             mode.value,
             converted_count,
             config.mxfp8_quant_backend,
@@ -254,6 +449,7 @@ def apply_qat(
             mode.value == "w8a8_mxfp8",
             config.mxfp8_probe_quant_error,
             config.mxfp8_rotation_enable,
+            config.experts.enable,
         )
 
     return model

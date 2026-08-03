@@ -231,19 +231,28 @@ def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
     server.config = SimpleNamespace(
         quantization=None,
         quantization_config_file=None,
-        qat={"enable": True, "mode": qat_mode, "mxfp8_quant_backend": "torch", "mxfp8_rounding_mode": "hash"},
+        qat={
+            "enable": True,
+            "mode": qat_mode,
+            "group_size": 32,
+            "mxfp8_quant_backend": "torch",
+            "mxfp8_rounding_mode": "hash",
+            "experts": {"enable": False},
+        },
     )
     server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
 
     quant_config = {"quant_method": "ascend", "layer.weight": "W8A8_MXFP8"}
     monkeypatch.setattr(vllm_server, "is_torch_npu_available", lambda check_device=False: False)
 
-    with patch("verl.utils.qat.load_quantization_config", return_value=quant_config), patch(
+    with patch("verl.utils.qat.load_quantization_config", return_value=quant_config) as mock_load_quantization_config, patch(
         "verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches"
     ) as mock_apply_patches:
         quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
 
     assert quantization == "ascend"
+    qat_config = mock_load_quantization_config.call_args.args[0]
+    assert qat_config.experts.enable is False
     assert hf_overrides["quantization_config"]["quant_method"] == "ascend"
     assert hf_overrides["quantization_config"]["group_size"] == 32
     assert hf_overrides["quantization_config"]["mxfp8_rotation_enable"] is False

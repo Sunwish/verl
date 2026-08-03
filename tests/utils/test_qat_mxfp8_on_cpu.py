@@ -23,6 +23,7 @@ import pytest
 
 from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales
 from verl.utils.qat.linear import QATLinear, QATMode
+from verl.utils.qat.mxfp8_experts import MXFP8QATExperts
 from verl.utils.qat.mxfp8_linear import (
     MXFP8QATLinear,
     flush_mxfp8_probe,
@@ -56,6 +57,76 @@ class _ProbeModel(nn.Module):
 
     def forward(self, x):
         return self.layers[0](x) + self.layers[1](x)
+
+
+class _PackedExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_experts = 2
+        self.hidden_dim = 32
+        self.intermediate_dim = 32
+        self.gate_up_proj = nn.Parameter(torch.randn(2, 64, 32, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(torch.randn(2, 32, 32, dtype=torch.bfloat16))
+        self.act_fn = F.silu
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+        return final_hidden_states
+
+
+class _SharedExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+        self.up_proj = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+        self.down_proj = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _MoeLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dense = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+        self.mlp = nn.Module()
+        self.mlp.gate = nn.Linear(32, 2, bias=False, dtype=torch.bfloat16)
+        self.mlp.experts = _PackedExperts()
+        self.mlp.shared_expert = _SharedExpert()
+        self.mlp.shared_expert_gate = nn.Linear(32, 1, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        hidden_states = x.reshape(-1, 32)
+        router_logits = self.mlp.gate(hidden_states)
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        routing_weights, selected_experts = torch.topk(routing_weights, 1, dim=-1)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+        routed = self.mlp.experts(hidden_states, selected_experts, routing_weights)
+        shared = torch.sigmoid(self.mlp.shared_expert_gate(hidden_states)) * self.mlp.shared_expert(hidden_states)
+        dense = self.dense(hidden_states)
+        return (routed + shared + dense).reshape_as(x)
+
+
+class _MoeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_MoeLayer()])
+
+    def forward(self, x):
+        return self.layers[0](x)
 
 
 @pytest.fixture(autouse=True)
@@ -197,6 +268,103 @@ def test_apply_qat_mxfp8_requires_group_size_32():
 
     with pytest.raises(ValueError, match="group_size=32"):
         apply_qat(model, QATConfig(enable=True, mode="w8a8_mxfp8", group_size=16))
+
+
+def test_apply_qat_mxfp8_experts_respects_subswitch_and_ignore_patterns():
+    model = _MoeModel()
+
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+        ),
+    )
+
+    assert isinstance(model.layers[0].dense, MXFP8QATLinear)
+    assert isinstance(model.layers[0].mlp.experts, _PackedExperts)
+    assert isinstance(model.layers[0].mlp.gate, nn.Linear)
+    assert isinstance(model.layers[0].mlp.shared_expert.gate_proj, nn.Linear)
+    assert isinstance(model.layers[0].mlp.shared_expert.up_proj, nn.Linear)
+    assert isinstance(model.layers[0].mlp.shared_expert.down_proj, nn.Linear)
+    assert isinstance(model.layers[0].mlp.shared_expert_gate, nn.Linear)
+
+    model = _MoeModel()
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+            experts={"enable": True},
+        ),
+    )
+
+    assert isinstance(model.layers[0].dense, MXFP8QATLinear)
+    assert isinstance(model.layers[0].mlp.experts, MXFP8QATExperts)
+    assert isinstance(model.layers[0].mlp.gate, nn.Linear)
+    assert isinstance(model.layers[0].mlp.shared_expert.gate_proj, MXFP8QATLinear)
+    assert isinstance(model.layers[0].mlp.shared_expert.up_proj, MXFP8QATLinear)
+    assert isinstance(model.layers[0].mlp.shared_expert.down_proj, MXFP8QATLinear)
+    assert isinstance(model.layers[0].mlp.shared_expert_gate, nn.Linear)
+
+    model = _MoeModel()
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+            experts={"enable": True},
+            ignore_patterns=["re:.*mlp.experts.gate_up_proj$", "re:.*shared_expert.up_proj$"],
+        ),
+    )
+
+    assert isinstance(model.layers[0].mlp.experts, MXFP8QATExperts)
+    assert model.layers[0].mlp.experts._quantize_gate_up_proj is False
+    assert model.layers[0].mlp.experts._quantize_down_proj is True
+    assert isinstance(model.layers[0].mlp.shared_expert.gate_proj, MXFP8QATLinear)
+    assert isinstance(model.layers[0].mlp.shared_expert.up_proj, nn.Linear)
+    assert isinstance(model.layers[0].mlp.shared_expert.down_proj, MXFP8QATLinear)
+
+
+def test_mxfp8_qat_expert_wrapper_runs_forward_and_invalidate_all_scales():
+    model = _MoeModel()
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+            experts={"enable": True},
+        ),
+    )
+
+    x = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+    out = model(x)
+
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+    assert model.layers[0].mlp.experts._last_gate_up_scale is not None
+    assert model.layers[0].mlp.experts._last_down_scale is not None
+    assert model.layers[0].mlp.experts._last_gate_up_input_scale is not None
+    assert model.layers[0].mlp.experts._last_down_input_scale is not None
+
+    invalidate_all_scales(model)
+
+    assert model.layers[0].mlp.experts._last_gate_up_scale is None
+    assert model.layers[0].mlp.experts._last_down_scale is None
+    assert model.layers[0].mlp.experts._last_gate_up_input_scale is None
+    assert model.layers[0].mlp.experts._last_down_input_scale is None
 
 
 def test_mxfp8_qat_linear_rejects_unknown_quant_backend():

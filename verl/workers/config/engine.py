@@ -20,6 +20,7 @@ from typing import Any, Callable, Literal, Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
+from verl.utils.qat.core import QATExpertsConfig
 from verl.utils.qat.mxfp8_rotation import MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN, MXFP8RotationConfig, validate_mxfp8_rotation_config
 
 from ...utils.profiler import ProfilerConfig
@@ -136,6 +137,7 @@ class QATEngineConfig(BaseConfig):
         group_size (int): Group size for blockwise quantization, default 16
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
+        experts (QATExpertsConfig): Expert-layer QAT sub-configuration
         mxfp8_quant_backend (str): MXFP8 quantization backend, "npu" or "torch"
         mxfp8_rounding_mode (str): MXFP8 rounding mode, "rint", "round", "random", or "hash"
         mxfp8_probe_quant_error (bool): Whether to log MXFP8 quantization error probes
@@ -156,9 +158,13 @@ class QATEngineConfig(BaseConfig):
     mxfp8_rotation_kind: str = MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN
     mxfp8_rotation_block_size: int = 32
     mxfp8_rotation_seed: int = 0
+    experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
+        from verl.utils.qat.core import _coerce_qat_experts_config
+
+        object.__setattr__(self, "experts", _coerce_qat_experts_config(getattr(self, "experts", None)))
         mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
         if mxfp8_rounding_mode not in {"rint", "round", "random", "hash"}:
             raise ValueError(

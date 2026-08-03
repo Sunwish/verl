@@ -172,7 +172,11 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     # Loop over all available experts in the model and perform the computation on each expert
     # Concat all weights
     input_dtype = hidden_states.dtype
-    if hasattr(self.experts, "gate_up_proj") and hasattr(self.experts, "down_proj"):
+    expert_hidden_states = hidden_states
+    if hasattr(self.experts, "get_npu_sparse_block_weights"):
+        expert_hidden_states = self.experts.prepare_npu_sparse_block_gate_input(hidden_states)
+        w1, w2, w3 = self.experts.get_npu_sparse_block_weights(input_dtype)
+    elif hasattr(self.experts, "gate_up_proj") and hasattr(self.experts, "down_proj"):
         gate_proj_weight, up_proj_weight = self.experts.gate_up_proj.chunk(2, dim=1)
         w1 = up_proj_weight.transpose(1, 2).to(input_dtype)
         w2 = gate_proj_weight.transpose(1, 2).to(input_dtype)
@@ -185,7 +189,7 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         w2 = torch.stack(gate_weight_list).transpose(1, 2).to(input_dtype)
         w3 = torch.stack(down_weight_list).transpose(1, 2).to(input_dtype)
 
-    permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, selected_experts.to(torch.int32))
+    permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(expert_hidden_states, selected_experts.to(torch.int32))
     num_experts = getattr(
         self, "num_experts", getattr(self.experts, "num_experts", getattr(self.gate, "out_features", None))
     )
@@ -196,6 +200,8 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     up_res = NPUGmmFunction.apply(permuted_tokens, w1, tokens_per_expert)
     gate_res = NPUGmmFunction.apply(permuted_tokens, w2, tokens_per_expert)
     act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
+    if hasattr(self.experts, "prepare_npu_sparse_block_down_input"):
+        act_res = self.experts.prepare_npu_sparse_block_down_input(act_res)
     down_res = NPUGmmFunction.apply(act_res, w3, tokens_per_expert)
 
     routed_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)
