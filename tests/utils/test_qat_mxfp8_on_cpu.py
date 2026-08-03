@@ -367,6 +367,42 @@ def test_mxfp8_qat_expert_wrapper_runs_forward_and_invalidate_all_scales():
     assert model.layers[0].mlp.experts._last_down_input_scale is None
 
 
+def test_mxfp8_qat_expert_probe_splits_gate_up_proj_into_gate_and_up(tmp_path):
+    model = _MoeModel()
+    output_path = tmp_path / "mxfp8_expert_probe.jsonl"
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+            mxfp8_probe_quant_error=True,
+            mxfp8_probe_quant_error_output_path=str(output_path),
+            experts={"enable": True},
+        ),
+    )
+
+    x = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+    with torch.no_grad():
+        with mxfp8_probe_step_context(23):
+            _ = model(x)
+    flush_mxfp8_probe()
+    reset_mxfp8_probe()
+
+    records = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
+    layer_types = {(record["error_type"], record["layer_type"]) for record in records}
+    assert ("weight", "gate_proj") in layer_types
+    assert ("weight", "up_proj") in layer_types
+    assert ("weight", "down_proj") in layer_types
+    assert ("activation", "gate_proj") in layer_types
+    assert ("activation", "up_proj") in layer_types
+    assert ("activation", "down_proj") in layer_types
+    assert ("weight", "gate_up_proj") not in layer_types
+    assert ("activation", "gate_up_proj") not in layer_types
+
+
 def test_mxfp8_qat_linear_rejects_unknown_quant_backend():
     with pytest.raises(ValueError, match="Unsupported MXFP8 quant backend"):
         MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="rotate")

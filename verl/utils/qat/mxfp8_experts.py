@@ -206,21 +206,31 @@ class MXFP8QATExperts(nn.Module):
         self._last_gate_up_input_scale = None
         self._last_down_input_scale = None
 
-    def _record_quant_error(self, error_type: str, sublayer_type: str, original: torch.Tensor, quantized: torch.Tensor):
+    def _record_quant_error(
+        self,
+        error_type: str,
+        sublayer_type: str | tuple[str, ...],
+        original: torch.Tensor,
+        quantized: torch.Tensor,
+    ):
         if not self.mxfp8_probe_quant_error:
             return
 
+        sublayer_types = (sublayer_type,) if isinstance(sublayer_type, str) else sublayer_type
         diff = (quantized.to(torch.float32) - original.detach().to(torch.float32)).abs()
-        _record_mxfp8_quant_error(
-            layer_type=sublayer_type,
-            layer_index=self._mxfp8_layer_index,
-            error_type=error_type,
-            error_sum=diff.sum().item(),
-            element_count=diff.numel(),
-            qat_mode=self.mode.value,
-            quant_backend=self.mxfp8_quant_backend,
-            rounding_mode=self.mxfp8_rounding_mode,
-        )
+        error_sum = diff.sum().item()
+        element_count = diff.numel()
+        for layer_type in sublayer_types:
+            _record_mxfp8_quant_error(
+                layer_type=layer_type,
+                layer_index=self._mxfp8_layer_index,
+                error_type=error_type,
+                error_sum=error_sum,
+                element_count=element_count,
+                qat_mode=self.mode.value,
+                quant_backend=self.mxfp8_quant_backend,
+                rounding_mode=self.mxfp8_rounding_mode,
+            )
 
     def _canonicalize_weight(self, weight: torch.Tensor, *, kind: str) -> torch.Tensor:
         if kind == "gate_up_proj":
@@ -246,7 +256,14 @@ class MXFP8QATExperts(nn.Module):
             return tensor
         return apply_mxfp8_block_rotation(tensor, self.mxfp8_rotation_config)
 
-    def _fake_quantize_weight(self, weight: torch.Tensor, *, sublayer_type: str, scale_attr: str) -> torch.Tensor:
+    def _fake_quantize_weight(
+        self,
+        weight: torch.Tensor,
+        *,
+        sublayer_type: str,
+        scale_attr: str,
+        split_sublayer_types: Optional[tuple[str, ...]] = None,
+    ) -> torch.Tensor:
         with torch.no_grad():
             weight_q, weight_scale = quantize_mxfp8_tensor(
                 weight.reshape(-1, weight.shape[-1]),
@@ -256,11 +273,25 @@ class MXFP8QATExperts(nn.Module):
             setattr(self, scale_attr, weight_scale.detach())
             weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype).reshape(weight.shape)
             if self.mxfp8_probe_quant_error:
-                self._record_quant_error("weight", sublayer_type, weight, weight_fq)
+                if split_sublayer_types is None:
+                    self._record_quant_error("weight", sublayer_type, weight, weight_fq)
+                else:
+                    original_chunks = weight.chunk(len(split_sublayer_types), dim=1)
+                    quantized_chunks = weight_fq.chunk(len(split_sublayer_types), dim=1)
+                    for layer_type, original_chunk, quantized_chunk in zip(
+                        split_sublayer_types, original_chunks, quantized_chunks, strict=True
+                    ):
+                        self._record_quant_error("weight", layer_type, original_chunk, quantized_chunk)
                 return weight
         return weight + (weight_fq - weight).detach()
 
-    def _fake_quantize_activation(self, x: torch.Tensor, *, sublayer_type: str, scale_attr: str) -> torch.Tensor:
+    def _fake_quantize_activation(
+        self,
+        x: torch.Tensor,
+        *,
+        sublayer_type: str | tuple[str, ...],
+        scale_attr: str,
+    ) -> torch.Tensor:
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
         with torch.no_grad():
@@ -285,6 +316,7 @@ class MXFP8QATExperts(nn.Module):
             weight,
             sublayer_type="gate_up_proj",
             scale_attr="_last_gate_up_scale",
+            split_sublayer_types=("gate_proj", "up_proj"),
         )
 
     def _prepare_down_weight(self, apply_fake_quant: bool) -> torch.Tensor:
@@ -305,7 +337,7 @@ class MXFP8QATExperts(nn.Module):
         if self.mode == QATMode.W8A8_MXFP8:
             x = self._fake_quantize_activation(
                 x,
-                sublayer_type="gate_up_proj",
+                sublayer_type=("gate_proj", "up_proj"),
                 scale_attr="_last_gate_up_input_scale",
             )
         return x
