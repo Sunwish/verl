@@ -273,6 +273,14 @@ class RolloutConfig(BaseConfig):
 
     quantization_config_file: Optional[str] = None
 
+    mxfp8_quant_backend: str = "npu"
+    mxfp8_rounding_mode: str = "rint"
+    mxfp8_rotation_enable: bool = False
+    mxfp8_rotation_kind: str = "block_hadamard_sign"
+    mxfp8_rotation_block_size: int = 32
+    mxfp8_rotation_seed: int = 0
+    mxfp8_group_size: int = 32
+
     enable_rollout_routing_replay: bool = False
 
     enable_sleep_mode: bool = True

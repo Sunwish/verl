@@ -17,6 +17,7 @@ import inspect
 import logging
 import os
 from dataclasses import dataclass, field
+from typing import Any, Optional
 from unittest.mock import patch
 
 import torch
@@ -30,12 +31,23 @@ except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
 
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
-from verl.utils.qat.mxfp8_rotation import apply_mxfp8_block_rotation, get_mxfp8_rotation_config
+from verl.utils.qat.mxfp8_rotation import (
+    MXFP8_ROTATION_BLOCK_SIZE_KEY,
+    MXFP8_ROTATION_ENABLE_KEY,
+    MXFP8_ROTATION_KIND_KEY,
+    MXFP8_ROTATION_SEED_KEY,
+    apply_mxfp8_block_rotation,
+    get_mxfp8_rotation_config as parse_mxfp8_rotation_config,
+)
 
 logger = logging.getLogger(__name__)
 
 MXFP8_QUANT_BACKEND_ENV = "VERL_MXFP8_QUANT_BACKEND"
 MXFP8_ROUNDING_MODE_ENV = "VERL_MXFP8_ROUNDING_MODE"
+MXFP8_ROTATION_ENABLE_ENV = "VERL_MXFP8_ROTATION_ENABLE"
+MXFP8_ROTATION_KIND_ENV = "VERL_MXFP8_ROTATION_KIND"
+MXFP8_ROTATION_BLOCK_SIZE_ENV = "VERL_MXFP8_ROTATION_BLOCK_SIZE"
+MXFP8_ROTATION_SEED_ENV = "VERL_MXFP8_ROTATION_SEED"
 
 
 # Ref: https://github.com/NVIDIA-NeMo/RL/commit/bc24887c72a6e1b2699a228bc87c588546dfe6b7
@@ -151,6 +163,19 @@ def get_mxfp8_rounding_mode(default: str = "rint") -> str:
     from verl.utils.qat.mxfp8_linear import normalize_mxfp8_rounding_mode
 
     return normalize_mxfp8_rounding_mode(rounding_mode)
+
+
+def get_mxfp8_rotation_config(default: Optional[dict[str, Any]] = None):
+    config = dict(default or {})
+    if MXFP8_ROTATION_ENABLE_ENV in os.environ:
+        config[MXFP8_ROTATION_ENABLE_KEY] = os.environ[MXFP8_ROTATION_ENABLE_ENV]
+    if MXFP8_ROTATION_KIND_ENV in os.environ:
+        config[MXFP8_ROTATION_KIND_KEY] = os.environ[MXFP8_ROTATION_KIND_ENV]
+    if MXFP8_ROTATION_BLOCK_SIZE_ENV in os.environ:
+        config[MXFP8_ROTATION_BLOCK_SIZE_KEY] = os.environ[MXFP8_ROTATION_BLOCK_SIZE_ENV]
+    if MXFP8_ROTATION_SEED_ENV in os.environ:
+        config[MXFP8_ROTATION_SEED_KEY] = os.environ[MXFP8_ROTATION_SEED_ENV]
+    return parse_mxfp8_rotation_config(config)
 
 
 def quantize_mxfp8_weight_ascend(

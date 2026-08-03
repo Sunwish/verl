@@ -39,7 +39,15 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
-from verl.utils.vllm.vllm_fp8_utils import MXFP8_QUANT_BACKEND_ENV, MXFP8_ROUNDING_MODE_ENV, apply_vllm_fp8_patches
+from verl.utils.vllm.vllm_fp8_utils import (
+    MXFP8_QUANT_BACKEND_ENV,
+    MXFP8_ROUNDING_MODE_ENV,
+    MXFP8_ROTATION_BLOCK_SIZE_ENV,
+    MXFP8_ROTATION_ENABLE_ENV,
+    MXFP8_ROTATION_KIND_ENV,
+    MXFP8_ROTATION_SEED_ENV,
+    apply_vllm_fp8_patches,
+)
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
@@ -873,53 +881,68 @@ class vLLMHttpServer:
 
             check_vllm_ascend_before_server_launch()
 
-        # Handle QAT (Quantization-Aware Training) configuration
         qat_config_dict = getattr(self.config, "qat", {}) or {}
-        if qat_config_dict.get("enable", False):
-            from verl.utils.qat import QATConfig, load_quantization_config
+        qat_config = None
+        if qat_config_dict:
+            from verl.utils.qat import QATConfig
 
             qat_config = QATConfig(**qat_config_dict)
-            quantization_config_dict = load_quantization_config(qat_config)
-            quant_method = quantization_config_dict.get("quant_method", None)
-            is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
-            if is_mxfp8_qat:
-                from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
-                from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, mxfp8_rotation_config_to_dict
 
-                mxfp8_quant_backend = normalize_mxfp8_quant_backend(qat_config.mxfp8_quant_backend)
-                mxfp8_rounding_mode = normalize_mxfp8_rounding_mode(qat_config.mxfp8_rounding_mode)
-                os.environ[MXFP8_QUANT_BACKEND_ENV] = mxfp8_quant_backend
-                os.environ[MXFP8_ROUNDING_MODE_ENV] = mxfp8_rounding_mode
-                quantization_config_dict["group_size"] = qat_config.group_size
-                rotation_config = MXFP8RotationConfig(
-                    enable=qat_config.mxfp8_rotation_enable,
-                    kind=qat_config.mxfp8_rotation_kind,
-                    block_size=qat_config.mxfp8_rotation_block_size,
-                    seed=qat_config.mxfp8_rotation_seed,
-                )
-                quantization_config_dict.update(mxfp8_rotation_config_to_dict(rotation_config))
+        def _configure_mxfp8_rollout_quantization(config_source, quantization_config_dict: dict | None = None) -> dict:
+            from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
+            from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, mxfp8_rotation_config_to_dict
+
+            quantization_config_dict = dict(quantization_config_dict or {})
+            mxfp8_quant_backend = normalize_mxfp8_quant_backend(config_source.mxfp8_quant_backend)
+            mxfp8_rounding_mode = normalize_mxfp8_rounding_mode(config_source.mxfp8_rounding_mode)
+            os.environ[MXFP8_QUANT_BACKEND_ENV] = mxfp8_quant_backend
+            os.environ[MXFP8_ROUNDING_MODE_ENV] = mxfp8_rounding_mode
+            os.environ[MXFP8_ROTATION_ENABLE_ENV] = str(config_source.mxfp8_rotation_enable)
+            os.environ[MXFP8_ROTATION_KIND_ENV] = str(config_source.mxfp8_rotation_kind)
+            os.environ[MXFP8_ROTATION_BLOCK_SIZE_ENV] = str(config_source.mxfp8_rotation_block_size)
+            os.environ[MXFP8_ROTATION_SEED_ENV] = str(config_source.mxfp8_rotation_seed)
+            group_size = getattr(config_source, "group_size", getattr(config_source, "mxfp8_group_size", 32))
+            quantization_config_dict["group_size"] = group_size
+            rotation_config = MXFP8RotationConfig(
+                enable=config_source.mxfp8_rotation_enable,
+                kind=config_source.mxfp8_rotation_kind,
+                block_size=config_source.mxfp8_rotation_block_size,
+                seed=config_source.mxfp8_rotation_seed,
+            )
+            quantization_config_dict.update(mxfp8_rotation_config_to_dict(rotation_config))
+            logger.warning(
+                "MXFP8 rollout quantization configured: mode=%s, quant_backend=%s, rounding_mode=%s, "
+                "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+                getattr(config_source, "mode", None),
+                mxfp8_quant_backend,
+                mxfp8_rounding_mode,
+                group_size,
+                rotation_config.enable,
+                rotation_config.kind,
+                rotation_config.block_size,
+                rotation_config.seed,
+            )
+            if rotation_config.enable:
                 logger.warning(
-                    "MXFP8 QAT rollout quantization configured: mode=%s, quant_backend=%s, rounding_mode=%s, "
-                    "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
-                    qat_config.mode.lower(),
-                    mxfp8_quant_backend,
-                    mxfp8_rounding_mode,
-                    qat_config.group_size,
-                    rotation_config.enable,
+                    "MXFP8 block rotation injected for vLLM rollout: kind=%s, block_size=%s, seed=%s",
                     rotation_config.kind,
                     rotation_config.block_size,
                     rotation_config.seed,
                 )
-                if rotation_config.enable:
-                    logger.warning(
-                        "MXFP8 block rotation injected for vLLM rollout: kind=%s, block_size=%s, seed=%s",
-                        rotation_config.kind,
-                        rotation_config.block_size,
-                        rotation_config.seed,
-                    )
+            return quantization_config_dict
+
+        # Handle QAT (Quantization-Aware Training) configuration
+        if qat_config is not None and qat_config.enable:
+            from verl.utils.qat import load_quantization_config
+
+            quantization_config_dict = load_quantization_config(qat_config)
+            quant_method = quantization_config_dict.get("quant_method", None)
             has_mxfp8_entry = any(
                 isinstance(value, str) and "MXFP8" in value.upper() for value in quantization_config_dict.values()
             )
+            is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
+            if is_mxfp8_qat:
+                quantization_config_dict = _configure_mxfp8_rollout_quantization(qat_config, quantization_config_dict)
 
             if quant_method == "modelopt":
                 from verl.utils.modelopt import apply_modelopt_nvfp4_patches
@@ -953,6 +976,9 @@ class vLLMHttpServer:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
             if quantization == "ascend":
+                _configure_mxfp8_rollout_quantization(self.config)
+                apply_vllm_fp8_patches()
+                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
                 logger.warning(
                     "Ascend rollout quantization configured: bootstrap_model_path=%s, "
                     "quantization_config_file=%s, live weight sync will inspect vLLM quant_config "

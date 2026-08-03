@@ -146,6 +146,16 @@ actor_rollout_ref:
       - embed_tokens
       - re:.*mlp.gate$
       activation_observer: static_minmax
+      experts:
+        enable: false
+      mxfp8_quant_backend: npu
+      mxfp8_rounding_mode: rint
+      mxfp8_probe_quant_error: false
+      mxfp8_probe_quant_error_output_path: null
+      mxfp8_rotation_enable: false
+      mxfp8_rotation_kind: block_hadamard_sign
+      mxfp8_rotation_block_size: 32
+      mxfp8_rotation_seed: 0
       quantization_config_path: null
     use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
   ref:
@@ -350,8 +360,16 @@ actor_rollout_ref:
       port: 9090
       file: /tmp/ray/session_latest/metrics/prometheus/prometheus.yml
       served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
+    bootstrap_model_path: null
     quantization: null
     quantization_config_file: null
+    mxfp8_quant_backend: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_quant_backend,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_quant_backend,"npu"}}
+    mxfp8_rounding_mode: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rounding_mode,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rounding_mode,"rint"}}
+    mxfp8_rotation_enable: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_enable,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_enable,false}}
+    mxfp8_rotation_kind: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_kind,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_kind,"block_hadamard_sign"}}
+    mxfp8_rotation_block_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_block_size,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_block_size,32}}
+    mxfp8_rotation_seed: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_seed,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_seed,0}}
+    mxfp8_group_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.group_size,${oc.select:actor_rollout_ref.actor.megatron.qat.group_size,32}}
     mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
     qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
     disaggregation:
