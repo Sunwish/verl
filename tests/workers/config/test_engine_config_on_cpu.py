@@ -72,6 +72,14 @@ class TestQATEngineConfig:
         config = QATEngineConfig()
         assert config.mxfp8_rounding_mode == "rint"
 
+    def test_qat_experts_subconfig_defaults_to_disabled(self):
+        config = QATEngineConfig()
+        assert config.experts.enable is False
+
+    def test_qat_experts_subconfig_accepts_dict(self):
+        config = QATEngineConfig(experts={"enable": True})
+        assert config.experts.enable is True
+
     def test_rejects_stochastic_rounding_with_npu_backend(self):
         with pytest.raises(ValueError, match="mxfp8_quant_backend='torch'"):
             QATEngineConfig(

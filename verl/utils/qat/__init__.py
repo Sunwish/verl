@@ -33,6 +33,7 @@ Usage:
 
 from verl.utils.qat.core import (
     QATConfig,
+    QATExpertsConfig,
     apply_qat,
     enable_qat_fuse,
     invalidate_all_scales,
@@ -53,6 +54,7 @@ from verl.utils.qat.vllm_patch import (
 __all__ = [
     # Core
     "QATConfig",
+    "QATExpertsConfig",
     "apply_qat",
     "load_quantization_config",
     "enable_qat_fuse",

@@ -51,6 +51,8 @@ actor_rollout_ref:
           - "lm_head"
           - "embed_tokens"
           - "re:.*mlp.gate$"
+        experts:
+          enable: false
         quantization_config_path: "recipe/qat/config/mxfp8_w8a8_ascend.json"
         mxfp8_quant_backend: "torch"
         mxfp8_rounding_mode: "hash"
@@ -67,6 +69,7 @@ actor_rollout_ref:
 | `fsdp_config.qat.mode` | MXFP8 mode | Use `w8a16_mxfp8` or `w8a8_mxfp8` |
 | `fsdp_config.qat.group_size` | MXFP8 block size | Must be `32` |
 | `fsdp_config.qat.ignore_patterns` | Layers to skip | `["lm_head", "embed_tokens", "re:.*mlp.gate$"]` |
+| `fsdp_config.qat.experts.enable` | Enable MXFP8 QAT for MoE expert compute | `False` |
 | `fsdp_config.qat.quantization_config_path` | vLLM quantization config JSON | Required when QAT is enabled |
 | `fsdp_config.qat.mxfp8_quant_backend` | Quantization backend | `npu` or `torch` |
 | `fsdp_config.qat.mxfp8_rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
@@ -145,6 +148,8 @@ The output format is JSONL, one rank-0 record per `(step, error_type, layer_inde
 - The torch quantizer now follows the same shared-exponent / private-exponent formula used by rollout.
 - `w8a16_mxfp8` keeps activation precision high and fake-quantizes weights only.
 - `w8a8_mxfp8` fake-quantizes both weights and activations.
+- MoE packed experts can join the same MXFP8 QAT path by setting `fsdp_config.qat.experts.enable: true`.
+- Router/gate paths remain excluded, and `ignore_patterns` can still be used to opt out specific expert sublayers such as `re:.*mlp.experts.gate_up_proj$`.
 
 ---
 

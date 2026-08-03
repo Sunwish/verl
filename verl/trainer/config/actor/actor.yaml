@@ -317,6 +317,12 @@ qat:
   # Activation observer for W4A4 mode: "static_minmax", "memoryless_minmax", or "minmax"
   activation_observer: "static_minmax"
 
+  # Expert-layer QAT configuration.
+  experts:
+
+    # Whether to enable MXFP8 QAT for MoE expert compute. Dense layers still follow qat.enable.
+    enable: false
+
   # MXFP8 quantization backend: "npu" uses torch_npu, and "torch" uses verl's torch implementation.
   # Future optimized variants can be added here.
   mxfp8_quant_backend: "npu"

@@ -500,6 +500,7 @@ class FSDPEngine(BaseEngine):
                 "group_size": self._qat_config.group_size,
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
+                "experts": self._qat_config.experts,
                 "mxfp8_quant_backend": self._qat_config.mxfp8_quant_backend,
                 "mxfp8_rounding_mode": self._qat_config.mxfp8_rounding_mode,
                 "mxfp8_probe_quant_error": self._qat_config.mxfp8_probe_quant_error,
