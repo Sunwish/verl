@@ -26,6 +26,7 @@ from verl.utils.qat.linear import QATLinear, QATMode
 from verl.utils.qat.mxfp8_experts import MXFP8QATExperts
 from verl.utils.qat.mxfp8_linear import (
     MXFP8QATLinear,
+    _round_mxfp8_scaled_abs,
     flush_mxfp8_probe,
     mxfp8_probe_step_context,
     quantize_mxfp8_tensor,
@@ -422,6 +423,15 @@ def test_mxfp8_qat_config_rejects_stochastic_rounding_with_npu_backend():
             mxfp8_quant_backend="npu",
             mxfp8_rounding_mode="random",
         )
+
+
+def test_round_mxfp8_scaled_abs_rint_uses_bankers_rounding():
+    values = torch.tensor([0.5, 1.5, 2.5, 3.5, 4.49, 4.5, 4.51], dtype=torch.float32)
+
+    rounded = _round_mxfp8_scaled_abs(values, "rint")
+
+    assert torch.equal(rounded, torch.tensor([0.0, 2.0, 2.0, 4.0, 4.0, 4.0, 5.0], dtype=torch.float32))
+
 
 
 def test_quantize_mxfp8_torch_defaults_to_rint_rounding_on_ties():

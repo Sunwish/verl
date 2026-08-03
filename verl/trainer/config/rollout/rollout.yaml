@@ -452,6 +452,27 @@ quantization: null
 # extra quantization information serialized in a config file, e.g. torchao_config.json
 quantization_config_file: null
 
+# MXFP8 rollout quantization backend: "npu" uses torch_npu, and "torch" uses verl's torch implementation.
+mxfp8_quant_backend: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_quant_backend,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_quant_backend,"npu"}}
+
+# MXFP8 rounding mode for the torch backend: "rint", "round", "random", or "hash".
+mxfp8_rounding_mode: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rounding_mode,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rounding_mode,"rint"}}
+
+# Enable global block-wise Hadamard/random-sign rotation before MXFP8 quantization during rollout weight sync.
+mxfp8_rotation_enable: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_enable,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_enable,false}}
+
+# Rotation implementation. First supported mode repeats one 32x32 block along the hidden dimension.
+mxfp8_rotation_kind: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_kind,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_kind,"block_hadamard_sign"}}
+
+# Must match MXFP8 group_size for the first implementation.
+mxfp8_rotation_block_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_block_size,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_block_size,32}}
+
+# Deterministic random sign seed for the global 32x32 block.
+mxfp8_rotation_seed: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_seed,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_seed,0}}
+
+# MXFP8 block size for rollout-side quantization; must stay 32 for the current implementation.
+mxfp8_group_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.group_size,${oc.select:actor_rollout_ref.actor.megatron.qat.group_size,32}}
+
 # MTP configuration, reuse model configuration
 mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
 
