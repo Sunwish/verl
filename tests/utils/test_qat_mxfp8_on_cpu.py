@@ -242,7 +242,7 @@ def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):
         assert "layer_name" not in record
         assert record["layer_type"] == "q_proj"
         assert record["layer_index"] in {0, 1}
-        assert record["error_metric"] == "mae"
+        assert record["error_metric"] == "relative_abs"
 
 
 def test_mxfp8_qat_probe_mode_requires_output_path():
@@ -368,6 +368,43 @@ def test_mxfp8_qat_expert_wrapper_runs_forward_and_invalidate_all_scales():
     assert model.layers[0].mlp.experts._last_down_input_scale is None
 
 
+def test_mxfp8_qat_expert_npu_weight_cache_reuses_qdq_without_probe(monkeypatch):
+    model = _MoeModel()
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a16_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+            experts={"enable": True},
+        ),
+    )
+
+    call_count = 0
+    original_quantize = quantize_mxfp8_tensor
+
+    def counting_quantize(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_quantize(*args, **kwargs)
+
+    monkeypatch.setattr("verl.utils.qat.mxfp8_experts.quantize_mxfp8_tensor", counting_quantize)
+
+    experts = model.layers[0].mlp.experts
+    experts.get_npu_sparse_block_weights(torch.bfloat16)
+    assert call_count == 2
+
+    experts.get_npu_sparse_block_weights(torch.bfloat16)
+    assert call_count == 2
+
+    invalidate_all_scales(model)
+
+    experts.get_npu_sparse_block_weights(torch.bfloat16)
+    assert call_count == 4
+
+
 def test_mxfp8_qat_expert_probe_splits_gate_up_proj_into_gate_and_up(tmp_path):
     model = _MoeModel()
     output_path = tmp_path / "mxfp8_expert_probe.jsonl"
@@ -393,6 +430,7 @@ def test_mxfp8_qat_expert_probe_splits_gate_up_proj_into_gate_and_up(tmp_path):
     reset_mxfp8_probe()
 
     records = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
+    assert all(record["error_metric"] == "relative_abs" for record in records)
     layer_types = {(record["error_type"], record["layer_type"]) for record in records}
     assert ("weight", "gate_proj") in layer_types
     assert ("weight", "up_proj") in layer_types
@@ -528,6 +566,7 @@ def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     model.nvfp4._cached_weight_amax = torch.ones(1)
     model.mxfp8._last_weight_scale = torch.ones((8, 1), dtype=torch.uint8)
     model.mxfp8._last_input_scale = torch.ones((1, 1), dtype=torch.uint8)
+    model.mxfp8._cached_weight_qdq = torch.ones((8, 32), dtype=torch.bfloat16)
 
     invalidate_all_scales(model)
 
@@ -536,3 +575,4 @@ def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     assert model.nvfp4._cached_weight_amax is None
     assert model.mxfp8._last_weight_scale is None
     assert model.mxfp8._last_input_scale is None
+    assert model.mxfp8._cached_weight_qdq is None

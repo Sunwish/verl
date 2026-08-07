@@ -28,6 +28,7 @@ from verl.utils.qat.mxfp8_linear import (
     _infer_mxfp8_layer_index,
     _infer_mxfp8_layer_type,
     _record_mxfp8_quant_error,
+    _relative_abs_error_sum_and_count,
     normalize_mxfp8_quant_backend,
     normalize_mxfp8_rounding_mode,
     quantize_mxfp8_tensor,
@@ -74,6 +75,47 @@ def _infer_packed_expert_dimensions(module: nn.Module) -> tuple[int, int, int]:
             )
 
     return int(num_experts), int(hidden_dim), int(intermediate_dim)
+
+
+class _NPUGmmFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, group_list, group_list_type=1):
+        import torch_npu
+
+        ctx.save_for_backward(x, weight)
+        ctx.group_list = group_list
+        ctx.group_list_type = group_list_type
+        return torch_npu.npu_grouped_matmul(
+            [x], [weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=group_list_type
+        )[0]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        import torch_npu
+
+        x, weight = ctx.saved_tensors
+        group_list = ctx.group_list
+        group_list_type = ctx.group_list_type
+
+        dx = torch_npu.npu_grouped_matmul(
+            [grad_output],
+            [weight.transpose(1, 2)],
+            bias=None,
+            group_list=group_list,
+            split_item=2,
+            group_type=0,
+            group_list_type=group_list_type,
+        )[0]
+        dw = torch_npu.npu_grouped_matmul(
+            [x.transpose(0, 1)],
+            [grad_output],
+            bias=None,
+            group_list=group_list,
+            split_item=3,
+            group_type=2,
+            group_list_type=group_list_type,
+        )[0]
+        return dx, dw, None, None
 
 
 class MXFP8QATExperts(nn.Module):
@@ -146,6 +188,10 @@ class MXFP8QATExperts(nn.Module):
         self._last_down_scale: Optional[torch.Tensor] = None
         self._last_gate_up_input_scale: Optional[torch.Tensor] = None
         self._last_down_input_scale: Optional[torch.Tensor] = None
+        self._cached_npu_weight_dtype: Optional[torch.dtype] = None
+        self._cached_npu_gate_proj_weight: Optional[torch.Tensor] = None
+        self._cached_npu_up_proj_weight: Optional[torch.Tensor] = None
+        self._cached_npu_down_proj_weight: Optional[torch.Tensor] = None
 
         self.gate_up_proj = nn.Parameter(_clone_parameter_tensor(gate_up_proj), requires_grad=True)
         self.down_proj = nn.Parameter(_clone_parameter_tensor(down_proj), requires_grad=True)
@@ -205,6 +251,10 @@ class MXFP8QATExperts(nn.Module):
         self._last_down_scale = None
         self._last_gate_up_input_scale = None
         self._last_down_input_scale = None
+        self._cached_npu_weight_dtype = None
+        self._cached_npu_gate_proj_weight = None
+        self._cached_npu_up_proj_weight = None
+        self._cached_npu_down_proj_weight = None
 
     def _record_quant_error(
         self,
@@ -217,9 +267,7 @@ class MXFP8QATExperts(nn.Module):
             return
 
         sublayer_types = (sublayer_type,) if isinstance(sublayer_type, str) else sublayer_type
-        diff = (quantized.to(torch.float32) - original.detach().to(torch.float32)).abs()
-        error_sum = diff.sum().item()
-        element_count = diff.numel()
+        error_sum, element_count = _relative_abs_error_sum_and_count(original, quantized)
         for layer_type in sublayer_types:
             _record_mxfp8_quant_error(
                 layer_type=layer_type,
@@ -285,6 +333,33 @@ class MXFP8QATExperts(nn.Module):
                 return weight
         return weight + (weight_fq - weight).detach()
 
+    def _fake_quantize_weight_no_ste(
+        self,
+        weight: torch.Tensor,
+        *,
+        sublayer_type: str,
+        scale_attr: str,
+        split_sublayer_types: Optional[tuple[str, ...]] = None,
+    ) -> torch.Tensor:
+        weight_q, weight_scale = quantize_mxfp8_tensor(
+            weight.reshape(-1, weight.shape[-1]),
+            quant_backend=self.mxfp8_quant_backend,
+            rounding_mode=self.mxfp8_rounding_mode,
+        )
+        setattr(self, scale_attr, weight_scale.detach())
+        weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype).reshape(weight.shape)
+        if self.mxfp8_probe_quant_error:
+            if split_sublayer_types is None:
+                self._record_quant_error("weight", sublayer_type, weight, weight_fq)
+            else:
+                original_chunks = weight.chunk(len(split_sublayer_types), dim=1)
+                quantized_chunks = weight_fq.chunk(len(split_sublayer_types), dim=1)
+                for layer_type, original_chunk, quantized_chunk in zip(
+                    split_sublayer_types, original_chunks, quantized_chunks, strict=True
+                ):
+                    self._record_quant_error("weight", layer_type, original_chunk, quantized_chunk)
+        return weight_fq
+
     def _fake_quantize_activation(
         self,
         x: torch.Tensor,
@@ -319,12 +394,35 @@ class MXFP8QATExperts(nn.Module):
             split_sublayer_types=("gate_proj", "up_proj"),
         )
 
+    def _prepare_gate_up_weight_no_ste(self, apply_fake_quant: bool) -> torch.Tensor:
+        weight = self._canonicalize_weight(self.gate_up_proj, kind="gate_up_proj")
+        if not apply_fake_quant or not self._quantize_gate_up_proj:
+            return weight
+        weight = self._rotate_if_enabled(weight)
+        return self._fake_quantize_weight_no_ste(
+            weight,
+            sublayer_type="gate_up_proj",
+            scale_attr="_last_gate_up_scale",
+            split_sublayer_types=("gate_proj", "up_proj"),
+        )
+
     def _prepare_down_weight(self, apply_fake_quant: bool) -> torch.Tensor:
         weight = self._canonicalize_weight(self.down_proj, kind="down_proj")
         if not apply_fake_quant or not self._quantize_down_proj:
             return weight
         weight = self._rotate_if_enabled(weight)
         return self._fake_quantize_weight(
+            weight,
+            sublayer_type="down_proj",
+            scale_attr="_last_down_scale",
+        )
+
+    def _prepare_down_weight_no_ste(self, apply_fake_quant: bool) -> torch.Tensor:
+        weight = self._canonicalize_weight(self.down_proj, kind="down_proj")
+        if not apply_fake_quant or not self._quantize_down_proj:
+            return weight
+        weight = self._rotate_if_enabled(weight)
+        return self._fake_quantize_weight_no_ste(
             weight,
             sublayer_type="down_proj",
             scale_attr="_last_down_scale",
@@ -361,14 +459,76 @@ class MXFP8QATExperts(nn.Module):
         return self._prepare_down_input(hidden_states, self.fake_quant_enabled)
 
     def get_npu_sparse_block_weights(self, input_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        gate_up_weight = self._prepare_gate_up_weight(self.fake_quant_enabled)
-        gate_proj_weight, up_proj_weight = gate_up_weight.chunk(2, dim=1)
-        down_weight = self._prepare_down_weight(self.fake_quant_enabled)
-        return (
-            up_proj_weight.transpose(1, 2).to(input_dtype),
-            gate_proj_weight.transpose(1, 2).to(input_dtype),
-            down_weight.transpose(1, 2).to(input_dtype),
+        needs_cached_refresh = self._cached_npu_weight_dtype != input_dtype or (
+            self.fake_quant_enabled
+            and not self.mxfp8_probe_quant_error
+            and (
+                (self._quantize_gate_up_proj and (self._cached_npu_up_proj_weight is None or self._cached_npu_gate_proj_weight is None))
+                or (self._quantize_down_proj and self._cached_npu_down_proj_weight is None)
+            )
         )
+
+        gate_up_weight = self._canonicalize_weight(self.gate_up_proj, kind="gate_up_proj")
+        if self.fake_quant_enabled and self._quantize_gate_up_proj:
+            gate_up_weight = self._rotate_if_enabled(gate_up_weight)
+            if self.mxfp8_probe_quant_error:
+                gate_up_weight = self._fake_quantize_weight(
+                    gate_up_weight,
+                    sublayer_type="gate_up_proj",
+                    scale_attr="_last_gate_up_scale",
+                    split_sublayer_types=("gate_proj", "up_proj"),
+                )
+                gate_proj_weight, up_proj_weight = gate_up_weight.chunk(2, dim=1)
+                up_proj_weight = up_proj_weight.transpose(1, 2).to(input_dtype)
+                gate_proj_weight = gate_proj_weight.transpose(1, 2).to(input_dtype)
+            else:
+                if needs_cached_refresh:
+                    gate_up_weight_qdq = self._fake_quantize_weight_no_ste(
+                        gate_up_weight,
+                        sublayer_type="gate_up_proj",
+                        scale_attr="_last_gate_up_scale",
+                        split_sublayer_types=("gate_proj", "up_proj"),
+                    )
+                    gate_proj_weight_qdq, up_proj_weight_qdq = gate_up_weight_qdq.chunk(2, dim=1)
+                    self._cached_npu_up_proj_weight = up_proj_weight_qdq.transpose(1, 2).to(input_dtype).detach()
+                    self._cached_npu_gate_proj_weight = gate_proj_weight_qdq.transpose(1, 2).to(input_dtype).detach()
+                gate_proj_weight, up_proj_weight = gate_up_weight.chunk(2, dim=1)
+                up_proj_weight = up_proj_weight.transpose(1, 2).to(input_dtype)
+                gate_proj_weight = gate_proj_weight.transpose(1, 2).to(input_dtype)
+                up_proj_weight = up_proj_weight + (self._cached_npu_up_proj_weight - up_proj_weight).detach()
+                gate_proj_weight = gate_proj_weight + (self._cached_npu_gate_proj_weight - gate_proj_weight).detach()
+        else:
+            gate_proj_weight, up_proj_weight = gate_up_weight.chunk(2, dim=1)
+            up_proj_weight = up_proj_weight.transpose(1, 2).to(input_dtype)
+            gate_proj_weight = gate_proj_weight.transpose(1, 2).to(input_dtype)
+
+        down_weight = self._canonicalize_weight(self.down_proj, kind="down_proj")
+        if self.fake_quant_enabled and self._quantize_down_proj:
+            down_weight = self._rotate_if_enabled(down_weight)
+            if self.mxfp8_probe_quant_error:
+                down_weight = self._fake_quantize_weight(
+                    down_weight,
+                    sublayer_type="down_proj",
+                    scale_attr="_last_down_scale",
+                )
+                down_weight = down_weight.transpose(1, 2).to(input_dtype)
+            else:
+                if needs_cached_refresh:
+                    down_weight_qdq = self._fake_quantize_weight_no_ste(
+                        down_weight,
+                        sublayer_type="down_proj",
+                        scale_attr="_last_down_scale",
+                    )
+                    self._cached_npu_down_proj_weight = down_weight_qdq.transpose(1, 2).to(input_dtype).detach()
+                down_weight = down_weight.transpose(1, 2).to(input_dtype)
+                down_weight = down_weight + (self._cached_npu_down_proj_weight - down_weight).detach()
+        else:
+            down_weight = down_weight.transpose(1, 2).to(input_dtype)
+
+        if self.fake_quant_enabled and not self.mxfp8_probe_quant_error and needs_cached_refresh:
+            self._cached_npu_weight_dtype = input_dtype
+
+        return up_proj_weight, gate_proj_weight, down_weight
 
     def _prepare_forward_inputs(
         self,
@@ -429,6 +589,28 @@ class MXFP8QATExperts(nn.Module):
 
         return final_hidden_states
 
+    def _forward_npu_grouped(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        *,
+        apply_fake_quant: bool,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        expert_hidden_states = self._prepare_gate_up_input(hidden_states, apply_fake_quant)
+        w1, w2, w3 = self.get_npu_sparse_block_weights(hidden_states.dtype)
+        permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(expert_hidden_states, top_k_index.to(torch.int32))
+        tokens_per_expert = torch.histc(top_k_index, bins=self.num_experts, min=0, max=self.num_experts)
+
+        up_res = _NPUGmmFunction.apply(permuted_tokens, w1, tokens_per_expert)
+        gate_res = _NPUGmmFunction.apply(permuted_tokens, w2, tokens_per_expert)
+        act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
+        act_res = self._prepare_down_input(act_res, apply_fake_quant)
+        down_res = _NPUGmmFunction.apply(act_res, w3, tokens_per_expert)
+        return torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=top_k_weights)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -440,12 +622,20 @@ class MXFP8QATExperts(nn.Module):
             routing_arg1,
             routing_arg2,
         )
-        output = self._forward_tokens(
-            hidden_states_2d,
-            top_k_index,
-            top_k_weights,
-            apply_fake_quant=self.fake_quant_enabled,
-        )
+        if hidden_states_2d.device.type == "npu":
+            output = self._forward_npu_grouped(
+                hidden_states_2d,
+                top_k_index,
+                top_k_weights,
+                apply_fake_quant=self.fake_quant_enabled,
+            )
+        else:
+            output = self._forward_tokens(
+                hidden_states_2d,
+                top_k_index,
+                top_k_weights,
+                apply_fake_quant=self.fake_quant_enabled,
+            )
         return output.reshape(original_shape)
 
     def extra_repr(self) -> str:

@@ -309,7 +309,7 @@ def _record_mxfp8_quant_error(
     step = _MXFP8_PROBE_RECORDER.current_step
     _MXFP8_PROBE_RECORDER.record(
         {
-            "error_metric": "mae",
+            "error_metric": "relative_abs",
             "error_type": error_type,
             "layer_index": layer_index,
             "layer_type": layer_type,
@@ -369,6 +369,14 @@ def _check_mxfp8_2d_tensor(tensor: torch.Tensor):
             f"MXFP8 quantization requires the last dimension to be divisible by {_MXFP8_BLOCK_SIZE}, "
             f"got shape={tuple(tensor.shape)}"
         )
+
+
+def _relative_abs_error_sum_and_count(original: torch.Tensor, quantized: torch.Tensor) -> tuple[float, int]:
+    orig = original.detach().to(torch.float32)
+    quant = quantized.to(torch.float32)
+    abs_diff = (quant - orig).abs()
+    rel_diff = torch.where(orig.abs() > 0, abs_diff / orig.abs(), torch.zeros_like(abs_diff))
+    return rel_diff.sum().item(), rel_diff.numel()
 
 
 # torch.round 本身就是四舍六入五成双的实现
@@ -531,6 +539,7 @@ class MXFP8QATLinear(nn.Linear):
         self.fake_quant_enabled = True
         self._last_weight_scale: Optional[torch.Tensor] = None
         self._last_input_scale: Optional[torch.Tensor] = None
+        self._cached_weight_qdq: Optional[torch.Tensor] = None
 
     @classmethod
     def from_linear(
@@ -582,24 +591,28 @@ class MXFP8QATLinear(nn.Linear):
     def invalidate_quant_state(self):
         self._last_weight_scale = None
         self._last_input_scale = None
+        self._cached_weight_qdq = None
 
     def _record_quant_error(self, error_type: str, original: torch.Tensor, quantized: torch.Tensor):
         if not self.mxfp8_probe_quant_error:
             return
 
-        diff = (quantized.to(torch.float32) - original.detach().to(torch.float32)).abs()
+        error_sum, element_count = _relative_abs_error_sum_and_count(original, quantized)
         _record_mxfp8_quant_error(
             layer_type=self._mxfp8_layer_type,
             layer_index=self._mxfp8_layer_index,
             error_type=error_type,
-            error_sum=diff.sum().item(),
-            element_count=diff.numel(),
+            error_sum=error_sum,
+            element_count=element_count,
             qat_mode=self.mode.value,
             quant_backend=self.mxfp8_quant_backend,
             rounding_mode=self.mxfp8_rounding_mode,
         )
 
     def _fake_quantize_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        if not self.mxfp8_probe_quant_error and self._cached_weight_qdq is not None:
+            return weight + (self._cached_weight_qdq - weight).detach()
+
         with torch.no_grad():
             weight_q, weight_scale = quantize_mxfp8_tensor(
                 weight, quant_backend=self.mxfp8_quant_backend, rounding_mode=self.mxfp8_rounding_mode
@@ -609,6 +622,7 @@ class MXFP8QATLinear(nn.Linear):
             if self.mxfp8_probe_quant_error:
                 self._record_quant_error("weight", weight, weight_fq)
                 return weight
+            self._cached_weight_qdq = weight_fq.detach()
         return weight + (weight_fq - weight).detach()
 
     def _rotate_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
