@@ -42,6 +42,52 @@ from verl.utils.qat.mxfp8_rotation import (
 __all__ = ["MXFP8QATExperts", "MXFP8QATSparseMoeBlock"]
 
 
+class _NPUGroupedMatmul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, group_list, group_list_type=1):
+        import torch_npu
+
+        ctx.save_for_backward(x, weight)
+        ctx.group_list = group_list
+        ctx.group_list_type = group_list_type
+        return torch_npu.npu_grouped_matmul(
+            [x],
+            [weight],
+            bias=None,
+            group_list=group_list,
+            split_item=2,
+            group_type=0,
+            group_list_type=group_list_type,
+        )[0]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        import torch_npu
+
+        x, weight = ctx.saved_tensors
+        group_list = ctx.group_list
+        group_list_type = ctx.group_list_type
+        dx = torch_npu.npu_grouped_matmul(
+            [grad_output],
+            [weight.transpose(1, 2)],
+            bias=None,
+            group_list=group_list,
+            split_item=2,
+            group_type=0,
+            group_list_type=group_list_type,
+        )[0]
+        dw = torch_npu.npu_grouped_matmul(
+            [x.transpose(0, 1)],
+            [grad_output],
+            bias=None,
+            group_list=group_list,
+            split_item=3,
+            group_type=2,
+            group_list_type=group_list_type,
+        )[0]
+        return dx, dw, None, None
+
+
 def _clone_parameter_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type == "meta":
         return tensor
@@ -370,6 +416,18 @@ class MXFP8QATExperts(nn.Module):
             down_weight.transpose(1, 2).to(input_dtype),
         )
 
+    def get_npu_sparse_block_grouped_weights(
+        self, input_dtype: torch.dtype, apply_fake_quant: Optional[bool] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if apply_fake_quant is None:
+            apply_fake_quant = self.fake_quant_enabled
+        gate_up_weight = self._prepare_gate_up_weight(apply_fake_quant)
+        down_weight = self._prepare_down_weight(apply_fake_quant)
+        return (
+            gate_up_weight.transpose(1, 2).contiguous().to(input_dtype),
+            down_weight.transpose(1, 2).contiguous().to(input_dtype),
+        )
+
     def _prepare_forward_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -429,6 +487,47 @@ class MXFP8QATExperts(nn.Module):
 
         return final_hidden_states
 
+    @staticmethod
+    def _can_use_npu_grouped_matmul(hidden_states: torch.Tensor) -> bool:
+        if hidden_states.device.type != "npu":
+            return False
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def _forward_npu_grouped(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        *,
+        apply_fake_quant: bool,
+    ) -> Optional[torch.Tensor]:
+        if not self._can_use_npu_grouped_matmul(hidden_states):
+            return None
+
+        import torch_npu
+
+        input_dtype = hidden_states.dtype
+        gate_up_input = self._prepare_gate_up_input(hidden_states, apply_fake_quant)
+        gate_up_weight, down_weight = self.get_npu_sparse_block_grouped_weights(
+            input_dtype, apply_fake_quant=apply_fake_quant
+        )
+
+        permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(
+            gate_up_input, top_k_index.to(torch.int32)
+        )
+        tokens_per_expert = torch.histc(top_k_index, bins=self.num_experts, min=0, max=self.num_experts)
+        gate_up = _NPUGroupedMatmul.apply(permuted_tokens, gate_up_weight, tokens_per_expert)
+        act_res = torch_npu.npu_swiglu(gate_up, dim=-1)
+        act_res = self._prepare_down_input(act_res, apply_fake_quant)
+        down_res = _NPUGroupedMatmul.apply(act_res, down_weight, tokens_per_expert)
+        return torch_npu.npu_moe_token_unpermute(
+            down_res.to(top_k_weights.dtype), row_ids_map, probs=top_k_weights
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -440,12 +539,19 @@ class MXFP8QATExperts(nn.Module):
             routing_arg1,
             routing_arg2,
         )
-        output = self._forward_tokens(
+        output = self._forward_npu_grouped(
             hidden_states_2d,
             top_k_index,
             top_k_weights,
             apply_fake_quant=self.fake_quant_enabled,
         )
+        if output is None:
+            output = self._forward_tokens(
+                hidden_states_2d,
+                top_k_index,
+                top_k_weights,
+                apply_fake_quant=self.fake_quant_enabled,
+            )
         return output.reshape(original_shape)
 
     def extra_repr(self) -> str:

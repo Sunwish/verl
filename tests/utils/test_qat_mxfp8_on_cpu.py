@@ -368,6 +368,48 @@ def test_mxfp8_qat_expert_wrapper_runs_forward_and_invalidate_all_scales():
     assert model.layers[0].mlp.experts._last_down_input_scale is None
 
 
+def test_mxfp8_qat_expert_wrapper_prefers_grouped_fast_path(monkeypatch):
+    model = _MoeModel()
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+            experts={"enable": True},
+        ),
+    )
+    experts = model.layers[0].mlp.experts
+    x = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+    top_k_index = torch.zeros(6, 1, dtype=torch.long)
+    top_k_weights = torch.ones(6, 1, dtype=torch.bfloat16)
+    fast_output = torch.randn(6, 32, dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_grouped(self, hidden_states, routed_experts, routing_weights, *, apply_fake_quant):
+        captured["hidden_shape"] = hidden_states.shape
+        captured["top_k_index"] = routed_experts
+        captured["top_k_weights"] = routing_weights
+        captured["apply_fake_quant"] = apply_fake_quant
+        return fast_output
+
+    def fail_fallback(*args, **kwargs):
+        raise AssertionError("fallback should not run when grouped fast path returns an output")
+
+    monkeypatch.setattr(MXFP8QATExperts, "_forward_npu_grouped", fake_grouped)
+    monkeypatch.setattr(MXFP8QATExperts, "_forward_tokens", fail_fallback)
+
+    out = experts(x, top_k_index, top_k_weights)
+
+    assert torch.equal(out, fast_output.reshape_as(x))
+    assert captured["hidden_shape"] == (6, 32)
+    assert captured["top_k_index"] is top_k_index
+    assert captured["top_k_weights"] is top_k_weights
+    assert captured["apply_fake_quant"] is True
+
+
 def test_mxfp8_qat_expert_probe_splits_gate_up_proj_into_gate_and_up(tmp_path):
     model = _MoeModel()
     output_path = tmp_path / "mxfp8_expert_probe.jsonl"
