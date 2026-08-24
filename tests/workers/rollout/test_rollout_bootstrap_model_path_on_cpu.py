@@ -310,6 +310,52 @@ def test_vllm_rollout_ascend_quantization_uses_rollout_mxfp8_config(monkeypatch)
     mock_apply_patches.assert_called_once()
 
 
+def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout import vllm_async_server as vllm_server
+
+    server = object.__new__(vllm_server.vLLMHttpServer)
+    server.config = SimpleNamespace(
+        quantization="ascend",
+        quantization_config_file=None,
+        qat_fake_quant=True,
+        qat={
+            "enable": True,
+            "mode": "w8a8_mxfp8",
+            "group_size": 32,
+            "mxfp8_quant_backend": "torch",
+            "mxfp8_rounding_mode": "hash",
+            "mxfp8_rotation_enable": True,
+            "mxfp8_rotation_kind": "block_hadamard_sign",
+            "mxfp8_rotation_block_size": 32,
+            "mxfp8_rotation_seed": 7,
+            "experts": {"enable": False},
+        },
+    )
+    server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
+
+    monkeypatch.setattr(vllm_server, "is_torch_npu_available", lambda check_device=False: False)
+
+    with patch("verl.utils.qat.load_quantization_config") as mock_load_quantization_config, patch(
+        "verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches"
+    ) as mock_apply_patches:
+        quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
+
+    assert quantization is None
+    assert hf_overrides == {}
+    mock_load_quantization_config.assert_not_called()
+    mock_apply_patches.assert_not_called()
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ENABLE_ENV] == "1"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_MODE_ENV] == "w8a8_mxfp8"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_BACKEND_ENV] == "torch"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROUNDING_MODE_ENV] == "hash"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_GROUP_SIZE_ENV] == "32"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_ENABLE_ENV] == "True"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_KIND_ENV] == "block_hadamard_sign"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_BLOCK_SIZE_ENV] == "32"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_SEED_ENV] == "7"
+
+
 def test_trtllm_launch_server_uses_bootstrap_model_path(monkeypatch):
     from verl.workers.rollout.trtllm_rollout import trtllm_async_server as trtllm_server
 

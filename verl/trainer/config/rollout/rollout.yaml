@@ -452,6 +452,15 @@ quantization: null
 # extra quantization information serialized in a config file, e.g. torchao_config.json
 quantization_config_file: null
 
+# Whether vLLM-Ascend should keep high-precision rollout kernels and inject
+# MXFP8 fake quant/dequant loss in the unquantized forward path.
+qat_fake_quant: false
+
+# Whether actor-side QAT should export quantized weights during actor -> rollout
+# sync. Disable when rollout injects its own fake quantization loss while keeping
+# high-precision weights and kernels.
+qat_weight_sync_quantize: true
+
 # MXFP8 rollout quantization backend: "npu" uses torch_npu, and "torch" uses verl's torch implementation.
 mxfp8_quant_backend: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_quant_backend,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_quant_backend,"npu"}}
 

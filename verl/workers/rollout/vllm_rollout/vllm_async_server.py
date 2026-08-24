@@ -40,6 +40,16 @@ from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import (
+    MXFP8_FAKE_QUANT_BACKEND_ENV,
+    MXFP8_FAKE_QUANT_ENABLE_ENV,
+    MXFP8_FAKE_QUANT_GROUP_SIZE_ENV,
+    MXFP8_FAKE_QUANT_IGNORE_PATTERNS_ENV,
+    MXFP8_FAKE_QUANT_MODE_ENV,
+    MXFP8_FAKE_QUANT_ROTATION_BLOCK_SIZE_ENV,
+    MXFP8_FAKE_QUANT_ROTATION_ENABLE_ENV,
+    MXFP8_FAKE_QUANT_ROTATION_KIND_ENV,
+    MXFP8_FAKE_QUANT_ROTATION_SEED_ENV,
+    MXFP8_FAKE_QUANT_ROUNDING_MODE_ENV,
     MXFP8_QUANT_BACKEND_ENV,
     MXFP8_ROUNDING_MODE_ENV,
     MXFP8_ROTATION_BLOCK_SIZE_ENV,
@@ -875,6 +885,7 @@ class vLLMHttpServer:
         """Process quantization config. Returns (quantization_str, hf_overrides)."""
         quantization = self.config.quantization
         hf_overrides = {}
+        os.environ[MXFP8_FAKE_QUANT_ENABLE_ENV] = "0"
 
         if is_torch_npu_available(check_device=False):
             from verl.utils.vllm.npu_vllm_patch import check_vllm_ascend_before_server_launch
@@ -931,8 +942,52 @@ class vLLMHttpServer:
                 )
             return quantization_config_dict
 
+        def _configure_mxfp8_fake_quant(config_source):
+            from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
+            from verl.utils.qat.core import get_effective_ignore_patterns
+
+            mxfp8_quant_backend = normalize_mxfp8_quant_backend(config_source.mxfp8_quant_backend)
+            mxfp8_rounding_mode = normalize_mxfp8_rounding_mode(config_source.mxfp8_rounding_mode)
+            group_size = getattr(config_source, "group_size", getattr(config_source, "mxfp8_group_size", 32))
+            os.environ[MXFP8_FAKE_QUANT_ENABLE_ENV] = "1"
+            os.environ[MXFP8_FAKE_QUANT_MODE_ENV] = str(config_source.mode).lower()
+            os.environ[MXFP8_FAKE_QUANT_BACKEND_ENV] = mxfp8_quant_backend
+            os.environ[MXFP8_FAKE_QUANT_ROUNDING_MODE_ENV] = mxfp8_rounding_mode
+            os.environ[MXFP8_FAKE_QUANT_GROUP_SIZE_ENV] = str(group_size)
+            os.environ[MXFP8_FAKE_QUANT_ROTATION_ENABLE_ENV] = str(config_source.mxfp8_rotation_enable)
+            os.environ[MXFP8_FAKE_QUANT_ROTATION_KIND_ENV] = str(config_source.mxfp8_rotation_kind)
+            os.environ[MXFP8_FAKE_QUANT_ROTATION_BLOCK_SIZE_ENV] = str(config_source.mxfp8_rotation_block_size)
+            os.environ[MXFP8_FAKE_QUANT_ROTATION_SEED_ENV] = str(config_source.mxfp8_rotation_seed)
+            os.environ[MXFP8_FAKE_QUANT_IGNORE_PATTERNS_ENV] = json.dumps(get_effective_ignore_patterns(config_source))
+            logger.warning(
+                "MXFP8 rollout fake quant configured: mode=%s, quant_backend=%s, rounding_mode=%s, "
+                "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+                os.environ[MXFP8_FAKE_QUANT_MODE_ENV],
+                mxfp8_quant_backend,
+                mxfp8_rounding_mode,
+                group_size,
+                config_source.mxfp8_rotation_enable,
+                config_source.mxfp8_rotation_kind,
+                config_source.mxfp8_rotation_block_size,
+                config_source.mxfp8_rotation_seed,
+            )
+
         # Handle QAT (Quantization-Aware Training) configuration
         if qat_config is not None and qat_config.enable:
+            is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
+            if getattr(self.config, "qat_fake_quant", False):
+                if not is_mxfp8_qat:
+                    raise ValueError("rollout.qat_fake_quant only supports w8a16_mxfp8/w8a8_mxfp8 QAT modes")
+                _configure_mxfp8_fake_quant(qat_config)
+                if quantization is not None:
+                    logger.warning(
+                        "rollout.qat_fake_quant=True keeps rollout in the high-precision path and ignores "
+                        "rollout.quantization=%s",
+                        quantization,
+                    )
+                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
+                return None, hf_overrides
+
             from verl.utils.qat import load_quantization_config
 
             quantization_config_dict = load_quantization_config(qat_config)
@@ -940,7 +995,6 @@ class vLLMHttpServer:
             has_mxfp8_entry = any(
                 isinstance(value, str) and "MXFP8" in value.upper() for value in quantization_config_dict.values()
             )
-            is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
             if is_mxfp8_qat:
                 quantization_config_dict = _configure_mxfp8_rollout_quantization(qat_config, quantization_config_dict)
 

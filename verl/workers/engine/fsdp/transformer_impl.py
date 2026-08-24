@@ -868,7 +868,11 @@ class FSDPEngine(BaseEngine):
                 for name, param in params.items()
             )
 
-        if self._qat_enabled and self._qat_config.mode in {"w4a4", "w4a16"}:
+        if (
+            self._qat_enabled
+            and kwargs.get("qat_weight_sync_quantize", True)
+            and self._qat_config.mode in {"w4a4", "w4a16"}
+        ):
             from verl.utils.qat.quantizer import QATQuantizer
             from verl.utils.torch_dtypes import PrecisionType
 

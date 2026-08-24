@@ -273,6 +273,10 @@ class RolloutConfig(BaseConfig):
 
     quantization_config_file: Optional[str] = None
 
+    qat_fake_quant: bool = False
+
+    qat_weight_sync_quantize: bool = True
+
     mxfp8_quant_backend: str = "npu"
     mxfp8_rounding_mode: str = "rint"
     mxfp8_rotation_enable: bool = False

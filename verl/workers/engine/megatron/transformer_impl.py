@@ -750,8 +750,9 @@ class MegatronEngine(BaseEngine):
                     per_tensor_param, model_type=self.model_config.hf_config.model_type
                 )
 
-        # QAT: process weights through QATWeightExporter for quantized weight sync to vLLM
-        if self._qat_enabled:
+        # QAT: process weights through QATWeightExporter for quantized weight sync to vLLM.
+        # Rollout fake-quantization keeps the synchronized weights high precision.
+        if self._qat_enabled and kwargs.get("qat_weight_sync_quantize", True):
             from verl.utils.modelopt import export_qat_weights
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
