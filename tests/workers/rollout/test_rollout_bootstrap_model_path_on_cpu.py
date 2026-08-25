@@ -342,7 +342,7 @@ def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
         quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
 
     assert quantization is None
-    assert hf_overrides == {}
+    assert hf_overrides == {"quantization_config": None}
     mock_load_quantization_config.assert_not_called()
     mock_apply_patches.assert_not_called()
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ENABLE_ENV] == "1"
