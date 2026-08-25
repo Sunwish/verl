@@ -223,7 +223,7 @@ def test_sglang_server_adapter_uses_bootstrap_model_path(monkeypatch):
 
 
 @pytest.mark.parametrize("qat_mode", ["w8a16_mxfp8", "w8a8_mxfp8"])
-def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
+def test_vllm_actor_qat_does_not_force_rollout_quantization(monkeypatch, qat_mode):
     pytest.importorskip("vllm")
     from verl.workers.rollout.vllm_rollout import vllm_async_server as vllm_server
 
@@ -246,31 +246,19 @@ def test_vllm_qat_mxfp8_routes_to_ascend_quantization(monkeypatch, qat_mode):
     )
     server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
 
-    quant_config = {"quant_method": "ascend", "layer.weight": "W8A8_MXFP8"}
     monkeypatch.setattr(vllm_server, "is_torch_npu_available", lambda check_device=False: False)
 
-    with patch("verl.utils.qat.load_quantization_config", return_value=quant_config) as mock_load_quantization_config, patch(
+    with patch("verl.utils.qat.load_quantization_config") as mock_load_quantization_config, patch(
         "verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches"
     ) as mock_apply_patches:
         quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
 
-    assert quantization == "ascend"
-    qat_config = mock_load_quantization_config.call_args.args[0]
-    assert qat_config.experts.enable is False
-    assert hf_overrides["quantization_config"]["quant_method"] == "ascend"
-    assert hf_overrides["quantization_config"]["group_size"] == 32
-    assert hf_overrides["quantization_config"]["mxfp8_rotation_enable"] is True
-    assert hf_overrides["quantization_config"]["mxfp8_rotation_kind"] == "block_hadamard_sign"
-    assert hf_overrides["quantization_config"]["mxfp8_rotation_block_size"] == 32
-    assert hf_overrides["quantization_config"]["mxfp8_rotation_seed"] == 7
-    assert hf_overrides["quantization_config"]["layer.weight"] == "W8A8_MXFP8"
-    assert os.environ[vllm_server.MXFP8_QUANT_BACKEND_ENV] == "torch"
-    assert os.environ[vllm_server.MXFP8_ROUNDING_MODE_ENV] == "hash"
-    assert os.environ[vllm_server.MXFP8_ROTATION_ENABLE_ENV] == "True"
-    assert os.environ[vllm_server.MXFP8_ROTATION_KIND_ENV] == "block_hadamard_sign"
-    assert os.environ[vllm_server.MXFP8_ROTATION_BLOCK_SIZE_ENV] == "32"
-    assert os.environ[vllm_server.MXFP8_ROTATION_SEED_ENV] == "7"
-    mock_apply_patches.assert_called_once()
+    assert quantization is None
+    assert hf_overrides == {"quantization_config": None}
+    mock_load_quantization_config.assert_not_called()
+    mock_apply_patches.assert_not_called()
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ENABLE_ENV] == "0"
+    assert os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] == "0"
 
 
 def test_vllm_rollout_ascend_quantization_uses_rollout_mxfp8_config(monkeypatch):
