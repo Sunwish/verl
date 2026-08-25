@@ -989,6 +989,15 @@ class vLLMHttpServer:
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
                 return None, hf_overrides
 
+            if quantization is None:
+                hf_overrides["quantization_config"] = None
+                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
+                logger.info(
+                    "Rollout inherited actor QAT config but rollout.quantization is unset; "
+                    "keep rollout in the high-precision path."
+                )
+                return None, hf_overrides
+
             from verl.utils.qat import load_quantization_config
 
             quantization_config_dict = load_quantization_config(qat_config)
