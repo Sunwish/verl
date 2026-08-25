@@ -979,6 +979,7 @@ class vLLMHttpServer:
                 if not is_mxfp8_qat:
                     raise ValueError("rollout.qat_fake_quant only supports w8a16_mxfp8/w8a8_mxfp8 QAT modes")
                 _configure_mxfp8_fake_quant(qat_config)
+                hf_overrides["quantization_config"] = None
                 if quantization is not None:
                     logger.warning(
                         "rollout.qat_fake_quant=True keeps rollout in the high-precision path and ignores "
