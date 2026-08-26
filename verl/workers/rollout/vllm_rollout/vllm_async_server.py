@@ -972,22 +972,32 @@ class vLLMHttpServer:
                 config_source.mxfp8_rotation_seed,
             )
 
-        # Handle QAT (Quantization-Aware Training) configuration
+        # Rollout fake quantization is independent from actor-side QAT
+        # enablement. The inherited config supplies the MXFP8 parameters,
+        # while qat_fake_quant controls the rollout behavior.
+        if getattr(self.config, "qat_fake_quant", False):
+            if qat_config is None:
+                raise ValueError(
+                    "rollout.qat_fake_quant=True requires rollout.qat or an inherited actor QAT config"
+                )
+            is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
+            if not is_mxfp8_qat:
+                raise ValueError("rollout.qat_fake_quant only supports w8a16_mxfp8/w8a8_mxfp8 QAT modes")
+            _configure_mxfp8_fake_quant(qat_config)
+            hf_overrides["quantization_config"] = None
+            if quantization is not None:
+                logger.warning(
+                    "rollout.qat_fake_quant=True keeps rollout in the high-precision path and ignores "
+                    "rollout.quantization=%s",
+                    quantization,
+                )
+            os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
+            return None, hf_overrides
+
+        # Handle actor-side QAT configuration only when rollout requests a
+        # real quantized vLLM path.
         if qat_config is not None and qat_config.enable:
             is_mxfp8_qat = qat_config.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
-            if getattr(self.config, "qat_fake_quant", False):
-                if not is_mxfp8_qat:
-                    raise ValueError("rollout.qat_fake_quant only supports w8a16_mxfp8/w8a8_mxfp8 QAT modes")
-                _configure_mxfp8_fake_quant(qat_config)
-                hf_overrides["quantization_config"] = None
-                if quantization is not None:
-                    logger.warning(
-                        "rollout.qat_fake_quant=True keeps rollout in the high-precision path and ignores "
-                        "rollout.quantization=%s",
-                        quantization,
-                    )
-                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
-                return None, hf_overrides
 
             if quantization is None:
                 hf_overrides["quantization_config"] = None
