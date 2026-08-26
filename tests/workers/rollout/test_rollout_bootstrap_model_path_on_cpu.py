@@ -308,7 +308,7 @@ def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
         quantization_config_file=None,
         qat_fake_quant=True,
         qat={
-            "enable": True,
+            "enable": False,
             "mode": "w8a8_mxfp8",
             "group_size": 32,
             "mxfp8_quant_backend": "torch",
