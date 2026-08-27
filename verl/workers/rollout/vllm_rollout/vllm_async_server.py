@@ -49,6 +49,7 @@ from verl.utils.vllm.vllm_fp8_utils import (
     MXFP8_FAKE_QUANT_ROTATION_ENABLE_ENV,
     MXFP8_FAKE_QUANT_ROTATION_KIND_ENV,
     MXFP8_FAKE_QUANT_ROTATION_SEED_ENV,
+    MXFP8_FAKE_QUANT_ROTATION_TARGETS_ENV,
     MXFP8_FAKE_QUANT_ROUNDING_MODE_ENV,
     MXFP8_QUANT_BACKEND_ENV,
     MXFP8_ROUNDING_MODE_ENV,
@@ -56,6 +57,7 @@ from verl.utils.vllm.vllm_fp8_utils import (
     MXFP8_ROTATION_ENABLE_ENV,
     MXFP8_ROTATION_KIND_ENV,
     MXFP8_ROTATION_SEED_ENV,
+    MXFP8_ROTATION_TARGETS_ENV,
     apply_vllm_fp8_patches,
 )
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -901,7 +903,13 @@ class vLLMHttpServer:
 
         def _configure_mxfp8_rollout_quantization(config_source, quantization_config_dict: dict | None = None) -> dict:
             from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
-            from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, mxfp8_rotation_config_to_dict
+            from verl.utils.qat.mxfp8_rotation import (
+                MXFP8_ROTATION_TARGET_FPROP,
+                MXFP8RotationConfig,
+                is_mxfp8_rotation_target,
+                mxfp8_rotation_config_to_dict,
+                normalize_mxfp8_rotation_targets,
+            )
 
             quantization_config_dict = dict(quantization_config_dict or {})
             mxfp8_quant_backend = normalize_mxfp8_quant_backend(config_source.mxfp8_quant_backend)
@@ -912,6 +920,10 @@ class vLLMHttpServer:
             os.environ[MXFP8_ROTATION_KIND_ENV] = str(config_source.mxfp8_rotation_kind)
             os.environ[MXFP8_ROTATION_BLOCK_SIZE_ENV] = str(config_source.mxfp8_rotation_block_size)
             os.environ[MXFP8_ROTATION_SEED_ENV] = str(config_source.mxfp8_rotation_seed)
+            rotation_targets = normalize_mxfp8_rotation_targets(
+                getattr(config_source, "mxfp8_rotation_targets", None)
+            )
+            os.environ[MXFP8_ROTATION_TARGETS_ENV] = json.dumps(rotation_targets)
             group_size = getattr(config_source, "group_size", getattr(config_source, "mxfp8_group_size", 32))
             quantization_config_dict["group_size"] = group_size
             rotation_config = MXFP8RotationConfig(
@@ -919,21 +931,24 @@ class vLLMHttpServer:
                 kind=config_source.mxfp8_rotation_kind,
                 block_size=config_source.mxfp8_rotation_block_size,
                 seed=config_source.mxfp8_rotation_seed,
+                targets=rotation_targets,
             )
             quantization_config_dict.update(mxfp8_rotation_config_to_dict(rotation_config))
             logger.warning(
                 "MXFP8 rollout quantization configured: mode=%s, quant_backend=%s, rounding_mode=%s, "
-                "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+                "group_size=%s, rotation_enable=%s, rotation_targets=%s, rotation_kind=%s, "
+                "rotation_block_size=%s, rotation_seed=%s",
                 getattr(config_source, "mode", None),
                 mxfp8_quant_backend,
                 mxfp8_rounding_mode,
                 group_size,
                 rotation_config.enable,
+                rotation_config.targets,
                 rotation_config.kind,
                 rotation_config.block_size,
                 rotation_config.seed,
             )
-            if rotation_config.enable:
+            if is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_FPROP):
                 logger.warning(
                     "MXFP8 block rotation injected for vLLM rollout: kind=%s, block_size=%s, seed=%s",
                     rotation_config.kind,
@@ -945,9 +960,13 @@ class vLLMHttpServer:
         def _configure_mxfp8_fake_quant(config_source):
             from verl.utils.qat.mxfp8_linear import normalize_mxfp8_quant_backend, normalize_mxfp8_rounding_mode
             from verl.utils.qat.core import get_effective_ignore_patterns
+            from verl.utils.qat.mxfp8_rotation import normalize_mxfp8_rotation_targets
 
             mxfp8_quant_backend = normalize_mxfp8_quant_backend(config_source.mxfp8_quant_backend)
             mxfp8_rounding_mode = normalize_mxfp8_rounding_mode(config_source.mxfp8_rounding_mode)
+            rotation_targets = normalize_mxfp8_rotation_targets(
+                getattr(config_source, "mxfp8_rotation_targets", None)
+            )
             group_size = getattr(config_source, "group_size", getattr(config_source, "mxfp8_group_size", 32))
             os.environ[MXFP8_FAKE_QUANT_ENABLE_ENV] = "1"
             os.environ[MXFP8_FAKE_QUANT_MODE_ENV] = str(config_source.mode).lower()
@@ -958,15 +977,18 @@ class vLLMHttpServer:
             os.environ[MXFP8_FAKE_QUANT_ROTATION_KIND_ENV] = str(config_source.mxfp8_rotation_kind)
             os.environ[MXFP8_FAKE_QUANT_ROTATION_BLOCK_SIZE_ENV] = str(config_source.mxfp8_rotation_block_size)
             os.environ[MXFP8_FAKE_QUANT_ROTATION_SEED_ENV] = str(config_source.mxfp8_rotation_seed)
+            os.environ[MXFP8_FAKE_QUANT_ROTATION_TARGETS_ENV] = json.dumps(rotation_targets)
             os.environ[MXFP8_FAKE_QUANT_IGNORE_PATTERNS_ENV] = json.dumps(get_effective_ignore_patterns(config_source))
             logger.warning(
                 "MXFP8 rollout fake quant configured: mode=%s, quant_backend=%s, rounding_mode=%s, "
-                "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+                "group_size=%s, rotation_enable=%s, rotation_targets=%s, rotation_kind=%s, "
+                "rotation_block_size=%s, rotation_seed=%s",
                 os.environ[MXFP8_FAKE_QUANT_MODE_ENV],
                 mxfp8_quant_backend,
                 mxfp8_rounding_mode,
                 group_size,
                 config_source.mxfp8_rotation_enable,
+                rotation_targets,
                 config_source.mxfp8_rotation_kind,
                 config_source.mxfp8_rotation_block_size,
                 config_source.mxfp8_rotation_seed,

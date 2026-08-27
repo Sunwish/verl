@@ -21,7 +21,12 @@ from typing import Any, Callable, Literal, Optional
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
 from verl.utils.qat.core import QATExpertsConfig
-from verl.utils.qat.mxfp8_rotation import MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN, MXFP8RotationConfig, validate_mxfp8_rotation_config
+from verl.utils.qat.mxfp8_rotation import (
+    MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN,
+    MXFP8RotationConfig,
+    normalize_mxfp8_rotation_targets,
+    validate_mxfp8_rotation_config,
+)
 
 from ...utils.profiler import ProfilerConfig
 from .model import HFModelConfig
@@ -158,6 +163,7 @@ class QATEngineConfig(BaseConfig):
     mxfp8_rotation_kind: str = MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN
     mxfp8_rotation_block_size: int = 32
     mxfp8_rotation_seed: int = 0
+    mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
     quantization_config_path: Optional[str] = None
 
@@ -165,6 +171,11 @@ class QATEngineConfig(BaseConfig):
         from verl.utils.qat.core import _coerce_qat_experts_config
 
         object.__setattr__(self, "experts", _coerce_qat_experts_config(getattr(self, "experts", None)))
+        object.__setattr__(
+            self,
+            "mxfp8_rotation_targets",
+            list(normalize_mxfp8_rotation_targets(self.mxfp8_rotation_targets)),
+        )
         mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
         if mxfp8_rounding_mode not in {"rint", "round", "random", "hash"}:
             raise ValueError(
@@ -190,6 +201,7 @@ class QATEngineConfig(BaseConfig):
             kind=self.mxfp8_rotation_kind,
             block_size=self.mxfp8_rotation_block_size,
             seed=self.mxfp8_rotation_seed,
+            targets=tuple(self.mxfp8_rotation_targets),
         )
         if rotation_config.enable:
             if self.mode.lower() not in {"w8a16_mxfp8", "w8a8_mxfp8"}:

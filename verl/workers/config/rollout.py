@@ -19,6 +19,7 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.utils.qat.mxfp8_rotation import normalize_mxfp8_rotation_targets
 from verl.workers.config.disaggregation import DisaggregationConfig
 from verl.workers.config.model import MtpConfig
 
@@ -283,6 +284,7 @@ class RolloutConfig(BaseConfig):
     mxfp8_rotation_kind: str = "block_hadamard_sign"
     mxfp8_rotation_block_size: int = 32
     mxfp8_rotation_seed: int = 0
+    mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     mxfp8_group_size: int = 32
 
     enable_rollout_routing_replay: bool = False
@@ -297,6 +299,11 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        object.__setattr__(
+            self,
+            "mxfp8_rotation_targets",
+            list(normalize_mxfp8_rotation_targets(self.mxfp8_rotation_targets)),
+        )
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

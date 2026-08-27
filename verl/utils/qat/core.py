@@ -28,6 +28,7 @@ from verl.utils.qat.mxfp8_rotation import (
     MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN,
     MXFP8RotationConfig,
     normalize_mxfp8_rotation_kind,
+    normalize_mxfp8_rotation_targets,
     validate_mxfp8_rotation_config,
 )
 
@@ -89,10 +90,16 @@ class QATConfig(BaseConfig):
     mxfp8_rotation_kind: str = MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN
     mxfp8_rotation_block_size: int = 32
     mxfp8_rotation_seed: int = 0
+    mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
         object.__setattr__(self, "experts", _coerce_qat_experts_config(self.experts))
+        object.__setattr__(
+            self,
+            "mxfp8_rotation_targets",
+            list(normalize_mxfp8_rotation_targets(self.mxfp8_rotation_targets)),
+        )
         mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
         if mxfp8_rounding_mode not in _MXFP8_ROUNDING_MODES:
             raise ValueError(
@@ -118,6 +125,7 @@ class QATConfig(BaseConfig):
             kind=normalize_mxfp8_rotation_kind(self.mxfp8_rotation_kind),
             block_size=self.mxfp8_rotation_block_size,
             seed=self.mxfp8_rotation_seed,
+            targets=tuple(self.mxfp8_rotation_targets),
         )
         if rotation_config.enable:
             if self.mode.lower() not in _MXFP8_MODES:
@@ -334,13 +342,15 @@ def apply_qat(
 
         logger.warning(
             "MXFP8 QAT requested on training model: mode=%s, group_size=%s, quant_backend=%s, "
-            "rounding_mode=%s, probe_quant_error=%s, rotation_enable=%s, experts_enable=%s",
+            "rounding_mode=%s, probe_quant_error=%s, rotation_enable=%s, rotation_targets=%s, "
+            "experts_enable=%s",
             mode.value,
             config.group_size,
             config.mxfp8_quant_backend,
             config.mxfp8_rounding_mode,
             config.mxfp8_probe_quant_error,
             config.mxfp8_rotation_enable,
+            config.mxfp8_rotation_targets,
             config.experts.enable,
         )
         configure_mxfp8_probe(
@@ -355,10 +365,11 @@ def apply_qat(
             )
         if config.mxfp8_rotation_enable:
             logger.warning(
-                "MXFP8 block rotation enabled for QAT: kind=%s, block_size=%s, seed=%s",
+                "MXFP8 block rotation enabled for QAT: kind=%s, block_size=%s, seed=%s, targets=%s",
                 config.mxfp8_rotation_kind,
                 config.mxfp8_rotation_block_size,
                 config.mxfp8_rotation_seed,
+                config.mxfp8_rotation_targets,
             )
 
     effective_ignore_patterns = get_effective_ignore_patterns(config)
@@ -397,6 +408,7 @@ def apply_qat(
             from_linear_kwargs["mxfp8_rotation_kind"] = config.mxfp8_rotation_kind
             from_linear_kwargs["mxfp8_rotation_block_size"] = config.mxfp8_rotation_block_size
             from_linear_kwargs["mxfp8_rotation_seed"] = config.mxfp8_rotation_seed
+            from_linear_kwargs["mxfp8_rotation_targets"] = list(config.mxfp8_rotation_targets)
             from_linear_kwargs["layer_name"] = name
             from_linear_kwargs["layer_type"] = layer_type
             from_linear_kwargs["layer_index"] = layer_index
@@ -427,6 +439,7 @@ def apply_qat(
                 mxfp8_rotation_kind=config.mxfp8_rotation_kind,
                 mxfp8_rotation_block_size=config.mxfp8_rotation_block_size,
                 mxfp8_rotation_seed=config.mxfp8_rotation_seed,
+                mxfp8_rotation_targets=config.mxfp8_rotation_targets,
                 layer_name=name,
                 layer_index=layer_index,
                 quantize_gate_up_proj=packed_expert_plan["quantize_gate_up_proj"],
@@ -441,7 +454,7 @@ def apply_qat(
         logger.warning(
             "MXFP8 QAT applied to training model: mode=%s, converted_layers=%s, quant_backend=%s, "
             "rounding_mode=%s, weight_fake_quant=True, activation_fake_quant=%s, probe_quant_error=%s, "
-            "rotation_enable=%s, experts_enable=%s",
+            "rotation_enable=%s, rotation_targets=%s, experts_enable=%s",
             mode.value,
             converted_count,
             config.mxfp8_quant_backend,
@@ -449,6 +462,7 @@ def apply_qat(
             mode.value == "w8a8_mxfp8",
             config.mxfp8_probe_quant_error,
             config.mxfp8_rotation_enable,
+            config.mxfp8_rotation_targets,
             config.experts.enable,
         )
 

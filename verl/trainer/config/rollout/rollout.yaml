@@ -470,6 +470,9 @@ mxfp8_rounding_mode: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_r
 # Enable global block-wise Hadamard/random-sign rotation before MXFP8 quantization during rollout weight sync.
 mxfp8_rotation_enable: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_enable,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_enable,false}}
 
+# Select rotation targets: Fprop, Dgrad, and/or Wgrad. Rollout applies Fprop; Dgrad/Wgrad are training-only.
+mxfp8_rotation_targets: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_targets,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_targets,null}}
+
 # Rotation implementation. First supported mode repeats one 32x32 block along the hidden dimension.
 mxfp8_rotation_kind: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_kind,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_kind,"block_hadamard_sign"}}
 
