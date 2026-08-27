@@ -28,11 +28,16 @@ from verl.utils.qat.mxfp8_linear import (
     MXFP8QATLinear,
     _round_mxfp8_scaled_abs,
     flush_mxfp8_probe,
+    linear_with_gradient_rotation,
     mxfp8_probe_step_context,
     quantize_mxfp8_tensor,
     reset_mxfp8_probe,
 )
-from verl.utils.qat.mxfp8_rotation import MXFP8RotationConfig, apply_mxfp8_block_rotation
+from verl.utils.qat.mxfp8_rotation import (
+    MXFP8RotationConfig,
+    apply_mxfp8_block_rotation,
+    normalize_mxfp8_rotation_targets,
+)
 
 
 class _TinyModel(nn.Module):
@@ -179,6 +184,63 @@ def test_mxfp8_block_rotation_preserves_linear_equivalence():
     rotated = F.linear(rotated_x, rotated_w)
 
     assert torch.allclose(rotated, baseline, atol=1e-5, rtol=1e-5)
+
+
+def test_mxfp8_rotation_targets_normalize_and_default():
+    assert normalize_mxfp8_rotation_targets(None) == ("fprop",)
+    assert normalize_mxfp8_rotation_targets("Dgrad,Wgrad") == ("dgrad", "wgrad")
+    assert normalize_mxfp8_rotation_targets('["Wgrad", "Fprop"]') == ("fprop", "wgrad")
+
+    config = QATConfig(
+        enable=True,
+        mode="w8a8_mxfp8",
+        group_size=32,
+        mxfp8_quant_backend="torch",
+        mxfp8_rotation_enable=True,
+        mxfp8_rotation_targets=["Wgrad", "Dgrad"],
+    )
+    assert config.mxfp8_rotation_targets == ["dgrad", "wgrad"]
+
+
+def test_linear_with_gradient_rotation_matches_standard_backward_with_padding():
+    cfg = MXFP8RotationConfig(enable=True, block_size=32, seed=17, targets=("dgrad", "wgrad"))
+    x = torch.randn(4, 37, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(23, 37, dtype=torch.float32, requires_grad=True)
+    grad_output = torch.randn(4, 23, dtype=torch.float32)
+
+    rotated_out = linear_with_gradient_rotation(x, weight, None, cfg)
+    rotated_out.backward(grad_output)
+    rotated_x_grad = x.grad.detach().clone()
+    rotated_weight_grad = weight.grad.detach().clone()
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    ref_out = F.linear(x_ref, weight_ref)
+    ref_out.backward(grad_output)
+
+    assert torch.allclose(rotated_out, ref_out, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(rotated_x_grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(rotated_weight_grad, weight_ref.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_apply_qat_mxfp8_rotation_targets_propagate_to_wrappers():
+    model = _TinyModel()
+
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            mxfp8_rounding_mode="round",
+            mxfp8_rotation_enable=True,
+            mxfp8_rotation_targets=["Dgrad", "Wgrad"],
+        ),
+    )
+
+    assert isinstance(model.proj, MXFP8QATLinear)
+    assert model.proj.mxfp8_rotation_config.targets == ("dgrad", "wgrad")
 
 
 def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):

@@ -36,8 +36,11 @@ from verl.utils.qat.mxfp8_rotation import (
     MXFP8_ROTATION_ENABLE_KEY,
     MXFP8_ROTATION_KIND_KEY,
     MXFP8_ROTATION_SEED_KEY,
+    MXFP8_ROTATION_TARGETS_KEY,
+    MXFP8_ROTATION_TARGET_FPROP,
     apply_mxfp8_block_rotation,
     get_mxfp8_rotation_config as parse_mxfp8_rotation_config,
+    is_mxfp8_rotation_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,7 @@ MXFP8_ROTATION_ENABLE_ENV = "VERL_MXFP8_ROTATION_ENABLE"
 MXFP8_ROTATION_KIND_ENV = "VERL_MXFP8_ROTATION_KIND"
 MXFP8_ROTATION_BLOCK_SIZE_ENV = "VERL_MXFP8_ROTATION_BLOCK_SIZE"
 MXFP8_ROTATION_SEED_ENV = "VERL_MXFP8_ROTATION_SEED"
+MXFP8_ROTATION_TARGETS_ENV = "VERL_MXFP8_ROTATION_TARGETS"
 MXFP8_FAKE_QUANT_ENABLE_ENV = "VLLM_ASCEND_QAT_FAKE_QUANT"
 MXFP8_FAKE_QUANT_MODE_ENV = "VLLM_ASCEND_QAT_FAKE_QUANT_MODE"
 MXFP8_FAKE_QUANT_BACKEND_ENV = "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND"
@@ -57,6 +61,7 @@ MXFP8_FAKE_QUANT_ROTATION_ENABLE_ENV = "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE"
 MXFP8_FAKE_QUANT_ROTATION_KIND_ENV = "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND"
 MXFP8_FAKE_QUANT_ROTATION_BLOCK_SIZE_ENV = "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE"
 MXFP8_FAKE_QUANT_ROTATION_SEED_ENV = "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED"
+MXFP8_FAKE_QUANT_ROTATION_TARGETS_ENV = "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS"
 MXFP8_FAKE_QUANT_IGNORE_PATTERNS_ENV = "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS"
 
 
@@ -185,6 +190,8 @@ def get_mxfp8_rotation_config(default: Optional[dict[str, Any]] = None):
         config[MXFP8_ROTATION_BLOCK_SIZE_KEY] = os.environ[MXFP8_ROTATION_BLOCK_SIZE_ENV]
     if MXFP8_ROTATION_SEED_ENV in os.environ:
         config[MXFP8_ROTATION_SEED_KEY] = os.environ[MXFP8_ROTATION_SEED_ENV]
+    if MXFP8_ROTATION_TARGETS_ENV in os.environ:
+        config[MXFP8_ROTATION_TARGETS_KEY] = os.environ[MXFP8_ROTATION_TARGETS_ENV]
     return parse_mxfp8_rotation_config(config)
 
 
@@ -263,12 +270,17 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16, stats: dic
     mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu")
     mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="rint") if is_mxfp8_npu else "rint"
     rotation_config = get_mxfp8_rotation_config(getattr(quant_config, "quant_description", {}) or {})
-    if is_mxfp8_npu and rotation_config.enable and torch.distributed.get_rank() == 0:
+    if (
+        is_mxfp8_npu
+        and is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_FPROP)
+        and torch.distributed.get_rank() == 0
+    ):
         logger.warning(
-            "MXFP8 block rotation enabled for rollout weight sync: kind=%s, block_size=%s, seed=%s",
+            "MXFP8 block rotation enabled for rollout weight sync: kind=%s, block_size=%s, seed=%s, targets=%s",
             rotation_config.kind,
             rotation_config.block_size,
             rotation_config.seed,
+            rotation_config.targets,
         )
     # vLLM v0.11-v0.12 renamed weight_scale_inv → weight_scale in process_weights_after_loading,
     # so load_weights expects "_scale" suffix. v0.14+ keeps weight_scale_inv, so expects "_scale_inv".
@@ -288,7 +300,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16, stats: dic
         if torch.distributed.get_rank() == 0:
             logger.debug(f"Quantizing to FP8 blockwise: {k}")
         if is_mxfp8_npu:
-            if rotation_config.enable:
+            if is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_FPROP):
                 v = apply_mxfp8_block_rotation(v, rotation_config)
             param_lp, param_scale = quantize_mxfp8_weight_ascend(
                 v,
@@ -350,6 +362,7 @@ def load_quanted_weights(weights, model_runner, is_drafter=False, return_stats=F
         "quant_backend": mxfp8_quant_backend,
         "rounding_mode": mxfp8_rounding_mode,
         "rotation_enable": rotation_config.enable,
+        "rotation_targets": rotation_config.targets,
         "rotation_kind": rotation_config.kind,
         "rotation_block_size": rotation_config.block_size,
         "rotation_seed": rotation_config.seed,

@@ -34,9 +34,14 @@ import torch.nn.functional as F
 
 from verl.utils.qat.linear import QATMode
 from verl.utils.qat.mxfp8_rotation import (
+    MXFP8_ROTATION_TARGET_DGRAD,
+    MXFP8_ROTATION_TARGET_FPROP,
+    MXFP8_ROTATION_TARGET_WGRAD,
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
+    is_mxfp8_rotation_target,
     normalize_mxfp8_rotation_kind,
+    normalize_mxfp8_rotation_targets,
     validate_mxfp8_rotation_config,
 )
 
@@ -44,6 +49,7 @@ __all__ = [
     "MXFP8QATLinear",
     "configure_mxfp8_probe",
     "flush_mxfp8_probe",
+    "linear_with_gradient_rotation",
     "mxfp8_probe_step_context",
     "normalize_mxfp8_quant_backend",
     "normalize_mxfp8_rounding_mode",
@@ -68,6 +74,117 @@ _MXFP8_HASH_INCREMENT = 1013904223
 _MXFP8_HASH_MODULUS = 2**32
 _MXFP8_HASH_RANDOM_SHIFT = 2**8
 _MXFP8_HASH_RANDOM_LEVELS = 2**24
+
+
+def _pad_mxfp8_rotation_dimension(tensor: torch.Tensor, block_size: int) -> torch.Tensor:
+    padding = (-tensor.shape[-1]) % block_size
+    if padding:
+        return F.pad(tensor, (0, padding))
+    return tensor
+
+
+def _rotate_and_fake_quantize_gradient_operand(
+    tensor: torch.Tensor,
+    rotation_config: MXFP8RotationConfig,
+    quant_backend: str | None,
+    rounding_mode: str,
+) -> torch.Tensor:
+    tensor = _pad_mxfp8_rotation_dimension(tensor, rotation_config.block_size)
+    tensor = apply_mxfp8_block_rotation(tensor, rotation_config)
+    if quant_backend is None:
+        return tensor
+
+    original_shape = tensor.shape
+    tensor_q, tensor_scale = quantize_mxfp8_tensor(
+        tensor.reshape(-1, tensor.shape[-1]),
+        quant_backend=quant_backend,
+        rounding_mode=rounding_mode,
+    )
+    return _dequantize_mxfp8(tensor_q, tensor_scale, tensor.dtype).reshape(original_shape)
+
+
+class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        rotation_config,
+        quant_backend: str | None,
+        rounding_mode: str,
+    ):
+        ctx.save_for_backward(input, weight)
+        ctx.bias_is_none = bias is None
+        ctx.rotation_config = rotation_config
+        ctx.quant_backend = quant_backend
+        ctx.rounding_mode = rounding_mode
+        return F.linear(input, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        input, weight = ctx.saved_tensors
+        rotation_config = ctx.rotation_config
+        input_2d = input.reshape(-1, input.shape[-1])
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        quant_backend = ctx.quant_backend
+        rounding_mode = ctx.rounding_mode
+
+        if is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_DGRAD):
+            rotated_grad_output = _rotate_and_fake_quantize_gradient_operand(
+                grad_output_2d,
+                rotation_config,
+                quant_backend,
+                rounding_mode,
+            )
+            rotated_weight = _rotate_and_fake_quantize_gradient_operand(
+                weight.transpose(0, 1),
+                rotation_config,
+                quant_backend,
+                rounding_mode,
+            ).transpose(0, 1)
+            grad_input_2d = rotated_grad_output.matmul(rotated_weight)
+        else:
+            grad_input_2d = grad_output_2d.matmul(weight)
+
+        if is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_WGRAD):
+            rotated_grad_output_t = _rotate_and_fake_quantize_gradient_operand(
+                grad_output_2d.transpose(0, 1),
+                rotation_config,
+                quant_backend,
+                rounding_mode,
+            )
+            rotated_input_t = _rotate_and_fake_quantize_gradient_operand(
+                input_2d.transpose(0, 1),
+                rotation_config,
+                quant_backend,
+                rounding_mode,
+            )
+            grad_weight = rotated_grad_output_t.matmul(rotated_input_t.transpose(0, 1))
+        else:
+            grad_weight = grad_output_2d.transpose(0, 1).matmul(input_2d)
+
+        grad_bias = None if ctx.bias_is_none else grad_output_2d.sum(dim=0)
+        return grad_input_2d.reshape_as(input), grad_weight, grad_bias, None, None, None
+
+
+def linear_with_gradient_rotation(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    rotation_config: MXFP8RotationConfig,
+    *,
+    quant_backend: str | None = None,
+    rounding_mode: str = "rint",
+) -> torch.Tensor:
+    return _MXFP8LinearWithGradientRotation.apply(
+        input,
+        weight,
+        bias,
+        rotation_config,
+        quant_backend,
+        rounding_mode,
+    )
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 _MXFP8_RUNTIME_LOGGED: set[tuple] = set()
 _MXFP8_RUNTIME_LOG_LOCK = threading.Lock()
@@ -566,6 +683,7 @@ class MXFP8QATLinear(nn.Linear):
         mxfp8_rotation_kind: str = "block_hadamard_sign",
         mxfp8_rotation_block_size: int = _MXFP8_BLOCK_SIZE,
         mxfp8_rotation_seed: int = 0,
+        mxfp8_rotation_targets: Any = None,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -592,6 +710,7 @@ class MXFP8QATLinear(nn.Linear):
             kind=normalize_mxfp8_rotation_kind(mxfp8_rotation_kind),
             block_size=mxfp8_rotation_block_size,
             seed=mxfp8_rotation_seed,
+            targets=normalize_mxfp8_rotation_targets(mxfp8_rotation_targets),
         )
         validate_mxfp8_rotation_config(self.mxfp8_rotation_config, group_size=self.group_size)
         self._mxfp8_layer_name = layer_name
@@ -615,6 +734,7 @@ class MXFP8QATLinear(nn.Linear):
         mxfp8_rotation_kind: str = "block_hadamard_sign",
         mxfp8_rotation_block_size: int = _MXFP8_BLOCK_SIZE,
         mxfp8_rotation_seed: int = 0,
+        mxfp8_rotation_targets: Any = None,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -634,6 +754,7 @@ class MXFP8QATLinear(nn.Linear):
             mxfp8_rotation_kind=mxfp8_rotation_kind,
             mxfp8_rotation_block_size=mxfp8_rotation_block_size,
             mxfp8_rotation_seed=mxfp8_rotation_seed,
+            mxfp8_rotation_targets=mxfp8_rotation_targets,
             layer_name=layer_name,
             layer_type=layer_type,
             layer_index=layer_index,
@@ -680,8 +801,8 @@ class MXFP8QATLinear(nn.Linear):
                 return weight
         return weight + (weight_fq - weight).detach()
 
-    def _rotate_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        if not self.mxfp8_rotation_config.enable:
+    def _rotate_tensor(self, tensor: torch.Tensor, target: str = MXFP8_ROTATION_TARGET_FPROP) -> torch.Tensor:
+        if not is_mxfp8_rotation_target(self.mxfp8_rotation_config, target):
             return tensor
         return apply_mxfp8_block_rotation(tensor, self.mxfp8_rotation_config)
 
@@ -728,6 +849,17 @@ class MXFP8QATLinear(nn.Linear):
             self.mxfp8_rotation_config.enable,
             tuple(x.shape),
         )
+        if is_mxfp8_rotation_target(
+            self.mxfp8_rotation_config, MXFP8_ROTATION_TARGET_DGRAD
+        ) or is_mxfp8_rotation_target(self.mxfp8_rotation_config, MXFP8_ROTATION_TARGET_WGRAD):
+            return linear_with_gradient_rotation(
+                x_fq,
+                weight_fq,
+                self.bias,
+                self.mxfp8_rotation_config,
+                quant_backend=self.mxfp8_quant_backend,
+                rounding_mode=self.mxfp8_rounding_mode,
+            )
         return F.linear(x_fq, weight_fq, self.bias)
 
     def extra_repr(self) -> str:
@@ -737,6 +869,7 @@ class MXFP8QATLinear(nn.Linear):
             f"group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
             f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, "
             f"mxfp8_rotation_enable={self.mxfp8_rotation_config.enable}, "
+            f"mxfp8_rotation_targets={self.mxfp8_rotation_config.targets}, "
             f"mxfp8_rotation_kind={self.mxfp8_rotation_config.kind}, "
             f"mxfp8_rotation_block_size={self.mxfp8_rotation_config.block_size}, "
             f"mxfp8_rotation_seed={self.mxfp8_rotation_config.seed}, "

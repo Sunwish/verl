@@ -28,14 +28,20 @@ from verl.utils.qat.mxfp8_linear import (
     _infer_mxfp8_layer_index,
     _infer_mxfp8_layer_type,
     _record_mxfp8_quant_error,
+    linear_with_gradient_rotation,
     normalize_mxfp8_quant_backend,
     normalize_mxfp8_rounding_mode,
     quantize_mxfp8_tensor,
 )
 from verl.utils.qat.mxfp8_rotation import (
+    MXFP8_ROTATION_TARGET_FPROP,
+    MXFP8_ROTATION_TARGET_DGRAD,
+    MXFP8_ROTATION_TARGET_WGRAD,
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
+    is_mxfp8_rotation_target,
     normalize_mxfp8_rotation_kind,
+    normalize_mxfp8_rotation_targets,
     validate_mxfp8_rotation_config,
 )
 
@@ -100,6 +106,7 @@ class MXFP8QATExperts(nn.Module):
         mxfp8_rotation_kind: str = "block_hadamard_sign",
         mxfp8_rotation_block_size: int = 32,
         mxfp8_rotation_seed: int = 0,
+        mxfp8_rotation_targets: Any = None,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -134,6 +141,7 @@ class MXFP8QATExperts(nn.Module):
             kind=normalize_mxfp8_rotation_kind(mxfp8_rotation_kind),
             block_size=mxfp8_rotation_block_size,
             seed=mxfp8_rotation_seed,
+            targets=normalize_mxfp8_rotation_targets(mxfp8_rotation_targets),
         )
         validate_mxfp8_rotation_config(self.mxfp8_rotation_config, group_size=self.group_size)
         self._mxfp8_layer_name = layer_name
@@ -167,6 +175,7 @@ class MXFP8QATExperts(nn.Module):
         mxfp8_rotation_kind: str = "block_hadamard_sign",
         mxfp8_rotation_block_size: int = 32,
         mxfp8_rotation_seed: int = 0,
+        mxfp8_rotation_targets: Any = None,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -191,6 +200,7 @@ class MXFP8QATExperts(nn.Module):
             mxfp8_rotation_kind=mxfp8_rotation_kind,
             mxfp8_rotation_block_size=mxfp8_rotation_block_size,
             mxfp8_rotation_seed=mxfp8_rotation_seed,
+            mxfp8_rotation_targets=mxfp8_rotation_targets,
             layer_name=layer_name,
             layer_type=layer_type,
             layer_index=layer_index,
@@ -251,10 +261,27 @@ class MXFP8QATExperts(nn.Module):
             f"{standard_shape} or {transposed_shape}"
         )
 
-    def _rotate_if_enabled(self, tensor: torch.Tensor) -> torch.Tensor:
-        if not self.mxfp8_rotation_config.enable:
+    def _rotate_if_enabled(self, tensor: torch.Tensor, target: str = MXFP8_ROTATION_TARGET_FPROP) -> torch.Tensor:
+        if not is_mxfp8_rotation_target(self.mxfp8_rotation_config, target):
             return tensor
         return apply_mxfp8_block_rotation(tensor, self.mxfp8_rotation_config)
+
+    def _apply_linear_with_gradient_rotation(
+        self, input: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        if (
+            is_mxfp8_rotation_target(self.mxfp8_rotation_config, MXFP8_ROTATION_TARGET_DGRAD)
+            or is_mxfp8_rotation_target(self.mxfp8_rotation_config, MXFP8_ROTATION_TARGET_WGRAD)
+        ):
+            return linear_with_gradient_rotation(
+                input,
+                weight,
+                None,
+                self.mxfp8_rotation_config,
+                quant_backend=self.mxfp8_quant_backend,
+                rounding_mode=self.mxfp8_rounding_mode,
+            )
+        return F.linear(input, weight)
 
     def _fake_quantize_weight(
         self,
@@ -420,10 +447,13 @@ class MXFP8QATExperts(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
             current_state = self._prepare_gate_up_input(current_state, apply_fake_quant)
-            gate, up = F.linear(current_state, gate_up_weight[expert_idx]).chunk(2, dim=-1)
+            gate_up = self._apply_linear_with_gradient_rotation(current_state, gate_up_weight[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = self._prepare_down_input(current_hidden_states, apply_fake_quant)
-            current_hidden_states = F.linear(current_hidden_states, down_weight[expert_idx])
+            current_hidden_states = self._apply_linear_with_gradient_rotation(
+                current_hidden_states, down_weight[expert_idx]
+            )
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
@@ -450,11 +480,16 @@ class MXFP8QATExperts(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"num_experts={self.num_experts}, hidden_dim={self.hidden_dim}, intermediate_dim={self.intermediate_dim}, "
+            f"num_experts={self.num_experts}, hidden_dim={self.hidden_dim}, "
+            f"intermediate_dim={self.intermediate_dim}, "
             f"mode={self.mode.value}, group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
-            f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, mxfp8_rotation_enable={self.mxfp8_rotation_config.enable}, "
-            f"mxfp8_rotation_kind={self.mxfp8_rotation_config.kind}, mxfp8_rotation_block_size={self.mxfp8_rotation_config.block_size}, "
-            f"mxfp8_rotation_seed={self.mxfp8_rotation_config.seed}, mxfp8_probe_quant_error={self.mxfp8_probe_quant_error}, "
+            f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, "
+            f"mxfp8_rotation_enable={self.mxfp8_rotation_config.enable}, "
+            f"mxfp8_rotation_targets={self.mxfp8_rotation_config.targets}, "
+            f"mxfp8_rotation_kind={self.mxfp8_rotation_config.kind}, "
+            f"mxfp8_rotation_block_size={self.mxfp8_rotation_config.block_size}, "
+            f"mxfp8_rotation_seed={self.mxfp8_rotation_config.seed}, "
+            f"mxfp8_probe_quant_error={self.mxfp8_probe_quant_error}, "
             f"fake_quant_enabled={self.fake_quant_enabled}"
         )
 
