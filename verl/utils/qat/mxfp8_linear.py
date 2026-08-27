@@ -351,6 +351,26 @@ def _warn_mxfp8_runtime_once(key: tuple, message: str, *args):
     logger.warning(message, *args)
 
 
+def _get_ascend_soc_version() -> Optional[int]:
+    try:
+        import torch_npu
+
+        return int(torch_npu.npu.get_soc_version())
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _use_mxfp8_torch_a2a3_path(tensor: torch.Tensor) -> tuple[bool, Optional[int]]:
+    """Select the torch fake-quant path that is compatible with the device."""
+    if tensor.device.type != "npu":
+        return False, None
+
+    soc_version = _get_ascend_soc_version()
+    # Ascend A5 supports the real FP8 payload cast. Unknown NPU models use the
+    # A2/A3 path because it avoids the unsupported float8 device cast.
+    return soc_version != 260, soc_version
+
+
 def _dequantize_mxfp8(weight_q: torch.Tensor, weight_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     weight_fp32 = weight_q.to(torch.float32)
     num_blocks = weight_q.shape[-1] // _MXFP8_BLOCK_SIZE
@@ -441,6 +461,45 @@ def _quantize_mxfp8_torch(tensor: torch.Tensor, rounding_mode: str = "rint") -> 
     return quant, tensor_scale
 
 
+def _quantize_mxfp8_torch_A2A3(tensor: torch.Tensor, rounding_mode: str = "rint") -> tuple[torch.Tensor, torch.Tensor]:
+    _check_mxfp8_2d_tensor(tensor)
+    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
+    tensor_fp32 = tensor.to(torch.float32)
+    original_shape = tensor_fp32.shape
+    max_norm = torch.finfo(torch.float8_e4m3fn).max
+    num_blocks = tensor.shape[-1] // _MXFP8_BLOCK_SIZE
+    blocked = tensor_fp32.reshape(tensor.shape[0], num_blocks, _MXFP8_BLOCK_SIZE)
+
+    amax = blocked.abs().amax(dim=-1)
+    amax_safe = torch.where(amax == 0, torch.full_like(amax, torch.finfo(torch.float32).tiny), amax)
+    shared_exp = torch.floor(torch.log2(amax_safe)) - _MXFP8_EMAX
+    shared_exp = torch.where(shared_exp > _MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
+
+    scale_factor = torch.pow(2.0, shared_exp.unsqueeze(-1))
+    normalized = blocked / scale_factor
+    abs_norm = normalized.abs()
+    private_exp = torch.floor(torch.log2(abs_norm + (abs_norm == 0).float()))
+    private_exp = private_exp.clamp(min=_MXFP8_MIN_PRIVATE_EXP)
+
+    private_scale = torch.pow(2.0, private_exp)
+    scaled = normalized / private_scale * _MXFP8_MANTISSA_SCALE
+    quantized = torch.sign(scaled) * _round_mxfp8_scaled_abs(torch.abs(scaled), rounding_mode)
+    quantized = quantized / _MXFP8_MANTISSA_SCALE * private_scale
+    quantized = torch.clamp(quantized, min=-max_norm, max=max_norm)
+    quantized = torch.where(torch.isinf(normalized), normalized, quantized)
+    quantized = torch.where(torch.isnan(normalized), normalized, quantized)
+
+    # This is a fake-quant/dequant path. The quantized payload is consumed
+    # immediately by _dequantize_mxfp8, so do not materialize an FP8 tensor on
+    # Ascend A2/A3, where the float8_e4m3fn device cast is unsupported.
+    quant = quantized.reshape(original_shape)
+    shared_exp_fixed = torch.nan_to_num(shared_exp, nan=-127.0)
+    # Keep the scale in FP32 as well. The fake path immediately dequantizes it,
+    # and A2/A3 do not need the real MXFP8 uint8/FP8 storage representation.
+    scale = torch.clamp(shared_exp_fixed + 127.0, 0, 255).round()
+    return quant, scale
+
+
 def _quantize_mxfp8_npu(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     import torch_npu
 
@@ -473,6 +532,16 @@ def quantize_mxfp8_tensor(
             raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
         return _quantize_mxfp8_npu(tensor)
 
+    use_a2a3_path, soc_version = _use_mxfp8_torch_a2a3_path(tensor)
+    _warn_mxfp8_runtime_once(
+        ("torch_quantizer_path", tensor.device.type, soc_version, use_a2a3_path),
+        "MXFP8 torch quantizer selected path=%s, soc_version=%s, device=%s",
+        "A2A3_fake_dequant" if use_a2a3_path else "real_fp8_cast",
+        soc_version,
+        tensor.device,
+    )
+    if use_a2a3_path:
+        return _quantize_mxfp8_torch_A2A3(tensor, rounding_mode=rounding_mode)
     return _quantize_mxfp8_torch(tensor, rounding_mode=rounding_mode)
 
 
