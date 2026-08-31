@@ -143,6 +143,8 @@ qat:
   mxfp8_quant_backend: "npu"
   # MXFP8 rounding mode for the torch backend: "rint", "round", "random", or "hash".
   mxfp8_rounding_mode: "rint"
+  # Select fake-quant targets: Fprop, Dgrad, and/or Wgrad. Defaults to Fprop only.
+  mxfp8_fake_quant_targets: ["Fprop"]
   # Enable MXFP8 quantization error probing.
   mxfp8_probe_quant_error: false
   # JSONL file path for MXFP8 probe records.

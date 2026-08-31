@@ -237,6 +237,7 @@ def test_vllm_actor_qat_does_not_force_rollout_quantization(monkeypatch, qat_mod
             "group_size": 32,
             "mxfp8_quant_backend": "torch",
             "mxfp8_rounding_mode": "hash",
+            "mxfp8_fake_quant_targets": ["Fprop"],
             "mxfp8_rotation_enable": True,
             "mxfp8_rotation_kind": "block_hadamard_sign",
             "mxfp8_rotation_block_size": 32,
@@ -338,6 +339,7 @@ def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_BACKEND_ENV] == "torch"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROUNDING_MODE_ENV] == "hash"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_GROUP_SIZE_ENV] == "32"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_TARGETS_ENV] == '["fprop"]'
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_ENABLE_ENV] == "True"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_KIND_ENV] == "block_hadamard_sign"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_BLOCK_SIZE_ENV] == "32"

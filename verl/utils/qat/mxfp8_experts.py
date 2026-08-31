@@ -29,13 +29,14 @@ from verl.utils.qat.mxfp8_linear import (
     _infer_mxfp8_layer_type,
     _record_mxfp8_quant_error,
     linear_with_gradient_rotation,
+    normalize_mxfp8_fake_quant_targets,
     normalize_mxfp8_quant_backend,
     normalize_mxfp8_rounding_mode,
     quantize_mxfp8_tensor,
 )
 from verl.utils.qat.mxfp8_rotation import (
-    MXFP8_ROTATION_TARGET_FPROP,
     MXFP8_ROTATION_TARGET_DGRAD,
+    MXFP8_ROTATION_TARGET_FPROP,
     MXFP8_ROTATION_TARGET_WGRAD,
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
@@ -107,6 +108,7 @@ class MXFP8QATExperts(nn.Module):
         mxfp8_rotation_block_size: int = 32,
         mxfp8_rotation_seed: int = 0,
         mxfp8_rotation_targets: Any = None,
+        mxfp8_fake_quant_targets: Any = None,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -144,6 +146,7 @@ class MXFP8QATExperts(nn.Module):
             targets=normalize_mxfp8_rotation_targets(mxfp8_rotation_targets),
         )
         validate_mxfp8_rotation_config(self.mxfp8_rotation_config, group_size=self.group_size)
+        self.mxfp8_fake_quant_targets = normalize_mxfp8_fake_quant_targets(mxfp8_fake_quant_targets)
         self._mxfp8_layer_name = layer_name
         self._mxfp8_layer_type = layer_type if layer_type is not None else _infer_mxfp8_layer_type(layer_name)
         self._mxfp8_layer_index = layer_index if layer_index is not None else _infer_mxfp8_layer_index(layer_name)
@@ -176,6 +179,7 @@ class MXFP8QATExperts(nn.Module):
         mxfp8_rotation_block_size: int = 32,
         mxfp8_rotation_seed: int = 0,
         mxfp8_rotation_targets: Any = None,
+        mxfp8_fake_quant_targets: Any = None,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -201,6 +205,7 @@ class MXFP8QATExperts(nn.Module):
             mxfp8_rotation_block_size=mxfp8_rotation_block_size,
             mxfp8_rotation_seed=mxfp8_rotation_seed,
             mxfp8_rotation_targets=mxfp8_rotation_targets,
+            mxfp8_fake_quant_targets=mxfp8_fake_quant_targets,
             layer_name=layer_name,
             layer_type=layer_type,
             layer_index=layer_index,
@@ -266,18 +271,23 @@ class MXFP8QATExperts(nn.Module):
             return tensor
         return apply_mxfp8_block_rotation(tensor, self.mxfp8_rotation_config)
 
-    def _apply_linear_with_gradient_rotation(
-        self, input: torch.Tensor, weight: torch.Tensor
-    ) -> torch.Tensor:
+    def _fake_quant_target_enabled(self, target: str) -> bool:
+        return target in self.mxfp8_fake_quant_targets
+
+    def _gradient_transform_enabled(self, target: str) -> bool:
+        return is_mxfp8_rotation_target(self.mxfp8_rotation_config, target) or self._fake_quant_target_enabled(target)
+
+    def _apply_linear_with_gradient_rotation(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if (
-            is_mxfp8_rotation_target(self.mxfp8_rotation_config, MXFP8_ROTATION_TARGET_DGRAD)
-            or is_mxfp8_rotation_target(self.mxfp8_rotation_config, MXFP8_ROTATION_TARGET_WGRAD)
+            self._gradient_transform_enabled(MXFP8_ROTATION_TARGET_DGRAD)
+            or self._gradient_transform_enabled(MXFP8_ROTATION_TARGET_WGRAD)
         ):
             return linear_with_gradient_rotation(
                 input,
                 weight,
                 None,
                 self.mxfp8_rotation_config,
+                fake_quant_targets=self.mxfp8_fake_quant_targets,
                 quant_backend=self.mxfp8_quant_backend,
                 rounding_mode=self.mxfp8_rounding_mode,
             )
@@ -339,6 +349,8 @@ class MXFP8QATExperts(nn.Module):
         if not apply_fake_quant or not self._quantize_gate_up_proj:
             return weight
         weight = self._rotate_if_enabled(weight)
+        if not self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_FPROP):
+            return weight
         return self._fake_quantize_weight(
             weight,
             sublayer_type="gate_up_proj",
@@ -351,6 +363,8 @@ class MXFP8QATExperts(nn.Module):
         if not apply_fake_quant or not self._quantize_down_proj:
             return weight
         weight = self._rotate_if_enabled(weight)
+        if not self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_FPROP):
+            return weight
         return self._fake_quantize_weight(
             weight,
             sublayer_type="down_proj",
@@ -361,7 +375,7 @@ class MXFP8QATExperts(nn.Module):
         if not apply_fake_quant or not self._quantize_gate_up_proj:
             return x
         x = self._rotate_if_enabled(x)
-        if self.mode == QATMode.W8A8_MXFP8:
+        if self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_FPROP) and self.mode == QATMode.W8A8_MXFP8:
             x = self._fake_quantize_activation(
                 x,
                 sublayer_type=("gate_proj", "up_proj"),
@@ -373,7 +387,7 @@ class MXFP8QATExperts(nn.Module):
         if not apply_fake_quant or not self._quantize_down_proj:
             return x
         x = self._rotate_if_enabled(x)
-        if self.mode == QATMode.W8A8_MXFP8:
+        if self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_FPROP) and self.mode == QATMode.W8A8_MXFP8:
             x = self._fake_quantize_activation(
                 x,
                 sublayer_type="down_proj",
@@ -484,6 +498,7 @@ class MXFP8QATExperts(nn.Module):
             f"intermediate_dim={self.intermediate_dim}, "
             f"mode={self.mode.value}, group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
             f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, "
+            f"mxfp8_fake_quant_targets={self.mxfp8_fake_quant_targets}, "
             f"mxfp8_rotation_enable={self.mxfp8_rotation_config.enable}, "
             f"mxfp8_rotation_targets={self.mxfp8_rotation_config.targets}, "
             f"mxfp8_rotation_kind={self.mxfp8_rotation_config.kind}, "

@@ -102,6 +102,9 @@ qat:
   # Stochastic modes require mxfp8_quant_backend: "torch".
   mxfp8_rounding_mode: "rint"
 
+  # Select fake-quant targets: Fprop, Dgrad, and/or Wgrad. Defaults to Fprop only.
+  mxfp8_fake_quant_targets: ["Fprop"]
+
   # Enable MXFP8 quantization error probing.
   # When true, MXFP8 QAT layers log per-layer weight/activation quantization errors
   # while matmul still uses the original high-precision tensors.

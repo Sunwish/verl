@@ -285,6 +285,7 @@ class RolloutConfig(BaseConfig):
     mxfp8_rotation_block_size: int = 32
     mxfp8_rotation_seed: int = 0
     mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
+    mxfp8_fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     mxfp8_group_size: int = 32
 
     enable_rollout_routing_replay: bool = False
@@ -303,6 +304,11 @@ class RolloutConfig(BaseConfig):
             self,
             "mxfp8_rotation_targets",
             list(normalize_mxfp8_rotation_targets(self.mxfp8_rotation_targets)),
+        )
+        object.__setattr__(
+            self,
+            "mxfp8_fake_quant_targets",
+            list(normalize_mxfp8_rotation_targets(self.mxfp8_fake_quant_targets)),
         )
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":

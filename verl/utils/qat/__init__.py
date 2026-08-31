@@ -42,6 +42,7 @@ from verl.utils.qat.core import (
 from verl.utils.qat.mxfp8_linear import (
     configure_mxfp8_probe,
     mxfp8_probe_step_context,
+    normalize_mxfp8_fake_quant_targets,
     reset_mxfp8_probe,
     set_mxfp8_probe_step,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "invalidate_all_scales",
     "configure_mxfp8_probe",
     "mxfp8_probe_step_context",
+    "normalize_mxfp8_fake_quant_targets",
     "reset_mxfp8_probe",
     "set_mxfp8_probe_step",
     # vLLM Patch
