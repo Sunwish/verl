@@ -72,6 +72,12 @@ class TestQATEngineConfig:
         config = QATEngineConfig()
         assert config.mxfp8_rounding_mode == "rint"
 
+    def test_mxfp8_fake_quant_targets_default_and_normalization(self):
+        assert QATEngineConfig().mxfp8_fake_quant_targets == ["fprop"]
+
+        config = QATEngineConfig(mxfp8_fake_quant_targets=["Wgrad", "Dgrad"])
+        assert config.mxfp8_fake_quant_targets == ["dgrad", "wgrad"]
+
     def test_qat_experts_subconfig_defaults_to_disabled(self):
         config = QATEngineConfig()
         assert config.experts.enable is False

@@ -28,6 +28,7 @@ This stack was built in stages:
 - configurable `npu` / `torch` quantization backend
 - MXFP8 quantization error probes
 - configurable rounding mode for the torch path
+- independent fake-quant targets for Fprop, Dgrad, and Wgrad
 
 > [!NOTE]
 > This page documents the FSDP / FSDP2 MXFP8 path. The Megatron QAT flow in verl still follows the NVFP4-oriented
@@ -56,7 +57,9 @@ actor_rollout_ref:
         quantization_config_path: "recipe/qat/config/mxfp8_w8a8_ascend.json"
         mxfp8_quant_backend: "torch"
         mxfp8_rounding_mode: "hash"
+        mxfp8_fake_quant_targets: ["Fprop"]
         mxfp8_probe_quant_error: false
+        mxfp8_rotation_targets: ["Fprop"]
 
 actor_rollout_ref:
   rollout:
@@ -73,8 +76,10 @@ actor_rollout_ref:
 | `fsdp_config.qat.quantization_config_path` | vLLM quantization config JSON | Required when QAT is enabled |
 | `fsdp_config.qat.mxfp8_quant_backend` | Quantization backend | `npu` or `torch` |
 | `fsdp_config.qat.mxfp8_rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
+| `fsdp_config.qat.mxfp8_fake_quant_targets` | Fake-quant targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
 | `fsdp_config.qat.mxfp8_probe_quant_error` | Log aggregated per-layer quantization error | `False` |
 | `fsdp_config.qat.mxfp8_probe_quant_error_output_path` | JSONL output path for probes | Required if probes are enabled |
+| `fsdp_config.qat.mxfp8_rotation_targets` | Block-rotation targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
 
 ---
 
@@ -148,6 +153,9 @@ The output format is JSONL, one rank-0 record per `(step, error_type, layer_inde
 - The torch quantizer now follows the same shared-exponent / private-exponent formula used by rollout.
 - `w8a16_mxfp8` keeps activation precision high and fake-quantizes weights only.
 - `w8a8_mxfp8` fake-quantizes both weights and activations.
+- `mxfp8_fake_quant_targets` and `mxfp8_rotation_targets` are independent. For example, setting
+  `mxfp8_fake_quant_targets: ["Fprop"]` and `mxfp8_rotation_targets: ["Dgrad"]` fake-quantizes only the training
+  forward operands while Dgrad receives block rotation without MXFP8 fake quantization.
 - MoE packed experts can join the same MXFP8 QAT path by setting `fsdp_config.qat.experts.enable: true`.
 - Router/gate paths remain excluded, and `ignore_patterns` can still be used to opt out specific expert sublayers such as `re:.*mlp.experts.gate_up_proj$`.
 

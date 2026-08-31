@@ -145,6 +145,7 @@ class QATEngineConfig(BaseConfig):
         experts (QATExpertsConfig): Expert-layer QAT sub-configuration
         mxfp8_quant_backend (str): MXFP8 quantization backend, "npu" or "torch"
         mxfp8_rounding_mode (str): MXFP8 rounding mode, "rint", "round", "random", or "hash"
+        mxfp8_fake_quant_targets (list[str]): MXFP8 fake quant targets, Fprop, Dgrad, and/or Wgrad
         mxfp8_probe_quant_error (bool): Whether to log MXFP8 quantization error probes
         mxfp8_probe_quant_error_output_path (Optional[str]): JSONL file path for MXFP8 probe logs
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
@@ -164,6 +165,7 @@ class QATEngineConfig(BaseConfig):
     mxfp8_rotation_block_size: int = 32
     mxfp8_rotation_seed: int = 0
     mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
+    mxfp8_fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
     quantization_config_path: Optional[str] = None
 
@@ -175,6 +177,11 @@ class QATEngineConfig(BaseConfig):
             self,
             "mxfp8_rotation_targets",
             list(normalize_mxfp8_rotation_targets(self.mxfp8_rotation_targets)),
+        )
+        object.__setattr__(
+            self,
+            "mxfp8_fake_quant_targets",
+            list(normalize_mxfp8_rotation_targets(self.mxfp8_fake_quant_targets)),
         )
         mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
         if mxfp8_rounding_mode not in {"rint", "round", "random", "hash"}:

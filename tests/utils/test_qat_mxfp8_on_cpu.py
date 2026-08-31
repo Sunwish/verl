@@ -30,6 +30,7 @@ from verl.utils.qat.mxfp8_linear import (
     flush_mxfp8_probe,
     linear_with_gradient_rotation,
     mxfp8_probe_step_context,
+    normalize_mxfp8_fake_quant_targets,
     quantize_mxfp8_tensor,
     reset_mxfp8_probe,
 )
@@ -202,6 +203,21 @@ def test_mxfp8_rotation_targets_normalize_and_default():
     assert config.mxfp8_rotation_targets == ["dgrad", "wgrad"]
 
 
+def test_mxfp8_fake_quant_targets_normalize_and_default():
+    assert normalize_mxfp8_fake_quant_targets(None) == ("fprop",)
+    assert normalize_mxfp8_fake_quant_targets("Dgrad,Wgrad") == ("dgrad", "wgrad")
+    assert normalize_mxfp8_fake_quant_targets('["Wgrad", "Fprop"]') == ("fprop", "wgrad")
+
+    config = QATConfig(
+        enable=True,
+        mode="w8a8_mxfp8",
+        group_size=32,
+        mxfp8_quant_backend="torch",
+        mxfp8_fake_quant_targets=["Wgrad", "Dgrad"],
+    )
+    assert config.mxfp8_fake_quant_targets == ["dgrad", "wgrad"]
+
+
 def test_linear_with_gradient_rotation_matches_standard_backward_with_padding():
     cfg = MXFP8RotationConfig(enable=True, block_size=32, seed=17, targets=("dgrad", "wgrad"))
     x = torch.randn(4, 37, dtype=torch.float32, requires_grad=True)
@@ -223,6 +239,69 @@ def test_linear_with_gradient_rotation_matches_standard_backward_with_padding():
     assert torch.allclose(rotated_weight_grad, weight_ref.grad, atol=1e-5, rtol=1e-5)
 
 
+def test_dgrad_rotation_does_not_fake_quantize_when_fake_quant_target_excludes_dgrad(monkeypatch):
+    cfg = MXFP8RotationConfig(enable=True, block_size=32, seed=17, targets=("dgrad",))
+    x = torch.randn(4, 37, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(23, 37, dtype=torch.float32, requires_grad=True)
+    grad_output = torch.randn(4, 23, dtype=torch.float32)
+
+    def fail_quantize(*args, **kwargs):
+        raise AssertionError("Dgrad rotation should not call MXFP8 quantization when Dgrad is not a fake-quant target")
+
+    monkeypatch.setattr("verl.utils.qat.mxfp8_linear.quantize_mxfp8_tensor", fail_quantize)
+    rotated_out = linear_with_gradient_rotation(
+        x,
+        weight,
+        None,
+        cfg,
+        fake_quant_targets=("fprop",),
+        quant_backend="torch",
+    )
+    rotated_out.backward(grad_output)
+    rotated_x_grad = x.grad.detach().clone()
+    rotated_weight_grad = weight.grad.detach().clone()
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    ref_out = F.linear(x_ref, weight_ref)
+    ref_out.backward(grad_output)
+
+    assert torch.allclose(rotated_out, ref_out, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(rotated_x_grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(rotated_weight_grad, weight_ref.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_dgrad_fake_quant_does_not_require_rotation(monkeypatch):
+    cfg = MXFP8RotationConfig(enable=False, block_size=32, seed=17, targets=("dgrad",))
+    x = torch.randn(4, 37, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(23, 37, dtype=torch.float32, requires_grad=True)
+    grad_output = torch.randn(4, 23, dtype=torch.float32)
+    quantized_shapes = []
+
+    def fake_quantize(tensor, quant_backend="torch", rounding_mode="rint"):
+        quantized_shapes.append(tuple(tensor.shape))
+        scale = torch.full(
+            (tensor.shape[0], tensor.shape[-1] // 32),
+            127,
+            dtype=torch.uint8,
+            device=tensor.device,
+        )
+        return tensor, scale
+
+    monkeypatch.setattr("verl.utils.qat.mxfp8_linear.quantize_mxfp8_tensor", fake_quantize)
+    out = linear_with_gradient_rotation(
+        x,
+        weight,
+        None,
+        cfg,
+        fake_quant_targets=("dgrad",),
+        quant_backend="torch",
+    )
+    out.backward(grad_output)
+
+    assert quantized_shapes == [(4, 32), (37, 32)]
+
+
 def test_apply_qat_mxfp8_rotation_targets_propagate_to_wrappers():
     model = _TinyModel()
 
@@ -236,11 +315,13 @@ def test_apply_qat_mxfp8_rotation_targets_propagate_to_wrappers():
             mxfp8_rounding_mode="round",
             mxfp8_rotation_enable=True,
             mxfp8_rotation_targets=["Dgrad", "Wgrad"],
+            mxfp8_fake_quant_targets=["Fprop", "Dgrad"],
         ),
     )
 
     assert isinstance(model.proj, MXFP8QATLinear)
     assert model.proj.mxfp8_rotation_config.targets == ("dgrad", "wgrad")
+    assert model.proj.mxfp8_fake_quant_targets == ("fprop", "dgrad")
 
 
 def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):
@@ -534,6 +615,28 @@ def test_w8a16_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
     assert linear._last_weight_scale is not None
     assert linear._last_input_scale is None
     assert not torch.allclose(enabled_out, expected)
+
+
+def test_mxfp8_qat_linear_skips_fprop_fake_quant_when_target_excludes_fprop():
+    linear = MXFP8QATLinear(
+        32,
+        8,
+        bias=True,
+        mode=QATMode.W8A8_MXFP8,
+        mxfp8_quant_backend="torch",
+        mxfp8_fake_quant_targets=["Dgrad"],
+        dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        linear.weight.copy_(torch.linspace(-3.25, 3.25, steps=8 * 32, dtype=torch.bfloat16).view(8, 32))
+        linear.bias.zero_()
+
+    x = torch.linspace(-1.0, 1.0, steps=64, dtype=torch.bfloat16).view(2, 32)
+    out = linear(x)
+
+    assert torch.allclose(out, F.linear(x, linear.weight, linear.bias))
+    assert linear._last_weight_scale is None
+    assert linear._last_input_scale is None
 
 
 def test_w8a8_mxfp8_qat_linear_fake_quantizes_activation():
