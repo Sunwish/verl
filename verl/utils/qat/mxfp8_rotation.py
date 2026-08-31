@@ -120,10 +120,10 @@ def normalize_mxfp8_rotation_targets(targets: Any) -> tuple[str, ...]:
         if normalized_target is None:
             raise ValueError(
                 f"Unsupported MXFP8 rotation target: {target}. "
-                f"Supported targets: {list(_MXFP8_ROTATION_TARGET_ORDER)}"
+                f"Supported targets: {list(MXFP8_ROTATION_TARGET_ORDER)}"
             )
         normalized.add(normalized_target)
-    return tuple(target for target in _MXFP8_ROTATION_TARGET_ORDER if target in normalized)
+    return tuple(target for target in MXFP8_ROTATION_TARGET_ORDER if target in normalized)
 
 
 def get_mxfp8_rotation_config(config: Mapping[str, Any] | None) -> MXFP8RotationConfig:
@@ -175,7 +175,7 @@ def is_mxfp8_rotation_target(config: MXFP8RotationConfig | Mapping[str, Any], ta
     if normalized_target is None:
         raise ValueError(
             f"Unsupported MXFP8 rotation target: {target}. "
-            f"Supported targets: {list(_MXFP8_ROTATION_TARGET_ORDER)}"
+            f"Supported targets: {list(MXFP8_ROTATION_TARGET_ORDER)}"
         )
     return bool(config.enable and normalized_target in normalize_mxfp8_rotation_targets(config.targets))
 
