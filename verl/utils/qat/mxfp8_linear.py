@@ -863,7 +863,7 @@ class MXFP8QATLinear(nn.Linear):
         x_2d = x.reshape(-1, x.shape[-1])
         with torch.no_grad():
             x_q, x_scale = quantize_mxfp8_tensor(
-                x_2d, quant_backend=self.mxfp8_quant_backend, rounding_mode=self.mxfp8_rounding_mode
+                x_2d, quant_backend=self.mxfp8_quant_backend, rounding_mode="rint"
             )
             self._last_input_scale = x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1])
             x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
