@@ -78,6 +78,10 @@ class TestQATEngineConfig:
         config = QATEngineConfig(mxfp8_fake_quant_targets=["Wgrad", "Dgrad"])
         assert config.mxfp8_fake_quant_targets == ["dgrad", "wgrad"]
 
+    def test_mxfp8_fallback_layers_normalize_to_inclusive_ranges(self):
+        config = QATEngineConfig(fallback_layers="0-3,37-48")
+        assert config.fallback_layers == [[0, 3], [37, 48]]
+
     def test_qat_experts_subconfig_defaults_to_disabled(self):
         config = QATEngineConfig()
         assert config.experts.enable is False

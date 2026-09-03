@@ -42,6 +42,7 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import (
     MXFP8_FAKE_QUANT_BACKEND_ENV,
     MXFP8_FAKE_QUANT_ENABLE_ENV,
+    MXFP8_FAKE_QUANT_FALLBACK_LAYERS_ENV,
     MXFP8_FAKE_QUANT_GROUP_SIZE_ENV,
     MXFP8_FAKE_QUANT_IGNORE_PATTERNS_ENV,
     MXFP8_FAKE_QUANT_MODE_ENV,
@@ -964,7 +965,7 @@ class vLLMHttpServer:
                 normalize_mxfp8_quant_backend,
                 normalize_mxfp8_rounding_mode,
             )
-            from verl.utils.qat.core import get_effective_ignore_patterns
+            from verl.utils.qat.core import format_mxfp8_fallback_layers, get_effective_ignore_patterns
             from verl.utils.qat.mxfp8_rotation import normalize_mxfp8_rotation_targets
 
             mxfp8_quant_backend = normalize_mxfp8_quant_backend(config_source.mxfp8_quant_backend)
@@ -988,10 +989,13 @@ class vLLMHttpServer:
             os.environ[MXFP8_FAKE_QUANT_ROTATION_SEED_ENV] = str(config_source.mxfp8_rotation_seed)
             os.environ[MXFP8_FAKE_QUANT_ROTATION_TARGETS_ENV] = json.dumps(rotation_targets)
             os.environ[MXFP8_FAKE_QUANT_IGNORE_PATTERNS_ENV] = json.dumps(get_effective_ignore_patterns(config_source))
+            os.environ[MXFP8_FAKE_QUANT_FALLBACK_LAYERS_ENV] = format_mxfp8_fallback_layers(
+                getattr(config_source, "fallback_layers", None)
+            )
             logger.warning(
                 "MXFP8 rollout fake quant configured: mode=%s, quant_backend=%s, rounding_mode=%s, "
                 "group_size=%s, fake_quant_targets=%s, rotation_enable=%s, rotation_targets=%s, "
-                "rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+                "rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s, fallback_layers=%s",
                 os.environ[MXFP8_FAKE_QUANT_MODE_ENV],
                 mxfp8_quant_backend,
                 mxfp8_rounding_mode,
@@ -1002,6 +1006,7 @@ class vLLMHttpServer:
                 config_source.mxfp8_rotation_kind,
                 config_source.mxfp8_rotation_block_size,
                 config_source.mxfp8_rotation_seed,
+                format_mxfp8_fallback_layers(getattr(config_source, "fallback_layers", None)),
             )
 
         # Rollout fake quantization is independent from actor-side QAT

@@ -145,6 +145,8 @@ qat:
   mxfp8_rounding_mode: "rint"
   # Select fake-quant targets: Fprop, Dgrad, and/or Wgrad. Defaults to Fprop only.
   mxfp8_fake_quant_targets: ["Fprop"]
+  # Inclusive transformer layer ranges to keep in high precision, e.g. "0-3,37-48".
+  fallback_layers: null
   # Enable MXFP8 quantization error probing.
   mxfp8_probe_quant_error: false
   # JSONL file path for MXFP8 probe records.
