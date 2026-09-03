@@ -511,6 +511,7 @@ class FSDPEngine(BaseEngine):
                 "mxfp8_rotation_seed": self._qat_config.mxfp8_rotation_seed,
                 "mxfp8_rotation_targets": list(self._qat_config.mxfp8_rotation_targets),
                 "mxfp8_fake_quant_targets": list(self._qat_config.mxfp8_fake_quant_targets),
+                "fallback_layers": self._qat_config.fallback_layers,
             },
         )
         if self._qat_config.mode in {"w4a4", "w4a16"}:

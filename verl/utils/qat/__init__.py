@@ -36,8 +36,12 @@ from verl.utils.qat.core import (
     QATExpertsConfig,
     apply_qat,
     enable_qat_fuse,
+    format_mxfp8_fallback_layers,
+    get_effective_ignore_patterns,
+    get_mxfp8_fallback_ignore_patterns,
     invalidate_all_scales,
     load_quantization_config,
+    normalize_mxfp8_fallback_layers,
 )
 from verl.utils.qat.mxfp8_linear import (
     configure_mxfp8_probe,
@@ -58,6 +62,10 @@ __all__ = [
     "QATExpertsConfig",
     "apply_qat",
     "load_quantization_config",
+    "normalize_mxfp8_fallback_layers",
+    "format_mxfp8_fallback_layers",
+    "get_mxfp8_fallback_ignore_patterns",
+    "get_effective_ignore_patterns",
     "enable_qat_fuse",
     "invalidate_all_scales",
     "configure_mxfp8_probe",

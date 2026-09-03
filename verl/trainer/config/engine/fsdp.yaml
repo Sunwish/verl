@@ -105,6 +105,10 @@ qat:
   # Select fake-quant targets: Fprop, Dgrad, and/or Wgrad. Defaults to Fprop only.
   mxfp8_fake_quant_targets: ["Fprop"]
 
+  # Inclusive transformer layer ranges to keep in high precision, e.g. "0-3,37-48".
+  # All linear and MoE submodules under these layers skip MXFP8 QAT and rollout fake quantization.
+  fallback_layers: null
+
   # Enable MXFP8 quantization error probing.
   # When true, MXFP8 QAT layers log per-layer weight/activation quantization errors
   # while matmul still uses the original high-precision tensors.

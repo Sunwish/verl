@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 import pytest
 
-from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales
+from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales, normalize_mxfp8_fallback_layers
 from verl.utils.qat.linear import QATLinear, QATMode
 from verl.utils.qat.mxfp8_experts import MXFP8QATExperts
 from verl.utils.qat.mxfp8_linear import (
@@ -171,6 +171,27 @@ def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode, caplog):
         and "rounding_mode=hash" in record.message
         for record in caplog.records
     )
+
+
+def test_apply_qat_mxfp8_fallback_layers_skip_complete_transformer_layers():
+    model = _ProbeModel()
+
+    assert normalize_mxfp8_fallback_layers("0-3,37-48") == ((0, 3), (37, 48))
+    assert normalize_mxfp8_fallback_layers([[3, 5], [0, 1], [5, 6]]) == ((0, 1), (3, 6))
+
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode="w8a8_mxfp8",
+            group_size=32,
+            mxfp8_quant_backend="torch",
+            fallback_layers="0",
+        ),
+    )
+
+    assert isinstance(model.layers[0].q_proj, nn.Linear)
+    assert isinstance(model.layers[1].q_proj, MXFP8QATLinear)
 
 
 def test_mxfp8_block_rotation_preserves_linear_equivalence():

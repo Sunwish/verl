@@ -20,7 +20,7 @@ from typing import Any, Callable, Literal, Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
-from verl.utils.qat.core import QATExpertsConfig
+from verl.utils.qat.core import QATExpertsConfig, normalize_mxfp8_fallback_layers
 from verl.utils.qat.mxfp8_rotation import (
     MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN,
     MXFP8RotationConfig,
@@ -148,6 +148,7 @@ class QATEngineConfig(BaseConfig):
         mxfp8_fake_quant_targets (list[str]): MXFP8 fake quant targets, Fprop, Dgrad, and/or Wgrad
         mxfp8_probe_quant_error (bool): Whether to log MXFP8 quantization error probes
         mxfp8_probe_quant_error_output_path (Optional[str]): JSONL file path for MXFP8 probe logs
+        fallback_layers (str | list): Inclusive layer ranges to keep in high precision, such as "0-3,37-48"
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
     """
 
@@ -166,6 +167,7 @@ class QATEngineConfig(BaseConfig):
     mxfp8_rotation_seed: int = 0
     mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     mxfp8_fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
+    fallback_layers: Any = None
     experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
     quantization_config_path: Optional[str] = None
 
@@ -173,6 +175,11 @@ class QATEngineConfig(BaseConfig):
         from verl.utils.qat.core import _coerce_qat_experts_config
 
         object.__setattr__(self, "experts", _coerce_qat_experts_config(getattr(self, "experts", None)))
+        object.__setattr__(
+            self,
+            "fallback_layers",
+            [list(layer_range) for layer_range in normalize_mxfp8_fallback_layers(self.fallback_layers)],
+        )
         object.__setattr__(
             self,
             "mxfp8_rotation_targets",
@@ -196,6 +203,8 @@ class QATEngineConfig(BaseConfig):
             and self.mxfp8_quant_backend.lower() != "torch"
         ):
             raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
+        if self.enable and self.fallback_layers and self.mode.lower() not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
+            raise ValueError("fallback_layers only supports w8a16_mxfp8/w8a8_mxfp8 modes")
         if self.mxfp8_probe_quant_error:
             if not self.enable:
                 raise ValueError("mxfp8_probe_quant_error requires QAT enable=True")

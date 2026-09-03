@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.qat.mxfp8_rotation import (
@@ -38,6 +38,7 @@ _MXFP8_MODES = {"w8a16_mxfp8", "w8a8_mxfp8"}
 _MXFP8_ROUNDING_MODES = {"rint", "round", "random", "hash"}
 _MXFP8_STOCHASTIC_ROUNDING_MODES = {"random", "hash"}
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+_MXFP8_FALLBACK_RANGE_RE = re.compile(r"^(\d+)(?:\s*-\s*(\d+))?$")
 _EXPERT_LINEAR_RE = re.compile(r".*(?:experts\.[^.]+|shared_expert|shared_experts)\.(gate_proj|up_proj|down_proj)$")
 _INTERNAL_ROUTER_IGNORE_PATTERNS = [
     r"re:.*mlp\.gate(?:\.|$)",
@@ -72,6 +73,86 @@ def _coerce_qat_experts_config(value: Any) -> QATExpertsConfig:
     raise TypeError(f"qat.experts must be a dict, DictConfig, or QATExpertsConfig; got {type(value).__name__}")
 
 
+def normalize_mxfp8_fallback_layers(value: Any) -> tuple[tuple[int, int], ...]:
+    """Normalize inclusive MXFP8 fallback layer ranges."""
+    if value is None:
+        return ()
+
+    if isinstance(value, (DictConfig, ListConfig)):
+        value = OmegaConf.to_container(value, resolve=True)
+
+    if isinstance(value, str):
+        raw_value = value.strip()
+        if raw_value.startswith("["):
+            try:
+                value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                value = raw_value.strip("[]()")
+        else:
+            value = raw_value
+        if isinstance(value, str):
+            value = value.strip("[]()")
+        if not value:
+            return ()
+    if isinstance(value, str):
+        value = re.sub(r"\s*[-:]\s*", "-", value)
+        items = re.split(r"[,;\s]+", value)
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = [value]
+
+    ranges = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)):
+            if len(item) != 2:
+                raise ValueError(f"Each MXFP8 fallback layer range must contain two values, got: {item!r}")
+            start, end = int(item[0]), int(item[1])
+        else:
+            token = str(item).strip().strip("[]()").replace(":", "-")
+            if not token:
+                continue
+            match = _MXFP8_FALLBACK_RANGE_RE.fullmatch(token)
+            if match is None:
+                raise ValueError(
+                    f"Invalid MXFP8 fallback layer range: {item!r}. "
+                    "Expected a layer index or an inclusive range such as '37-48'."
+                )
+            start = int(match.group(1))
+            end = int(match.group(2) or start)
+
+        if start < 0 or end < 0 or start > end:
+            raise ValueError(f"Invalid MXFP8 fallback layer range: {item!r}")
+        ranges.append((start, end))
+
+    normalized = []
+    for start, end in sorted(ranges):
+        if normalized and start <= normalized[-1][1] + 1:
+            normalized[-1] = (normalized[-1][0], max(normalized[-1][1], end))
+        else:
+            normalized.append((start, end))
+    return tuple(normalized)
+
+
+def format_mxfp8_fallback_layers(value: Any) -> str:
+    """Serialize normalized fallback ranges for the rollout environment."""
+    return ",".join(
+        str(start) if start == end else f"{start}-{end}"
+        for start, end in normalize_mxfp8_fallback_layers(value)
+    )
+
+
+def get_mxfp8_fallback_ignore_patterns(value: Any) -> list[str]:
+    """Build module-name patterns that exclude complete transformer layers."""
+    patterns = []
+    for start, end in normalize_mxfp8_fallback_layers(value):
+        layer_ids = "|".join(str(layer_index) for layer_index in range(start, end + 1))
+        patterns.append(rf"re:.*(?:layers\.(?:{layer_ids})|layer(?:{layer_ids}))(?:\.|$)")
+    return patterns
+
+
 @dataclass
 class QATConfig(BaseConfig):
     """Unified configuration for QAT (Quantization-Aware Training)."""
@@ -92,10 +173,16 @@ class QATConfig(BaseConfig):
     mxfp8_rotation_seed: int = 0
     mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     mxfp8_fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
+    fallback_layers: Any = None
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
         object.__setattr__(self, "experts", _coerce_qat_experts_config(self.experts))
+        object.__setattr__(
+            self,
+            "fallback_layers",
+            [list(layer_range) for layer_range in normalize_mxfp8_fallback_layers(self.fallback_layers)],
+        )
         object.__setattr__(
             self,
             "mxfp8_rotation_targets",
@@ -119,6 +206,8 @@ class QATConfig(BaseConfig):
             and self.mxfp8_quant_backend.lower() != "torch"
         ):
             raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
+        if self.enable and self.fallback_layers and self.mode.lower() not in _MXFP8_MODES:
+            raise ValueError("fallback_layers only supports w8a16_mxfp8/w8a8_mxfp8 modes")
         if self.mxfp8_probe_quant_error:
             if not self.enable:
                 raise ValueError("mxfp8_probe_quant_error requires QAT enable=True")
@@ -152,6 +241,9 @@ def _is_ignored(name: str, ignore_patterns: list[str]) -> bool:
 def get_effective_ignore_patterns(qat_config: QATConfig) -> list[str]:
     """Return the ignore list actually enforced for training and rollout handoff."""
     effective_ignore = list(qat_config.ignore_patterns or [])
+    for pattern in get_mxfp8_fallback_ignore_patterns(qat_config.fallback_layers):
+        if pattern not in effective_ignore:
+            effective_ignore.append(pattern)
     for pattern in _INTERNAL_ROUTER_IGNORE_PATTERNS:
         if pattern not in effective_ignore:
             effective_ignore.append(pattern)
@@ -341,7 +433,8 @@ def apply_qat(
         raise ValueError(f"MXFP8 QAT requires group_size=32, got: {config.group_size}")
     logger.info(
         f"Applying QAT with mode={mode.value}, group_size={config.group_size}, "
-        f"mxfp8_rounding_mode={config.mxfp8_rounding_mode}, experts_enable={config.experts.enable}"
+        f"mxfp8_rounding_mode={config.mxfp8_rounding_mode}, experts_enable={config.experts.enable}, "
+        f"fallback_layers={config.fallback_layers}"
     )
     if mode.value in _MXFP8_MODES:
         from verl.utils.qat.mxfp8_linear import configure_mxfp8_probe

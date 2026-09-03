@@ -242,6 +242,7 @@ def test_vllm_actor_qat_does_not_force_rollout_quantization(monkeypatch, qat_mod
             "mxfp8_rotation_kind": "block_hadamard_sign",
             "mxfp8_rotation_block_size": 32,
             "mxfp8_rotation_seed": 7,
+            "fallback_layers": "0-3,37-48",
             "experts": {"enable": False},
         },
     )
@@ -344,6 +345,7 @@ def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_KIND_ENV] == "block_hadamard_sign"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_BLOCK_SIZE_ENV] == "32"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROTATION_SEED_ENV] == "7"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_FALLBACK_LAYERS_ENV] == "0-3,37-48"
 
 
 def test_trtllm_launch_server_uses_bootstrap_model_path(monkeypatch):
