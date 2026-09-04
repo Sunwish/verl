@@ -105,10 +105,12 @@ def _transform_gradient_operand(
     fake_quant_targets: tuple[str, ...],
     quant_backend: str | None,
     rounding_mode: str,
+    skip_fake_quant: bool = False,
 ) -> torch.Tensor:
     should_rotate = is_mxfp8_rotation_target(rotation_config, target)
-    should_fake_quantize = _is_mxfp8_fake_quant_target(fake_quant_targets, target)
-    if not (should_rotate or should_fake_quantize):
+    target_fake_quant_enabled = _is_mxfp8_fake_quant_target(fake_quant_targets, target)
+    should_fake_quantize = target_fake_quant_enabled and not skip_fake_quant
+    if not (should_rotate or target_fake_quant_enabled):
         return tensor
 
     block_size = rotation_config.block_size if should_rotate else _MXFP8_BLOCK_SIZE
@@ -138,6 +140,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
         fake_quant_targets,
         quant_backend: str | None,
         rounding_mode: str,
+        skip_dgrad_weight_fake_quant: bool,
+        skip_wgrad_input_fake_quant: bool,
     ):
         ctx.save_for_backward(input, weight)
         ctx.bias_is_none = bias is None
@@ -145,6 +149,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
         ctx.fake_quant_targets = fake_quant_targets
         ctx.quant_backend = quant_backend
         ctx.rounding_mode = rounding_mode
+        ctx.skip_dgrad_weight_fake_quant = skip_dgrad_weight_fake_quant
+        ctx.skip_wgrad_input_fake_quant = skip_wgrad_input_fake_quant
         return F.linear(input, weight, bias)
 
     @staticmethod
@@ -175,6 +181,7 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                 fake_quant_targets,
                 quant_backend,
                 rounding_mode,
+                skip_fake_quant=ctx.skip_dgrad_weight_fake_quant,
             ).transpose(0, 1)
             grad_input_2d = rotated_grad_output.matmul(rotated_weight)
         else:
@@ -198,13 +205,24 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                 fake_quant_targets,
                 quant_backend,
                 rounding_mode,
+                skip_fake_quant=ctx.skip_wgrad_input_fake_quant,
             )
             grad_weight = rotated_grad_output_t.matmul(rotated_input_t.transpose(0, 1))
         else:
             grad_weight = grad_output_2d.transpose(0, 1).matmul(input_2d)
 
         grad_bias = None if ctx.bias_is_none else grad_output_2d.sum(dim=0)
-        return grad_input_2d.reshape_as(input), grad_weight, grad_bias, None, None, None, None
+        return (
+            grad_input_2d.reshape_as(input),
+            grad_weight,
+            grad_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def linear_with_gradient_rotation(
@@ -216,6 +234,8 @@ def linear_with_gradient_rotation(
     fake_quant_targets: Any = None,
     quant_backend: str | None = None,
     rounding_mode: str = "rint",
+    skip_dgrad_weight_fake_quant: bool = False,
+    skip_wgrad_input_fake_quant: bool = False,
 ) -> torch.Tensor:
     fake_quant_targets = normalize_mxfp8_fake_quant_targets(fake_quant_targets)
     return _MXFP8LinearWithGradientRotation.apply(
@@ -226,6 +246,8 @@ def linear_with_gradient_rotation(
         fake_quant_targets,
         quant_backend,
         rounding_mode,
+        skip_dgrad_weight_fake_quant,
+        skip_wgrad_input_fake_quant,
     )
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 _MXFP8_RUNTIME_LOGGED: set[tuple] = set()
@@ -885,6 +907,10 @@ class MXFP8QATLinear(nn.Linear):
             if apply_fprop_fake_quant and self.mode == QATMode.W8A8_MXFP8
             else rotated_x
         )
+        fprop_weight_fake_quantized = apply_fprop_fake_quant and not self.mxfp8_probe_quant_error
+        fprop_activation_fake_quantized = (
+            apply_fprop_fake_quant and self.mode == QATMode.W8A8_MXFP8 and not self.mxfp8_probe_quant_error
+        )
         _warn_mxfp8_runtime_once(
             (
                 "qat_forward",
@@ -920,6 +946,8 @@ class MXFP8QATLinear(nn.Linear):
                 fake_quant_targets=self.mxfp8_fake_quant_targets,
                 quant_backend=self.mxfp8_quant_backend,
                 rounding_mode=self.mxfp8_rounding_mode,
+                skip_dgrad_weight_fake_quant=fprop_weight_fake_quantized,
+                skip_wgrad_input_fake_quant=fprop_activation_fake_quantized,
             )
         return F.linear(x_fq, weight_fq, self.bias)
 

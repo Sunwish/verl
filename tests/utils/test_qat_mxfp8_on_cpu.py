@@ -323,6 +323,36 @@ def test_dgrad_fake_quant_does_not_require_rotation(monkeypatch):
     assert quantized_shapes == [(4, 32), (37, 32)]
 
 
+def test_mxfp8_qat_linear_does_not_requantize_fprop_operands_in_backward(monkeypatch):
+    linear = MXFP8QATLinear(
+        32,
+        8,
+        bias=False,
+        mode=QATMode.W8A8_MXFP8,
+        mxfp8_quant_backend="torch",
+        mxfp8_fake_quant_targets=["Fprop", "Dgrad", "Wgrad"],
+        dtype=torch.float32,
+    )
+    x = torch.randn(4, 32, dtype=torch.float32, requires_grad=True)
+    quantized_shapes = []
+
+    def fake_quantize(tensor, quant_backend="torch", rounding_mode="rint"):
+        quantized_shapes.append(tuple(tensor.shape))
+        scale = torch.full(
+            (tensor.shape[0], tensor.shape[-1] // 32),
+            127,
+            dtype=torch.uint8,
+            device=tensor.device,
+        )
+        return tensor, scale
+
+    monkeypatch.setattr("verl.utils.qat.mxfp8_linear.quantize_mxfp8_tensor", fake_quantize)
+
+    linear(x).sum().backward()
+
+    assert quantized_shapes == [(8, 32), (4, 32), (4, 32), (8, 32)]
+
+
 def test_apply_qat_mxfp8_rotation_targets_propagate_to_wrappers():
     model = _TinyModel()
 
