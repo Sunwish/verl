@@ -277,7 +277,14 @@ class MXFP8QATExperts(nn.Module):
     def _gradient_transform_enabled(self, target: str) -> bool:
         return is_mxfp8_rotation_target(self.mxfp8_rotation_config, target) or self._fake_quant_target_enabled(target)
 
-    def _apply_linear_with_gradient_rotation(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    def _apply_linear_with_gradient_rotation(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        input_fprop_fake_quantized: bool = False,
+        weight_fprop_fake_quantized: bool = False,
+    ) -> torch.Tensor:
         if (
             self._gradient_transform_enabled(MXFP8_ROTATION_TARGET_DGRAD)
             or self._gradient_transform_enabled(MXFP8_ROTATION_TARGET_WGRAD)
@@ -290,6 +297,8 @@ class MXFP8QATExperts(nn.Module):
                 fake_quant_targets=self.mxfp8_fake_quant_targets,
                 quant_backend=self.mxfp8_quant_backend,
                 rounding_mode=self.mxfp8_rounding_mode,
+                skip_dgrad_weight_fake_quant=weight_fprop_fake_quantized,
+                skip_wgrad_input_fake_quant=input_fprop_fake_quantized,
             )
         return F.linear(input, weight)
 
@@ -453,6 +462,18 @@ class MXFP8QATExperts(nn.Module):
 
         gate_up_weight = self._prepare_gate_up_weight(apply_fake_quant)
         down_weight = self._prepare_down_weight(apply_fake_quant)
+        gate_up_fprop_weight_fake_quantized = (
+            apply_fake_quant
+            and self._quantize_gate_up_proj
+            and self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_FPROP)
+            and not self.mxfp8_probe_quant_error
+        )
+        down_fprop_weight_fake_quantized = (
+            apply_fake_quant
+            and self._quantize_down_proj
+            and self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_FPROP)
+            and not self.mxfp8_probe_quant_error
+        )
 
         for expert_idx in expert_hit:
             expert_idx = expert_idx[0]
@@ -461,12 +482,24 @@ class MXFP8QATExperts(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
             current_state = self._prepare_gate_up_input(current_state, apply_fake_quant)
-            gate_up = self._apply_linear_with_gradient_rotation(current_state, gate_up_weight[expert_idx])
+            gate_up = self._apply_linear_with_gradient_rotation(
+                current_state,
+                gate_up_weight[expert_idx],
+                input_fprop_fake_quantized=(
+                    gate_up_fprop_weight_fake_quantized and self.mode == QATMode.W8A8_MXFP8
+                ),
+                weight_fprop_fake_quantized=gate_up_fprop_weight_fake_quantized,
+            )
             gate, up = gate_up.chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = self._prepare_down_input(current_hidden_states, apply_fake_quant)
             current_hidden_states = self._apply_linear_with_gradient_rotation(
-                current_hidden_states, down_weight[expert_idx]
+                current_hidden_states,
+                down_weight[expert_idx],
+                input_fprop_fake_quantized=(
+                    down_fprop_weight_fake_quantized and self.mode == QATMode.W8A8_MXFP8
+                ),
+                weight_fprop_fake_quantized=down_fprop_weight_fake_quantized,
             )
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
