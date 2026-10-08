@@ -511,6 +511,9 @@ class FSDPEngine(BaseEngine):
                 "mxfp8_rotation_seed": self._qat_config.mxfp8_rotation_seed,
                 "mxfp8_rotation_targets": list(self._qat_config.mxfp8_rotation_targets),
                 "mxfp8_fake_quant_targets": list(self._qat_config.mxfp8_fake_quant_targets),
+                "mxfp8_backward_reduction_axis_fake_quant": (
+                    self._qat_config.mxfp8_backward_reduction_axis_fake_quant
+                ),
                 "fallback_layers": self._qat_config.fallback_layers,
             },
         )

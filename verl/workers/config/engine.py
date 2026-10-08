@@ -146,6 +146,7 @@ class QATEngineConfig(BaseConfig):
         mxfp8_quant_backend (str): MXFP8 quantization backend, "npu" or "torch"
         mxfp8_rounding_mode (str): MXFP8 rounding mode, "rint", "round", "random", or "hash"
         mxfp8_fake_quant_targets (list[str]): MXFP8 fake quant targets, Fprop, Dgrad, and/or Wgrad
+        mxfp8_backward_reduction_axis_fake_quant (bool): Use backward reduction-axis operands for MXFP8 Dgrad/Wgrad
         mxfp8_probe_quant_error (bool): Whether to log MXFP8 quantization error probes
         mxfp8_probe_quant_error_output_path (Optional[str]): JSONL file path for MXFP8 probe logs
         fallback_layers (str | list): Inclusive layer ranges to keep in high precision, such as "0-3,37-48"
@@ -167,6 +168,7 @@ class QATEngineConfig(BaseConfig):
     mxfp8_rotation_seed: int = 0
     mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     mxfp8_fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
+    mxfp8_backward_reduction_axis_fake_quant: bool = False
     fallback_layers: Any = None
     experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
     quantization_config_path: Optional[str] = None

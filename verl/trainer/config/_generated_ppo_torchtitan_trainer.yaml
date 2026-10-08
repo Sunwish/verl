@@ -145,6 +145,7 @@ actor_rollout_ref:
       mxfp8_rounding_mode: rint
       mxfp8_fake_quant_targets:
       - Fprop
+      mxfp8_backward_reduction_axis_fake_quant: false
       fallback_layers: null
       mxfp8_probe_quant_error: false
       mxfp8_probe_quant_error_output_path: null

@@ -77,6 +77,7 @@ actor_rollout_ref:
 | `fsdp_config.qat.mxfp8_quant_backend` | Quantization backend | `npu` or `torch` |
 | `fsdp_config.qat.mxfp8_rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
 | `fsdp_config.qat.mxfp8_fake_quant_targets` | Fake-quant targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
+| `fsdp_config.qat.mxfp8_backward_reduction_axis_fake_quant` | Prepare Dgrad/Wgrad fake-quant operands along each backward matmul reduction axis | Defaults to `False` to preserve historical Fprop operand reuse |
 | `fsdp_config.qat.mxfp8_probe_quant_error` | Log aggregated per-layer quantization error | `False` |
 | `fsdp_config.qat.mxfp8_probe_quant_error_output_path` | JSONL output path for probes | Required if probes are enabled |
 | `fsdp_config.qat.mxfp8_rotation_targets` | Block-rotation targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
@@ -156,6 +157,8 @@ The output format is JSONL, one rank-0 record per `(step, error_type, layer_inde
 - `mxfp8_fake_quant_targets` and `mxfp8_rotation_targets` are independent. For example, setting
   `mxfp8_fake_quant_targets: ["Fprop"]` and `mxfp8_rotation_targets: ["Dgrad"]` fake-quantizes only the training
   forward operands while Dgrad receives block rotation without MXFP8 fake quantization.
+- `mxfp8_backward_reduction_axis_fake_quant: true` makes Dgrad/Wgrad use operands fake-quantized along each
+  backward matmul reduction axis instead of reusing Fprop fake-quantized operands.
 - MoE packed experts can join the same MXFP8 QAT path by setting `fsdp_config.qat.experts.enable: true`.
 - Router/gate paths remain excluded, and `ignore_patterns` can still be used to opt out specific expert sublayers such as `re:.*mlp.experts.gate_up_proj$`.
 

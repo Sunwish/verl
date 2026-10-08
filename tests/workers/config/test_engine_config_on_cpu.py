@@ -78,6 +78,12 @@ class TestQATEngineConfig:
         config = QATEngineConfig(mxfp8_fake_quant_targets=["Wgrad", "Dgrad"])
         assert config.mxfp8_fake_quant_targets == ["dgrad", "wgrad"]
 
+    def test_mxfp8_backward_reduction_axis_fake_quant_default_and_override(self):
+        assert QATEngineConfig().mxfp8_backward_reduction_axis_fake_quant is False
+
+        config = QATEngineConfig(mxfp8_backward_reduction_axis_fake_quant=True)
+        assert config.mxfp8_backward_reduction_axis_fake_quant is True
+
     def test_mxfp8_fallback_layers_normalize_to_inclusive_ranges(self):
         config = QATEngineConfig(fallback_layers="0-3,37-48")
         assert config.fallback_layers == [[0, 3], [37, 48]]

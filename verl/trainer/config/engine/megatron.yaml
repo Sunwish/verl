@@ -145,6 +145,9 @@ qat:
   mxfp8_rounding_mode: "rint"
   # Select fake-quant targets: Fprop, Dgrad, and/or Wgrad. Defaults to Fprop only.
   mxfp8_fake_quant_targets: ["Fprop"]
+  # When true, Dgrad/Wgrad use MXFP8 fake-quantized operands prepared along each backward matmul reduction axis.
+  # Defaults to false to preserve the historical Fprop-operand reuse behavior.
+  mxfp8_backward_reduction_axis_fake_quant: false
   # Inclusive transformer layer ranges to keep in high precision, e.g. "0-3,37-48".
   fallback_layers: null
   # Enable MXFP8 quantization error probing.

@@ -129,6 +129,43 @@ def _transform_gradient_operand(
     return _dequantize_mxfp8(tensor_q, tensor_scale, tensor.dtype).reshape(original_shape)
 
 
+def _prepare_dgrad_weight_operand(
+    weight: torch.Tensor,
+    rotation_config: MXFP8RotationConfig,
+    fake_quant_targets: tuple[str, ...],
+    quant_backend: str | None,
+    rounding_mode: str,
+) -> torch.Tensor:
+    with torch.no_grad():
+        return _transform_gradient_operand(
+            weight.transpose(0, 1),
+            rotation_config,
+            MXFP8_ROTATION_TARGET_DGRAD,
+            fake_quant_targets,
+            quant_backend,
+            rounding_mode,
+        ).transpose(0, 1)
+
+
+def _prepare_wgrad_input_operand_t(
+    input: torch.Tensor,
+    rotation_config: MXFP8RotationConfig,
+    fake_quant_targets: tuple[str, ...],
+    quant_backend: str | None,
+    rounding_mode: str,
+) -> torch.Tensor:
+    input_2d = input.reshape(-1, input.shape[-1])
+    with torch.no_grad():
+        return _transform_gradient_operand(
+            input_2d.transpose(0, 1),
+            rotation_config,
+            MXFP8_ROTATION_TARGET_WGRAD,
+            fake_quant_targets,
+            quant_backend,
+            rounding_mode,
+        )
+
+
 class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -136,6 +173,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
         input: torch.Tensor,
         weight: torch.Tensor,
         bias: torch.Tensor | None,
+        dgrad_weight_operand: torch.Tensor | None,
+        wgrad_input_operand_t: torch.Tensor | None,
         rotation_config,
         fake_quant_targets,
         quant_backend: str | None,
@@ -143,7 +182,13 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
         skip_dgrad_weight_fake_quant: bool,
         skip_wgrad_input_fake_quant: bool,
     ):
-        ctx.save_for_backward(input, weight)
+        ctx.use_dgrad_weight_operand = dgrad_weight_operand is not None
+        ctx.use_wgrad_input_operand = wgrad_input_operand_t is not None
+        if dgrad_weight_operand is None:
+            dgrad_weight_operand = weight
+        if wgrad_input_operand_t is None:
+            wgrad_input_operand_t = input
+        ctx.save_for_backward(input, weight, dgrad_weight_operand, wgrad_input_operand_t)
         ctx.bias_is_none = bias is None
         ctx.rotation_config = rotation_config
         ctx.fake_quant_targets = fake_quant_targets
@@ -155,7 +200,7 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        input, weight = ctx.saved_tensors
+        input, weight, dgrad_weight_operand, wgrad_input_operand_t = ctx.saved_tensors
         rotation_config = ctx.rotation_config
         input_2d = input.reshape(-1, input.shape[-1])
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
@@ -174,15 +219,18 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                 quant_backend,
                 rounding_mode,
             )
-            rotated_weight = _transform_gradient_operand(
-                weight.transpose(0, 1),
-                rotation_config,
-                MXFP8_ROTATION_TARGET_DGRAD,
-                fake_quant_targets,
-                quant_backend,
-                rounding_mode,
-                skip_fake_quant=ctx.skip_dgrad_weight_fake_quant,
-            ).transpose(0, 1)
+            if ctx.use_dgrad_weight_operand:
+                rotated_weight = dgrad_weight_operand
+            else:
+                rotated_weight = _transform_gradient_operand(
+                    weight.transpose(0, 1),
+                    rotation_config,
+                    MXFP8_ROTATION_TARGET_DGRAD,
+                    fake_quant_targets,
+                    quant_backend,
+                    rounding_mode,
+                    skip_fake_quant=ctx.skip_dgrad_weight_fake_quant,
+                ).transpose(0, 1)
             grad_input_2d = rotated_grad_output.matmul(rotated_weight)
         else:
             grad_input_2d = grad_output_2d.matmul(weight)
@@ -198,15 +246,18 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                 quant_backend,
                 rounding_mode,
             )
-            rotated_input_t = _transform_gradient_operand(
-                input_2d.transpose(0, 1),
-                rotation_config,
-                MXFP8_ROTATION_TARGET_WGRAD,
-                fake_quant_targets,
-                quant_backend,
-                rounding_mode,
-                skip_fake_quant=ctx.skip_wgrad_input_fake_quant,
-            )
+            if ctx.use_wgrad_input_operand:
+                rotated_input_t = wgrad_input_operand_t
+            else:
+                rotated_input_t = _transform_gradient_operand(
+                    input_2d.transpose(0, 1),
+                    rotation_config,
+                    MXFP8_ROTATION_TARGET_WGRAD,
+                    fake_quant_targets,
+                    quant_backend,
+                    rounding_mode,
+                    skip_fake_quant=ctx.skip_wgrad_input_fake_quant,
+                )
             grad_weight = rotated_grad_output_t.matmul(rotated_input_t.transpose(0, 1))
         else:
             grad_weight = grad_output_2d.transpose(0, 1).matmul(input_2d)
@@ -222,6 +273,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -231,6 +284,8 @@ def linear_with_gradient_rotation(
     bias: torch.Tensor | None,
     rotation_config: MXFP8RotationConfig,
     *,
+    dgrad_weight_operand: torch.Tensor | None = None,
+    wgrad_input_operand_t: torch.Tensor | None = None,
     fake_quant_targets: Any = None,
     quant_backend: str | None = None,
     rounding_mode: str = "rint",
@@ -242,6 +297,8 @@ def linear_with_gradient_rotation(
         input,
         weight,
         bias,
+        dgrad_weight_operand,
+        wgrad_input_operand_t,
         rotation_config,
         fake_quant_targets,
         quant_backend,
@@ -749,6 +806,7 @@ class MXFP8QATLinear(nn.Linear):
         mxfp8_rotation_seed: int = 0,
         mxfp8_rotation_targets: Any = None,
         mxfp8_fake_quant_targets: Any = None,
+        mxfp8_backward_reduction_axis_fake_quant: bool = False,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -779,6 +837,7 @@ class MXFP8QATLinear(nn.Linear):
         )
         validate_mxfp8_rotation_config(self.mxfp8_rotation_config, group_size=self.group_size)
         self.mxfp8_fake_quant_targets = normalize_mxfp8_fake_quant_targets(mxfp8_fake_quant_targets)
+        self.mxfp8_backward_reduction_axis_fake_quant = bool(mxfp8_backward_reduction_axis_fake_quant)
         self._mxfp8_layer_name = layer_name
         self._mxfp8_layer_type = layer_type if layer_type is not None else _infer_mxfp8_layer_type(layer_name)
         self._mxfp8_layer_index = layer_index if layer_index is not None else _infer_mxfp8_layer_index(layer_name)
@@ -802,6 +861,7 @@ class MXFP8QATLinear(nn.Linear):
         mxfp8_rotation_seed: int = 0,
         mxfp8_rotation_targets: Any = None,
         mxfp8_fake_quant_targets: Any = None,
+        mxfp8_backward_reduction_axis_fake_quant: bool = False,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -823,6 +883,7 @@ class MXFP8QATLinear(nn.Linear):
             mxfp8_rotation_seed=mxfp8_rotation_seed,
             mxfp8_rotation_targets=mxfp8_rotation_targets,
             mxfp8_fake_quant_targets=mxfp8_fake_quant_targets,
+            mxfp8_backward_reduction_axis_fake_quant=mxfp8_backward_reduction_axis_fake_quant,
             layer_name=layer_name,
             layer_type=layer_type,
             layer_index=layer_index,
@@ -938,11 +999,32 @@ class MXFP8QATLinear(nn.Linear):
         if self._gradient_transform_enabled(MXFP8_ROTATION_TARGET_DGRAD) or self._gradient_transform_enabled(
             MXFP8_ROTATION_TARGET_WGRAD
         ):
+            dgrad_weight_operand = None
+            wgrad_input_operand_t = None
+            if self.mxfp8_backward_reduction_axis_fake_quant:
+                if self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_DGRAD):
+                    dgrad_weight_operand = _prepare_dgrad_weight_operand(
+                        rotated_weight,
+                        self.mxfp8_rotation_config,
+                        self.mxfp8_fake_quant_targets,
+                        self.mxfp8_quant_backend,
+                        self.mxfp8_rounding_mode,
+                    )
+                if self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_WGRAD):
+                    wgrad_input_operand_t = _prepare_wgrad_input_operand_t(
+                        rotated_x,
+                        self.mxfp8_rotation_config,
+                        self.mxfp8_fake_quant_targets,
+                        self.mxfp8_quant_backend,
+                        self.mxfp8_rounding_mode,
+                    )
             return linear_with_gradient_rotation(
                 x_fq,
                 weight_fq,
                 self.bias,
                 self.mxfp8_rotation_config,
+                dgrad_weight_operand=dgrad_weight_operand,
+                wgrad_input_operand_t=wgrad_input_operand_t,
                 fake_quant_targets=self.mxfp8_fake_quant_targets,
                 quant_backend=self.mxfp8_quant_backend,
                 rounding_mode=self.mxfp8_rounding_mode,
@@ -958,6 +1040,7 @@ class MXFP8QATLinear(nn.Linear):
             f"group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
             f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, "
             f"mxfp8_fake_quant_targets={self.mxfp8_fake_quant_targets}, "
+            f"mxfp8_backward_reduction_axis_fake_quant={self.mxfp8_backward_reduction_axis_fake_quant}, "
             f"mxfp8_rotation_enable={self.mxfp8_rotation_config.enable}, "
             f"mxfp8_rotation_targets={self.mxfp8_rotation_config.targets}, "
             f"mxfp8_rotation_kind={self.mxfp8_rotation_config.kind}, "
