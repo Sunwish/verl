@@ -68,21 +68,41 @@ class TestFSDPEngineConfigCPU:
 
 
 class TestQATEngineConfig:
+    @pytest.mark.parametrize("mode", ["w4a8_mxfp4", "w4a4_mxfp4"])
+    def test_mxfp4_shared_options_and_backend_validation(self, mode):
+        config = QATEngineConfig(
+            enable=True,
+            mode=mode,
+            group_size=32,
+            quant_backend="torch",
+            rounding_mode="hash",
+            rotation_enable=True,
+            rotation_targets=["Fprop", "Dgrad", "Wgrad"],
+            fake_quant_targets=["Dgrad", "Wgrad"],
+            experts={"enable": True},
+            fallback_layers="0-1,4",
+        )
+        assert config.fake_quant_targets == ["dgrad", "wgrad"]
+        assert config.rotation_targets == ["fprop", "dgrad", "wgrad"]
+        assert config.experts.enable and config.fallback_layers == [[0, 1], [4, 4]]
+        with pytest.raises(ValueError, match="quant_backend='torch'"):
+            QATEngineConfig(enable=True, mode=mode, group_size=32, quant_backend="npu")
+
     def test_mxfp8_rounding_mode_defaults_to_rint(self):
         config = QATEngineConfig()
-        assert config.mxfp8_rounding_mode == "rint"
+        assert config.rounding_mode == "rint"
 
     def test_mxfp8_fake_quant_targets_default_and_normalization(self):
-        assert QATEngineConfig().mxfp8_fake_quant_targets == ["fprop"]
+        assert QATEngineConfig().fake_quant_targets == ["fprop"]
 
-        config = QATEngineConfig(mxfp8_fake_quant_targets=["Wgrad", "Dgrad"])
-        assert config.mxfp8_fake_quant_targets == ["dgrad", "wgrad"]
+        config = QATEngineConfig(fake_quant_targets=["Wgrad", "Dgrad"])
+        assert config.fake_quant_targets == ["dgrad", "wgrad"]
 
     def test_mxfp8_backward_reduction_axis_fake_quant_default_and_override(self):
-        assert QATEngineConfig().mxfp8_backward_reduction_axis_fake_quant is False
+        assert QATEngineConfig().backward_reduction_axis_fake_quant is False
 
-        config = QATEngineConfig(mxfp8_backward_reduction_axis_fake_quant=True)
-        assert config.mxfp8_backward_reduction_axis_fake_quant is True
+        config = QATEngineConfig(backward_reduction_axis_fake_quant=True)
+        assert config.backward_reduction_axis_fake_quant is True
 
     def test_mxfp8_fallback_layers_normalize_to_inclusive_ranges(self):
         config = QATEngineConfig(fallback_layers="0-3,37-48")
@@ -97,11 +117,11 @@ class TestQATEngineConfig:
         assert config.experts.enable is True
 
     def test_rejects_stochastic_rounding_with_npu_backend(self):
-        with pytest.raises(ValueError, match="mxfp8_quant_backend='torch'"):
+        with pytest.raises(ValueError, match="quant_backend='torch'"):
             QATEngineConfig(
                 enable=True,
                 mode="w8a8_mxfp8",
                 group_size=32,
-                mxfp8_quant_backend="npu",
-                mxfp8_rounding_mode="hash",
+                quant_backend="npu",
+                rounding_mode="hash",
             )

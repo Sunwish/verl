@@ -30,6 +30,7 @@ from verl.utils.qat.mxfp8_linear import (
     _prepare_dgrad_weight_operand,
     _prepare_wgrad_input_operand_t,
     _record_mxfp8_quant_error,
+    dequantize_mxfp4_tensor,
     get_mxfp_quantizers,
     linear_with_gradient_rotation,
     normalize_mxfp8_fake_quant_targets,
@@ -138,6 +139,9 @@ class MXFP8QATExperts(nn.Module):
         self.activation_observer = activation_observer
         self.quant_backend = normalize_mxfp8_quant_backend(quant_backend)
         self.weight_quantizer, self.activation_quantizer = get_mxfp_quantizers(mode, self.quant_backend)
+        self.dequantizer = (
+            dequantize_mxfp4_tensor if mode in {QATMode.W4A8_MXFP4, QATMode.W4A4_MXFP4} else _dequantize_mxfp8
+        )
         self.quantize_activation = mode != QATMode.W8A16_MXFP8
         self.rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
         if self.quant_backend == "npu" and self.rounding_mode in {"random", "hash"}:
@@ -309,6 +313,7 @@ class MXFP8QATExperts(nn.Module):
                         self.quant_backend,
                         self.rounding_mode,
                         quantize_fn=self.weight_quantizer,
+                        dequantize_fn=self.dequantizer,
                     )
                 if self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_WGRAD):
                     wgrad_input_operand_t = _prepare_wgrad_input_operand_t(
@@ -318,6 +323,7 @@ class MXFP8QATExperts(nn.Module):
                         self.quant_backend,
                         self.rounding_mode,
                         quantize_fn=self.activation_quantizer,
+                        dequantize_fn=self.dequantizer,
                     )
             return linear_with_gradient_rotation(
                 input,
@@ -331,6 +337,7 @@ class MXFP8QATExperts(nn.Module):
                 rounding_mode=self.rounding_mode,
                 quantize_fn=self.activation_quantizer,
                 weight_quantize_fn=self.weight_quantizer,
+                dequantize_fn=self.dequantizer,
                 skip_dgrad_weight_fake_quant=weight_fprop_fake_quantized,
                 skip_wgrad_input_fake_quant=input_fprop_fake_quantized,
             )
@@ -351,7 +358,7 @@ class MXFP8QATExperts(nn.Module):
                 rounding_mode=self.rounding_mode,
             )
             setattr(self, scale_attr, weight_scale.detach())
-            weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype).reshape(weight.shape)
+            weight_fq = self.dequantizer(weight_q, weight_scale, weight.dtype).reshape(weight.shape)
             if self.probe_quant_error:
                 if split_sublayer_types is None:
                     self._record_quant_error("weight", sublayer_type, weight, weight_fq)
@@ -381,7 +388,7 @@ class MXFP8QATExperts(nn.Module):
                 rounding_mode="rint" if self.mode in {QATMode.W4A8_MXFP4, QATMode.W4A4_MXFP4} else self.rounding_mode,
             )
             setattr(self, scale_attr, x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1]))
-            x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
+            x_fq = self.dequantizer(x_q, x_scale, x.dtype).reshape(original_shape)
             if self.probe_quant_error:
                 self._record_quant_error("activation", sublayer_type, x, x_fq)
                 return x

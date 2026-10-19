@@ -128,8 +128,9 @@ def test_vllm_launch_server_uses_bootstrap_model_path(monkeypatch):
 
 def test_sglang_launch_server_uses_bootstrap_model_path(monkeypatch):
     pytest.importorskip("sglang")
-    from verl.workers.rollout.sglang_rollout import async_sglang_server as sglang_server
     import sglang.srt.entrypoints.http_server as http_server
+
+    from verl.workers.rollout.sglang_rollout import async_sglang_server as sglang_server
 
     captured = {}
 
@@ -235,13 +236,13 @@ def test_vllm_actor_qat_does_not_force_rollout_quantization(monkeypatch, qat_mod
             "enable": True,
             "mode": qat_mode,
             "group_size": 32,
-            "mxfp8_quant_backend": "torch",
-            "mxfp8_rounding_mode": "hash",
-            "mxfp8_fake_quant_targets": ["Fprop"],
-            "mxfp8_rotation_enable": True,
-            "mxfp8_rotation_kind": "block_hadamard_sign",
-            "mxfp8_rotation_block_size": 32,
-            "mxfp8_rotation_seed": 7,
+            "quant_backend": "torch",
+            "rounding_mode": "hash",
+            "fake_quant_targets": ["Fprop"],
+            "rotation_enable": True,
+            "rotation_kind": "block_hadamard_sign",
+            "rotation_block_size": 32,
+            "rotation_seed": 7,
             "fallback_layers": "0-3,37-48",
             "experts": {"enable": False},
         },
@@ -250,9 +251,10 @@ def test_vllm_actor_qat_does_not_force_rollout_quantization(monkeypatch, qat_mod
 
     monkeypatch.setattr(vllm_server, "is_torch_npu_available", lambda check_device=False: False)
 
-    with patch("verl.utils.qat.load_quantization_config") as mock_load_quantization_config, patch(
-        "verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches"
-    ) as mock_apply_patches:
+    with (
+        patch("verl.utils.qat.load_quantization_config") as mock_load_quantization_config,
+        patch("verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches") as mock_apply_patches,
+    ):
         quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
 
     assert quantization is None
@@ -271,13 +273,13 @@ def test_vllm_rollout_ascend_quantization_uses_rollout_mxfp8_config(monkeypatch)
     server.config = SimpleNamespace(
         quantization="ascend",
         quantization_config_file=None,
-        mxfp8_quant_backend="torch",
-        mxfp8_rounding_mode="hash",
-        mxfp8_rotation_enable=True,
-        mxfp8_rotation_kind="block_hadamard_sign",
-        mxfp8_rotation_block_size=32,
-        mxfp8_rotation_seed=11,
-        mxfp8_group_size=32,
+        quant_backend="torch",
+        rounding_mode="hash",
+        rotation_enable=True,
+        rotation_kind="block_hadamard_sign",
+        rotation_block_size=32,
+        rotation_seed=11,
+        group_size=32,
         qat=None,
     )
     server.rollout_bootstrap_model_path = "/tmp/quantized-model"
@@ -300,7 +302,8 @@ def test_vllm_rollout_ascend_quantization_uses_rollout_mxfp8_config(monkeypatch)
     mock_apply_patches.assert_called_once()
 
 
-def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
+@pytest.mark.parametrize("mode", ["w8a8_mxfp8", "w4a8_mxfp4", "w4a4_mxfp4"])
+def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch, mode):
     pytest.importorskip("vllm")
     from verl.workers.rollout.vllm_rollout import vllm_async_server as vllm_server
 
@@ -311,24 +314,26 @@ def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
         qat_fake_quant=True,
         qat={
             "enable": False,
-            "mode": "w8a8_mxfp8",
+            "mode": mode,
             "group_size": 32,
-            "mxfp8_quant_backend": "torch",
-            "mxfp8_rounding_mode": "hash",
-            "mxfp8_rotation_enable": True,
-            "mxfp8_rotation_kind": "block_hadamard_sign",
-            "mxfp8_rotation_block_size": 32,
-            "mxfp8_rotation_seed": 7,
+            "quant_backend": "torch",
+            "rounding_mode": "hash",
+            "rotation_enable": True,
+            "rotation_kind": "block_hadamard_sign",
+            "rotation_block_size": 32,
+            "rotation_seed": 7,
             "experts": {"enable": False},
+            "fallback_layers": "0-3,37-48",
         },
     )
     server.model_config = SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=2))
 
     monkeypatch.setattr(vllm_server, "is_torch_npu_available", lambda check_device=False: False)
 
-    with patch("verl.utils.qat.load_quantization_config") as mock_load_quantization_config, patch(
-        "verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches"
-    ) as mock_apply_patches:
+    with (
+        patch("verl.utils.qat.load_quantization_config") as mock_load_quantization_config,
+        patch("verl.workers.rollout.vllm_rollout.vllm_async_server.apply_vllm_fp8_patches") as mock_apply_patches,
+    ):
         quantization, hf_overrides = vllm_server.vLLMHttpServer._apply_quantization(server)
 
     assert quantization is None
@@ -336,7 +341,7 @@ def test_vllm_qat_fake_quant_keeps_high_precision_rollout(monkeypatch):
     mock_load_quantization_config.assert_not_called()
     mock_apply_patches.assert_not_called()
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ENABLE_ENV] == "1"
-    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_MODE_ENV] == "w8a8_mxfp8"
+    assert os.environ[vllm_server.MXFP8_FAKE_QUANT_MODE_ENV] == mode
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_BACKEND_ENV] == "torch"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_ROUNDING_MODE_ENV] == "hash"
     assert os.environ[vllm_server.MXFP8_FAKE_QUANT_GROUP_SIZE_ENV] == "32"

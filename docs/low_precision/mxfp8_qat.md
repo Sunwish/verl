@@ -1,5 +1,9 @@
 # MXFP8 QAT (Quantization-Aware Training) in verl
 
+MXFP4 W4A8/W4A4 experiments reuse this QAT path. See
+[MXFP4 QAT](mxfp4_qat.md) for modes, the shared configuration key migration,
+and training/rollout validation steps.
+
 Last updated: 07/27/2026
 
 verl supports MXFP8 QAT for the Ascend low-precision RL stack. Training keeps matmul in high precision, but inserts
@@ -55,11 +59,11 @@ actor_rollout_ref:
         experts:
           enable: false
         quantization_config_path: "recipe/qat/config/mxfp8_w8a8_ascend.json"
-        mxfp8_quant_backend: "torch"
-        mxfp8_rounding_mode: "hash"
-        mxfp8_fake_quant_targets: ["Fprop"]
-        mxfp8_probe_quant_error: false
-        mxfp8_rotation_targets: ["Fprop"]
+        quant_backend: "torch"
+        rounding_mode: "hash"
+        fake_quant_targets: ["Fprop"]
+        probe_quant_error: false
+        rotation_targets: ["Fprop"]
 
 actor_rollout_ref:
   rollout:
@@ -74,13 +78,13 @@ actor_rollout_ref:
 | `fsdp_config.qat.ignore_patterns` | Layers to skip | `["lm_head", "embed_tokens", "re:.*mlp.gate$"]` |
 | `fsdp_config.qat.experts.enable` | Enable MXFP8 QAT for MoE expert compute | `False` |
 | `fsdp_config.qat.quantization_config_path` | vLLM quantization config JSON | Required when QAT is enabled |
-| `fsdp_config.qat.mxfp8_quant_backend` | Quantization backend | `npu` or `torch` |
-| `fsdp_config.qat.mxfp8_rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
-| `fsdp_config.qat.mxfp8_fake_quant_targets` | Fake-quant targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
-| `fsdp_config.qat.mxfp8_backward_reduction_axis_fake_quant` | Prepare Dgrad/Wgrad fake-quant operands along each backward matmul reduction axis | Defaults to `False` to preserve historical Fprop operand reuse |
-| `fsdp_config.qat.mxfp8_probe_quant_error` | Log aggregated per-layer quantization error | `False` |
-| `fsdp_config.qat.mxfp8_probe_quant_error_output_path` | JSONL output path for probes | Required if probes are enabled |
-| `fsdp_config.qat.mxfp8_rotation_targets` | Block-rotation targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
+| `fsdp_config.qat.quant_backend` | Quantization backend | `npu` or `torch` |
+| `fsdp_config.qat.rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
+| `fsdp_config.qat.fake_quant_targets` | Fake-quant targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
+| `fsdp_config.qat.backward_reduction_axis_fake_quant` | Prepare Dgrad/Wgrad fake-quant operands along each backward matmul reduction axis | Defaults to `False` to preserve historical Fprop operand reuse |
+| `fsdp_config.qat.probe_quant_error` | Log aggregated per-layer quantization error | `False` |
+| `fsdp_config.qat.probe_quant_error_output_path` | JSONL output path for probes | Required if probes are enabled |
+| `fsdp_config.qat.rotation_targets` | Block-rotation targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
 
 ---
 
@@ -102,7 +106,7 @@ The rounding mode only affects the torch backend:
 | `random` | Independent stochastic rounding | Best for noise studies |
 | `hash` | Deterministic pseudo-random rounding from tensor bits | Good when you want repeatable stochastic behavior |
 
-`random` and `hash` require `mxfp8_quant_backend: "torch"`.
+`random` and `hash` require `quant_backend: "torch"`.
 
 ---
 
@@ -129,7 +133,7 @@ per-parameter descriptors that contain `MXFP8`.
 
 ## Probe Logging
 
-Enable `mxfp8_probe_quant_error` when you want to inspect quantization error by step, layer index, layer type, and
+Enable `probe_quant_error` when you want to inspect quantization error by step, layer index, layer type, and
 error type. The probe aggregates all matching layer events and writes one final MAE record for each group. Records with
 `step: null` are skipped.
 
@@ -154,10 +158,10 @@ The output format is JSONL, one rank-0 record per `(step, error_type, layer_inde
 - The torch quantizer now follows the same shared-exponent / private-exponent formula used by rollout.
 - `w8a16_mxfp8` keeps activation precision high and fake-quantizes weights only.
 - `w8a8_mxfp8` fake-quantizes both weights and activations.
-- `mxfp8_fake_quant_targets` and `mxfp8_rotation_targets` are independent. For example, setting
-  `mxfp8_fake_quant_targets: ["Fprop"]` and `mxfp8_rotation_targets: ["Dgrad"]` fake-quantizes only the training
+- `fake_quant_targets` and `rotation_targets` are independent. For example, setting
+  `fake_quant_targets: ["Fprop"]` and `rotation_targets: ["Dgrad"]` fake-quantizes only the training
   forward operands while Dgrad receives block rotation without MXFP8 fake quantization.
-- `mxfp8_backward_reduction_axis_fake_quant: true` makes Dgrad/Wgrad use operands fake-quantized along each
+- `backward_reduction_axis_fake_quant: true` makes Dgrad/Wgrad use operands fake-quantized along each
   backward matmul reduction axis instead of reusing Fprop fake-quantized operands.
 - MoE packed experts can join the same MXFP8 QAT path by setting `fsdp_config.qat.experts.enable: true`.
 - Router/gate paths remain excluded, and `ignore_patterns` can still be used to opt out specific expert sublayers such as `re:.*mlp.experts.gate_up_proj$`.
@@ -170,6 +174,6 @@ The current stack was exercised on Qwen3-30B-A3B in the FSDP / vLLM-Ascend flow.
 
 Good starting points:
 
-- baseline parity checks: `mxfp8_quant_backend: "npu"` with `mxfp8_rounding_mode: "rint"`
-- repeatable stochastic studies: `mxfp8_quant_backend: "torch"` with `mxfp8_rounding_mode: "hash"`
-- exploratory noise injection: `mxfp8_quant_backend: "torch"` with `mxfp8_rounding_mode: "random"`
+- baseline parity checks: `quant_backend: "npu"` with `rounding_mode: "rint"`
+- repeatable stochastic studies: `quant_backend: "torch"` with `rounding_mode: "hash"`
+- exploratory noise injection: `quant_backend: "torch"` with `rounding_mode: "random"`

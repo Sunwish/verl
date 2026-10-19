@@ -15,22 +15,24 @@
 import json
 import logging
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import pytest
 
 from verl.utils.qat.core import QATConfig, apply_qat, invalidate_all_scales, normalize_mxfp8_fallback_layers
 from verl.utils.qat.linear import QATLinear, QATMode
 from verl.utils.qat.mxfp8_experts import MXFP8QATExperts
 from verl.utils.qat.mxfp8_linear import (
     MXFP8QATLinear,
+    _dequantize_mxfp8,
     _round_mxfp8_scaled_abs,
+    dequantize_mxfp4_tensor,
     flush_mxfp8_probe,
     linear_with_gradient_rotation,
     mxfp8_probe_step_context,
     normalize_mxfp8_fake_quant_targets,
+    quantize_mxfp4_tensor,
     quantize_mxfp8_tensor,
     reset_mxfp8_probe,
 )
@@ -154,15 +156,15 @@ def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode, caplog):
             enable=True,
             mode=mode,
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_rounding_mode="hash",
+            quant_backend="torch",
+            rounding_mode="hash",
         ),
     )
 
     assert isinstance(model.proj, MXFP8QATLinear)
     assert model.proj.mode == QATMode(mode)
-    assert model.proj.mxfp8_quant_backend == "torch"
-    assert model.proj.mxfp8_rounding_mode == "hash"
+    assert model.proj.quant_backend == "torch"
+    assert model.proj.rounding_mode == "hash"
     assert isinstance(model.lm_head, nn.Linear)
     assert any(
         "MXFP8 QAT applied to training model" in record.message
@@ -185,7 +187,7 @@ def test_apply_qat_mxfp8_fallback_layers_skip_complete_transformer_layers():
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
+            quant_backend="torch",
             fallback_layers="0",
         ),
     )
@@ -217,11 +219,11 @@ def test_mxfp8_rotation_targets_normalize_and_default():
         enable=True,
         mode="w8a8_mxfp8",
         group_size=32,
-        mxfp8_quant_backend="torch",
-        mxfp8_rotation_enable=True,
-        mxfp8_rotation_targets=["Wgrad", "Dgrad"],
+        quant_backend="torch",
+        rotation_enable=True,
+        rotation_targets=["Wgrad", "Dgrad"],
     )
-    assert config.mxfp8_rotation_targets == ["dgrad", "wgrad"]
+    assert config.rotation_targets == ["dgrad", "wgrad"]
 
 
 def test_mxfp8_fake_quant_targets_normalize_and_default():
@@ -233,10 +235,10 @@ def test_mxfp8_fake_quant_targets_normalize_and_default():
         enable=True,
         mode="w8a8_mxfp8",
         group_size=32,
-        mxfp8_quant_backend="torch",
-        mxfp8_fake_quant_targets=["Wgrad", "Dgrad"],
+        quant_backend="torch",
+        fake_quant_targets=["Wgrad", "Dgrad"],
     )
-    assert config.mxfp8_fake_quant_targets == ["dgrad", "wgrad"]
+    assert config.fake_quant_targets == ["dgrad", "wgrad"]
 
 
 def test_linear_with_gradient_rotation_matches_standard_backward_with_padding():
@@ -329,8 +331,8 @@ def test_mxfp8_qat_linear_does_not_requantize_fprop_operands_in_backward(monkeyp
         8,
         bias=False,
         mode=QATMode.W8A8_MXFP8,
-        mxfp8_quant_backend="torch",
-        mxfp8_fake_quant_targets=["Fprop", "Dgrad", "Wgrad"],
+        quant_backend="torch",
+        fake_quant_targets=["Fprop", "Dgrad", "Wgrad"],
         dtype=torch.float32,
     )
     x = torch.randn(4, 32, dtype=torch.float32, requires_grad=True)
@@ -348,6 +350,8 @@ def test_mxfp8_qat_linear_does_not_requantize_fprop_operands_in_backward(monkeyp
 
     monkeypatch.setattr("verl.utils.qat.mxfp8_linear.quantize_mxfp8_tensor", fake_quantize)
 
+    linear.weight_quantizer = fake_quantize
+    linear.activation_quantizer = fake_quantize
     linear(x).sum().backward()
 
     assert quantized_shapes == [(8, 32), (4, 32), (4, 32), (8, 32)]
@@ -359,9 +363,9 @@ def test_mxfp8_qat_linear_uses_backward_reduction_axis_operands_when_enabled(mon
         8,
         bias=False,
         mode=QATMode.W8A8_MXFP8,
-        mxfp8_quant_backend="torch",
-        mxfp8_fake_quant_targets=["Fprop", "Dgrad", "Wgrad"],
-        mxfp8_backward_reduction_axis_fake_quant=True,
+        quant_backend="torch",
+        fake_quant_targets=["Fprop", "Dgrad", "Wgrad"],
+        backward_reduction_axis_fake_quant=True,
         dtype=torch.float32,
     )
     x = torch.randn(4, 32, dtype=torch.float32, requires_grad=True)
@@ -379,6 +383,8 @@ def test_mxfp8_qat_linear_uses_backward_reduction_axis_operands_when_enabled(mon
 
     monkeypatch.setattr("verl.utils.qat.mxfp8_linear.quantize_mxfp8_tensor", fake_quantize)
 
+    linear.weight_quantizer = fake_quantize
+    linear.activation_quantizer = fake_quantize
     linear(x).sum().backward()
 
     assert quantized_shapes == [(8, 32), (4, 32), (32, 32), (32, 32), (4, 32), (8, 32)]
@@ -393,19 +399,19 @@ def test_apply_qat_mxfp8_rotation_targets_propagate_to_wrappers():
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_rounding_mode="round",
-            mxfp8_rotation_enable=True,
-            mxfp8_rotation_targets=["Dgrad", "Wgrad"],
-            mxfp8_fake_quant_targets=["Fprop", "Dgrad"],
-            mxfp8_backward_reduction_axis_fake_quant=True,
+            quant_backend="torch",
+            rounding_mode="round",
+            rotation_enable=True,
+            rotation_targets=["Dgrad", "Wgrad"],
+            fake_quant_targets=["Fprop", "Dgrad"],
+            backward_reduction_axis_fake_quant=True,
         ),
     )
 
     assert isinstance(model.proj, MXFP8QATLinear)
     assert model.proj.mxfp8_rotation_config.targets == ("dgrad", "wgrad")
-    assert model.proj.mxfp8_fake_quant_targets == ("fprop", "dgrad")
-    assert model.proj.mxfp8_backward_reduction_axis_fake_quant is True
+    assert model.proj.fake_quant_targets == ("fprop", "dgrad")
+    assert model.proj.backward_reduction_axis_fake_quant is True
 
 
 def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):
@@ -418,14 +424,14 @@ def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_probe_quant_error=True,
-            mxfp8_probe_quant_error_output_path=str(output_path),
+            quant_backend="torch",
+            probe_quant_error=True,
+            probe_quant_error_output_path=str(output_path),
         ),
     )
 
     assert isinstance(model.layers[0].q_proj, MXFP8QATLinear)
-    assert model.layers[0].q_proj.mxfp8_probe_quant_error is True
+    assert model.layers[0].q_proj.probe_quant_error is True
     assert model.layers[0].q_proj._mxfp8_layer_type == "q_proj"
     assert model.layers[0].q_proj._mxfp8_layer_index == 0
     assert model.layers[1].q_proj._mxfp8_layer_type == "q_proj"
@@ -473,13 +479,13 @@ def test_mxfp8_qat_probe_mode_aggregates_by_step_layer_index_and_type(tmp_path):
 
 
 def test_mxfp8_qat_probe_mode_requires_output_path():
-    with pytest.raises(ValueError, match="mxfp8_probe_quant_error_output_path"):
+    with pytest.raises(ValueError, match="probe_quant_error_output_path"):
         QATConfig(
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_probe_quant_error=True,
+            quant_backend="torch",
+            probe_quant_error=True,
         )
 
 
@@ -507,8 +513,8 @@ def test_apply_qat_mxfp8_experts_respects_subswitch_and_ignore_patterns():
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_rounding_mode="round",
+            quant_backend="torch",
+            rounding_mode="round",
         ),
     )
 
@@ -527,8 +533,8 @@ def test_apply_qat_mxfp8_experts_respects_subswitch_and_ignore_patterns():
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_rounding_mode="round",
+            quant_backend="torch",
+            rounding_mode="round",
             experts={"enable": True},
         ),
     )
@@ -548,8 +554,8 @@ def test_apply_qat_mxfp8_experts_respects_subswitch_and_ignore_patterns():
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_rounding_mode="round",
+            quant_backend="torch",
+            rounding_mode="round",
             experts={"enable": True},
             ignore_patterns=["re:.*mlp.experts.gate_up_proj$", "re:.*shared_expert.up_proj$"],
         ),
@@ -571,8 +577,8 @@ def test_mxfp8_qat_expert_wrapper_runs_forward_and_invalidate_all_scales():
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_rounding_mode="round",
+            quant_backend="torch",
+            rounding_mode="round",
             experts={"enable": True},
         ),
     )
@@ -604,10 +610,10 @@ def test_mxfp8_qat_expert_probe_splits_gate_up_proj_into_gate_and_up(tmp_path):
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="torch",
-            mxfp8_rounding_mode="round",
-            mxfp8_probe_quant_error=True,
-            mxfp8_probe_quant_error_output_path=str(output_path),
+            quant_backend="torch",
+            rounding_mode="round",
+            probe_quant_error=True,
+            probe_quant_error_output_path=str(output_path),
             experts={"enable": True},
         ),
     )
@@ -633,22 +639,22 @@ def test_mxfp8_qat_expert_probe_splits_gate_up_proj_into_gate_and_up(tmp_path):
 
 def test_mxfp8_qat_linear_rejects_unknown_quant_backend():
     with pytest.raises(ValueError, match="Unsupported MXFP8 quant backend"):
-        MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="rotate")
+        MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, quant_backend="rotate")
 
 
 def test_mxfp8_qat_linear_rejects_unknown_rounding_mode():
     with pytest.raises(ValueError, match="Unsupported MXFP8 rounding mode"):
-        MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch", mxfp8_rounding_mode="nearest")
+        MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, quant_backend="torch", rounding_mode="nearest")
 
 
 def test_mxfp8_qat_config_rejects_stochastic_rounding_with_npu_backend():
-    with pytest.raises(ValueError, match="mxfp8_quant_backend='torch'"):
+    with pytest.raises(ValueError, match="quant_backend='torch'"):
         QATConfig(
             enable=True,
             mode="w8a8_mxfp8",
             group_size=32,
-            mxfp8_quant_backend="npu",
-            mxfp8_rounding_mode="random",
+            quant_backend="npu",
+            rounding_mode="random",
         )
 
 
@@ -658,7 +664,6 @@ def test_round_mxfp8_scaled_abs_rint_uses_bankers_rounding():
     rounded = _round_mxfp8_scaled_abs(values, "rint")
 
     assert torch.equal(rounded, torch.tensor([0.0, 2.0, 2.0, 4.0, 4.0, 4.0, 5.0], dtype=torch.float32))
-
 
 
 def test_quantize_mxfp8_torch_defaults_to_rint_rounding_on_ties():
@@ -678,9 +683,7 @@ def test_quantize_mxfp8_torch_defaults_to_rint_rounding_on_ties():
 
 
 def test_w8a16_mxfp8_qat_linear_preserves_high_precision_matmul_toggle():
-    linear = MXFP8QATLinear(
-        32, 8, bias=True, mode=QATMode.W8A16_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
-    )
+    linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A16_MXFP8, quant_backend="torch", dtype=torch.bfloat16)
     with torch.no_grad():
         linear.weight.copy_(torch.linspace(-3.25, 3.25, steps=8 * 32, dtype=torch.bfloat16).view(8, 32))
         linear.bias.zero_()
@@ -707,8 +710,8 @@ def test_mxfp8_qat_linear_skips_fprop_fake_quant_when_target_excludes_fprop():
         8,
         bias=True,
         mode=QATMode.W8A8_MXFP8,
-        mxfp8_quant_backend="torch",
-        mxfp8_fake_quant_targets=["Dgrad"],
+        quant_backend="torch",
+        fake_quant_targets=["Dgrad"],
         dtype=torch.bfloat16,
     )
     with torch.no_grad():
@@ -724,11 +727,9 @@ def test_mxfp8_qat_linear_skips_fprop_fake_quant_when_target_excludes_fprop():
 
 
 def test_w8a8_mxfp8_qat_linear_fake_quantizes_activation():
-    linear = MXFP8QATLinear(
-        32, 8, bias=True, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
-    )
+    linear = MXFP8QATLinear(32, 8, bias=True, mode=QATMode.W8A8_MXFP8, quant_backend="torch", dtype=torch.bfloat16)
     w8a16_linear = MXFP8QATLinear(
-        32, 8, bias=True, mode=QATMode.W8A16_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
+        32, 8, bias=True, mode=QATMode.W8A16_MXFP8, quant_backend="torch", dtype=torch.bfloat16
     )
     with torch.no_grad():
         weight = torch.linspace(-2.0, 2.0, steps=8 * 32, dtype=torch.bfloat16).view(8, 32)
@@ -751,9 +752,7 @@ def test_w8a8_mxfp8_qat_linear_fake_quantizes_activation():
 
 
 def test_w8a8_mxfp8_qat_linear_supports_3d_activation():
-    linear = MXFP8QATLinear(
-        32, 8, bias=False, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch", dtype=torch.bfloat16
-    )
+    linear = MXFP8QATLinear(32, 8, bias=False, mode=QATMode.W8A8_MXFP8, quant_backend="torch", dtype=torch.bfloat16)
     with torch.no_grad():
         linear.weight.copy_(torch.linspace(-2.0, 2.0, steps=8 * 32, dtype=torch.bfloat16).view(8, 32))
 
@@ -770,7 +769,7 @@ def test_w8a8_mxfp8_qat_linear_supports_3d_activation():
 def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     model = nn.Module()
     model.nvfp4 = QATLinear(32, 8, mode=QATMode.W4A16, group_size=16)
-    model.mxfp8 = MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, mxfp8_quant_backend="torch")
+    model.mxfp8 = MXFP8QATLinear(32, 8, mode=QATMode.W8A8_MXFP8, quant_backend="torch")
 
     model.nvfp4._weight_blockwise_scale = torch.ones(1)
     model.nvfp4._weight_global_scale = torch.ones(1)
@@ -785,3 +784,150 @@ def test_invalidate_all_scales_handles_nvfp4_and_mxfp8_modules():
     assert model.nvfp4._cached_weight_amax is None
     assert model.mxfp8._last_weight_scale is None
     assert model.mxfp8._last_input_scale is None
+
+
+@pytest.mark.parametrize(
+    "rounding,expected",
+    [
+        ("rint", [0, 1, 1, 2, 2, 4, 4, 6]),
+        ("round", [0.5, 1, 1.5, 2, 3, 4, 6, 6]),
+    ],
+)
+def test_mxfp4_e2m1_midpoints_and_saturation(rounding, expected):
+    values = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, 7])
+    tensor = torch.cat([values, -values, values, -values]).reshape(1, 32)
+    payload, scale = quantize_mxfp4_tensor(tensor, rounding_mode=rounding)
+    expected = torch.tensor(expected, dtype=torch.float32)
+    expected = torch.cat([expected, -expected, expected, -expected]).reshape_as(tensor)
+    assert torch.equal(scale, torch.tensor([[127.0]]))
+    assert torch.equal(payload, expected)
+    assert torch.equal(dequantize_mxfp4_tensor(payload, scale, tensor.dtype), expected)
+
+
+def test_mxfp4_zero_tiny_nonfinite_and_independent_scales():
+    tensor = torch.cat([torch.zeros(32), torch.full((32,), 2.0**-140), torch.full((32,), 24.0)]).reshape(1, 96)
+    payload, scale = quantize_mxfp4_tensor(tensor)
+    assert torch.equal(scale, torch.tensor([[0.0, 0.0, 129.0]]))
+    assert torch.equal(payload[:, :64], torch.zeros(1, 64))
+    assert torch.equal(dequantize_mxfp4_tensor(payload, scale, tensor.dtype)[:, 64:], tensor[:, 64:])
+    for value in [float("nan"), float("inf")]:
+        tensor[0, 0] = value
+        payload, scale = quantize_mxfp4_tensor(tensor)
+        assert scale[0, 0] == 255
+        assert torch.isnan(dequantize_mxfp4_tensor(payload, scale, tensor.dtype)[:, :32]).all()
+
+
+def test_mxfp4_handles_empty_token_rows():
+    tensor = torch.empty(0, 96)
+    payload, scale = quantize_mxfp4_tensor(tensor)
+    assert payload.shape == (0, 96) and scale.shape == (0, 3)
+    assert dequantize_mxfp4_tensor(payload, scale, tensor.dtype).shape == tensor.shape
+
+
+@pytest.mark.parametrize("rounding", ["random", "hash"])
+def test_mxfp4_stochastic_rounding_is_reproducible_and_uses_adjacent_levels(rounding):
+    tensor = torch.full((512, 32), 0.25)
+    tensor[:, -1] = 6
+    torch.manual_seed(17)
+    payload, scale = quantize_mxfp4_tensor(tensor, rounding_mode=rounding)
+    torch.manual_seed(17)
+    again, again_scale = quantize_mxfp4_tensor(tensor, rounding_mode=rounding)
+    assert torch.equal(payload, again)
+    assert torch.equal(scale, again_scale)
+    assert ((payload[:, :-1] == 0) | (payload[:, :-1] == 0.5)).all()
+    if rounding == "random":
+        assert abs(payload[:, :-1].mean().item() - 0.25) < 0.01
+
+
+@pytest.mark.parametrize("shape", [(32,), (2, 31), (2, 3, 32)])
+def test_mxfp4_rejects_invalid_shapes(shape):
+    with pytest.raises(ValueError):
+        quantize_mxfp4_tensor(torch.zeros(shape))
+
+
+@pytest.mark.parametrize("mode", ["w4a8_mxfp4", "w4a4_mxfp4"])
+@pytest.mark.parametrize("rotation", [False, True])
+def test_mxfp4_dense_forward_uses_expected_formats_and_ste(mode, rotation):
+    torch.manual_seed(71)
+    linear = MXFP8QATLinear(32, 9, mode=mode, quant_backend="torch", rotation_enable=rotation)
+    x = torch.randn(2, 3, 32, requires_grad=True)
+    weight = linear._rotate_tensor(linear.weight)
+    inputs = linear._rotate_tensor(x)
+    wq, ws = quantize_mxfp4_tensor(weight)
+    activation_quantizer = quantize_mxfp4_tensor if mode == "w4a4_mxfp4" else quantize_mxfp8_tensor
+    aq, asc = activation_quantizer(inputs.reshape(-1, 32))
+    expected = F.linear(
+        _dequantize_mxfp8(aq, asc, x.dtype).reshape_as(x), dequantize_mxfp4_tensor(wq, ws, x.dtype), linear.bias
+    )
+    result = linear(x)
+    torch.testing.assert_close(result, expected)
+    result.sum().backward()
+    assert torch.isfinite(x.grad).all() and torch.isfinite(linear.weight.grad).all()
+
+
+@pytest.mark.parametrize("mode", ["w4a8_mxfp4", "w4a4_mxfp4"])
+def test_mxfp4_backward_reduction_axis_preserves_weight_activation_formats(mode):
+    linear = MXFP8QATLinear(
+        32,
+        9,
+        mode=mode,
+        quant_backend="torch",
+        rotation_enable=True,
+        rotation_targets=["Fprop", "Dgrad", "Wgrad"],
+        fake_quant_targets=["Fprop", "Dgrad", "Wgrad"],
+        backward_reduction_axis_fake_quant=True,
+    )
+    calls = []
+    weight_quantizer, activation_quantizer = linear.weight_quantizer, linear.activation_quantizer
+
+    def weights(tensor, **kwargs):
+        calls.append(("weight", tuple(tensor.shape)))
+        return weight_quantizer(tensor, **kwargs)
+
+    def activations(tensor, **kwargs):
+        calls.append(("activation", tuple(tensor.shape)))
+        return activation_quantizer(tensor, **kwargs)
+
+    linear.weight_quantizer, linear.activation_quantizer = weights, activations
+    x = torch.randn(3, 32, requires_grad=True)
+    linear(x).sum().backward()
+    assert calls == [
+        ("weight", (9, 32)),
+        ("activation", (3, 32)),
+        ("weight", (32, 32)),
+        ("activation", (32, 32)),
+        ("activation", (3, 32)),
+        ("activation", (9, 32)),
+    ]
+    assert torch.isfinite(x.grad).all() and torch.isfinite(linear.weight.grad).all()
+
+
+@pytest.mark.parametrize("mode", ["w4a8_mxfp4", "w4a4_mxfp4"])
+def test_mxfp4_apply_qat_experts_fallback_and_probe(mode, tmp_path):
+    model = _MoeModel()
+    model.layers.append(_MoeLayer())
+    output = tmp_path / "mxfp4_probe.jsonl"
+    config = QATConfig(
+        enable=True,
+        mode=mode,
+        group_size=32,
+        quant_backend="torch",
+        experts={"enable": True},
+        fallback_layers="1",
+        rotation_enable=True,
+        probe_quant_error=True,
+        probe_quant_error_output_path=str(output),
+    )
+    apply_qat(model, config)
+    assert isinstance(model.layers[0].mlp.experts, MXFP8QATExperts)
+    assert isinstance(model.layers[1].mlp.experts, _PackedExperts)
+    expert = model.layers[0].mlp.experts
+    x = torch.randn(3, 32, dtype=torch.bfloat16, requires_grad=True)
+    result = expert(x, torch.tensor([[0], [1], [0]]), torch.ones(3, 1, dtype=x.dtype))
+    result.float().sum().backward()
+    assert torch.isfinite(expert.gate_up_proj.grad).all()
+    flush_mxfp8_probe()
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert records and all(record["mode"] == mode for record in records)
+    assert {record["error_type"] for record in records} == {"weight", "activation"}
+    reset_mxfp8_probe()
