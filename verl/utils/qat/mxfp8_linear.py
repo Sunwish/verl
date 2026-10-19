@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MXFP8 QAT linear layer for FSDP training.
+"""Shared MXFP8/MXFP4 QAT linear layer for FSDP training.
 
-This layer applies MXFP8 quantize+dequantize during forward while keeping the
-actual matmul in high precision. W8A16 quantizes weights only; W8A8 quantizes
-both weights and activations.
+Quantize/dequantize operands while keeping matmuls in high precision. Modes
+select weight and activation formats; rotation, STE, probes and backward
+operand transforms are shared.
 """
 
 import atexit
@@ -55,6 +55,8 @@ __all__ = [
     "normalize_mxfp8_quant_backend",
     "normalize_mxfp8_rounding_mode",
     "quantize_mxfp8_tensor",
+    "quantize_mxfp4_tensor",
+    "dequantize_mxfp4_tensor",
     "reset_mxfp8_probe",
     "set_mxfp8_probe_step",
 ]
@@ -106,6 +108,8 @@ def _transform_gradient_operand(
     quant_backend: str | None,
     rounding_mode: str,
     skip_fake_quant: bool = False,
+    quantize_fn=None,
+    dequantize_fn=None,
 ) -> torch.Tensor:
     should_rotate = is_mxfp8_rotation_target(rotation_config, target)
     target_fake_quant_enabled = _is_mxfp8_fake_quant_target(fake_quant_targets, target)
@@ -121,12 +125,14 @@ def _transform_gradient_operand(
         return tensor
 
     original_shape = tensor.shape
-    tensor_q, tensor_scale = quantize_mxfp8_tensor(
+    quantize_fn = quantize_fn or quantize_mxfp8_tensor
+    dequantize_fn = dequantize_fn or _dequantize_mxfp8
+    tensor_q, tensor_scale = quantize_fn(
         tensor.reshape(-1, tensor.shape[-1]),
         quant_backend=quant_backend,
         rounding_mode=rounding_mode,
     )
-    return _dequantize_mxfp8(tensor_q, tensor_scale, tensor.dtype).reshape(original_shape)
+    return dequantize_fn(tensor_q, tensor_scale, tensor.dtype).reshape(original_shape)
 
 
 def _prepare_dgrad_weight_operand(
@@ -135,6 +141,8 @@ def _prepare_dgrad_weight_operand(
     fake_quant_targets: tuple[str, ...],
     quant_backend: str | None,
     rounding_mode: str,
+    quantize_fn=None,
+    dequantize_fn=None,
 ) -> torch.Tensor:
     with torch.no_grad():
         return _transform_gradient_operand(
@@ -144,6 +152,8 @@ def _prepare_dgrad_weight_operand(
             fake_quant_targets,
             quant_backend,
             rounding_mode,
+            quantize_fn=quantize_fn,
+            dequantize_fn=dequantize_fn,
         ).transpose(0, 1)
 
 
@@ -153,6 +163,8 @@ def _prepare_wgrad_input_operand_t(
     fake_quant_targets: tuple[str, ...],
     quant_backend: str | None,
     rounding_mode: str,
+    quantize_fn=None,
+    dequantize_fn=None,
 ) -> torch.Tensor:
     input_2d = input.reshape(-1, input.shape[-1])
     with torch.no_grad():
@@ -163,6 +175,8 @@ def _prepare_wgrad_input_operand_t(
             fake_quant_targets,
             quant_backend,
             rounding_mode,
+            quantize_fn=quantize_fn,
+            dequantize_fn=dequantize_fn,
         )
 
 
@@ -179,6 +193,9 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
         fake_quant_targets,
         quant_backend: str | None,
         rounding_mode: str,
+        quantize_fn,
+        dequantize_fn,
+        weight_quantize_fn,
         skip_dgrad_weight_fake_quant: bool,
         skip_wgrad_input_fake_quant: bool,
     ):
@@ -194,6 +211,9 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
         ctx.fake_quant_targets = fake_quant_targets
         ctx.quant_backend = quant_backend
         ctx.rounding_mode = rounding_mode
+        ctx.quantize_fn = quantize_fn
+        ctx.dequantize_fn = dequantize_fn
+        ctx.weight_quantize_fn = weight_quantize_fn
         ctx.skip_dgrad_weight_fake_quant = skip_dgrad_weight_fake_quant
         ctx.skip_wgrad_input_fake_quant = skip_wgrad_input_fake_quant
         return F.linear(input, weight, bias)
@@ -207,6 +227,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
         fake_quant_targets = ctx.fake_quant_targets
         quant_backend = ctx.quant_backend
         rounding_mode = ctx.rounding_mode
+        quantize_fn = ctx.quantize_fn
+        dequantize_fn = ctx.dequantize_fn
 
         if is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_DGRAD) or _is_mxfp8_fake_quant_target(
             fake_quant_targets, MXFP8_ROTATION_TARGET_DGRAD
@@ -218,6 +240,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                 fake_quant_targets,
                 quant_backend,
                 rounding_mode,
+                quantize_fn=quantize_fn,
+                dequantize_fn=dequantize_fn,
             )
             if ctx.use_dgrad_weight_operand:
                 rotated_weight = dgrad_weight_operand
@@ -230,6 +254,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                     quant_backend,
                     rounding_mode,
                     skip_fake_quant=ctx.skip_dgrad_weight_fake_quant,
+                    quantize_fn=ctx.weight_quantize_fn,
+                    dequantize_fn=dequantize_fn,
                 ).transpose(0, 1)
             grad_input_2d = rotated_grad_output.matmul(rotated_weight)
         else:
@@ -245,6 +271,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                 fake_quant_targets,
                 quant_backend,
                 rounding_mode,
+                quantize_fn=quantize_fn,
+                dequantize_fn=dequantize_fn,
             )
             if ctx.use_wgrad_input_operand:
                 rotated_input_t = wgrad_input_operand_t
@@ -257,6 +285,8 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
                     quant_backend,
                     rounding_mode,
                     skip_fake_quant=ctx.skip_wgrad_input_fake_quant,
+                    quantize_fn=quantize_fn,
+                    dequantize_fn=dequantize_fn,
                 )
             grad_weight = rotated_grad_output_t.matmul(rotated_input_t.transpose(0, 1))
         else:
@@ -267,6 +297,9 @@ class _MXFP8LinearWithGradientRotation(torch.autograd.Function):
             grad_input_2d.reshape_as(input),
             grad_weight,
             grad_bias,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -289,6 +322,9 @@ def linear_with_gradient_rotation(
     fake_quant_targets: Any = None,
     quant_backend: str | None = None,
     rounding_mode: str = "rint",
+    quantize_fn=None,
+    dequantize_fn=None,
+    weight_quantize_fn=None,
     skip_dgrad_weight_fake_quant: bool = False,
     skip_wgrad_input_fake_quant: bool = False,
 ) -> torch.Tensor:
@@ -303,9 +339,14 @@ def linear_with_gradient_rotation(
         fake_quant_targets,
         quant_backend,
         rounding_mode,
+        quantize_fn or quantize_mxfp8_tensor,
+        dequantize_fn or _dequantize_mxfp8,
+        weight_quantize_fn or quantize_fn or quantize_mxfp8_tensor,
         skip_dgrad_weight_fake_quant,
         skip_wgrad_input_fake_quant,
     )
+
+
 _MXFP8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 _MXFP8_RUNTIME_LOGGED: set[tuple] = set()
 _MXFP8_RUNTIME_LOG_LOCK = threading.Lock()
@@ -451,7 +492,7 @@ _MXFP8_PROBE_RECORDER = _MXFP8ProbeRecorder()
 def configure_mxfp8_probe(enabled: bool, output_path: Optional[str], rank0_only: bool = True):
     _MXFP8_PROBE_RECORDER.configure(enabled=enabled, output_path=output_path, rank0_only=rank0_only)
     logger.warning(
-        "MXFP8 QAT quant error probe configured: enabled=%s, output_path=%s, rank0_only=%s",
+        "MXFP QAT quant error probe configured: enabled=%s, output_path=%s, rank0_only=%s",
         enabled,
         output_path,
         rank0_only,
@@ -575,8 +616,7 @@ def normalize_mxfp8_rounding_mode(rounding_mode: str) -> str:
     rounding_mode = rounding_mode.lower()
     if rounding_mode not in _MXFP8_ROUNDING_MODES:
         raise ValueError(
-            f"Unsupported MXFP8 rounding mode: {rounding_mode}. "
-            f"Supported modes: {sorted(_MXFP8_ROUNDING_MODES)}"
+            f"Unsupported MXFP8 rounding mode: {rounding_mode}. Supported modes: {sorted(_MXFP8_ROUNDING_MODES)}"
         )
     return rounding_mode
 
@@ -767,7 +807,7 @@ def quantize_mxfp8_tensor(
     )
     if quant_backend == "npu":
         if rounding_mode in _MXFP8_STOCHASTIC_ROUNDING_MODES:
-            raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
+            raise ValueError("MXFP8 stochastic rounding modes require quant_backend='torch'")
         return _quantize_mxfp8_npu(tensor)
 
     use_a2a3_path, soc_version = _use_mxfp8_torch_a2a3_path(tensor)
@@ -781,6 +821,55 @@ def quantize_mxfp8_tensor(
     if use_a2a3_path:
         return _quantize_mxfp8_torch_A2A3(tensor, rounding_mode=rounding_mode)
     return _quantize_mxfp8_torch(tensor, rounding_mode=rounding_mode)
+
+
+def quantize_mxfp4_tensor(
+    tensor: torch.Tensor, quant_backend: str = "torch", rounding_mode: str = "rint"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4 E2M1 payload and biased E8M0 exponents, both stored in FP32.
+
+    Follows ops-nn DynamicMxQuant (scale_alg=0): 32-element blocks,
+    emax=2, minimum private exponent=0, one mantissa bit, saturation at 6.
+    No packed FP4/device cast is needed for immediate fake dequantization.
+    """
+    _check_mxfp8_2d_tensor(tensor)
+    if str(quant_backend).lower() != "torch":
+        raise ValueError("MXFP4 fake quantization requires quant_backend='torch'")
+    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
+    blocked = tensor.to(torch.float32).reshape(tensor.shape[0], tensor.shape[-1] // 32, 32)
+    amax = blocked.abs().amax(dim=-1)
+    amax_safe = torch.where(amax == 0, torch.ones_like(amax), amax)
+    shared_exp = (torch.floor(torch.log2(amax_safe)) - 2.0).clamp(min=-127.0)
+    shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -127.0), shared_exp)
+    shared_exp = torch.where(shared_exp > 127.0, torch.full_like(shared_exp, float("nan")), shared_exp)
+    normalized = blocked / torch.pow(2.0, shared_exp.unsqueeze(-1))
+    abs_norm = normalized.abs()
+    private_exp = torch.floor(torch.log2(abs_norm + (abs_norm == 0).float())).clamp(min=0)
+    private_scale = torch.pow(2.0, private_exp)
+    scaled = normalized / private_scale * 2.0
+    quantized = torch.sign(scaled) * _round_mxfp8_scaled_abs(scaled.abs(), rounding_mode)
+    quantized = (quantized / 2.0 * private_scale).clamp(-6.0, 6.0)
+    # E8M0 code 255 denotes a non-finite block scale.
+    scale = torch.where(torch.isnan(shared_exp), torch.full_like(shared_exp, 255.0), shared_exp + 127.0)
+    return quantized.reshape_as(tensor), scale
+
+
+def dequantize_mxfp4_tensor(tensor_q: torch.Tensor, tensor_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Decode unpacked E2M1 values and E8M0 exponent codes."""
+    result = _dequantize_mxfp8(tensor_q, tensor_scale, dtype)
+    invalid_blocks = tensor_scale.reshape(tensor_q.shape[0], -1) == 255
+    invalid = invalid_blocks.unsqueeze(-1).expand(-1, -1, 32).reshape_as(tensor_q)
+    return torch.where(invalid, torch.full_like(result, float("nan")), result)
+
+
+def get_mxfp_quantizers(mode: QATMode, quant_backend: str):
+    """Select weight and activation formats without duplicating QAT plumbing."""
+    if mode in {QATMode.W4A8_MXFP4, QATMode.W4A4_MXFP4}:
+        if quant_backend != "torch":
+            raise ValueError("MXFP4 QAT requires quant_backend='torch'")
+        activation_quantizer = quantize_mxfp4_tensor if mode == QATMode.W4A4_MXFP4 else quantize_mxfp8_tensor
+        return quantize_mxfp4_tensor, activation_quantizer
+    return quantize_mxfp8_tensor, quantize_mxfp8_tensor
 
 
 class MXFP8QATLinear(nn.Linear):
@@ -797,16 +886,16 @@ class MXFP8QATLinear(nn.Linear):
         mode: QATMode = QATMode.W8A16_MXFP8,
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
-        mxfp8_quant_backend: str = "npu",
-        mxfp8_rounding_mode: str = "rint",
-        mxfp8_probe_quant_error: bool = False,
-        mxfp8_rotation_enable: bool = False,
-        mxfp8_rotation_kind: str = "block_hadamard_sign",
-        mxfp8_rotation_block_size: int = _MXFP8_BLOCK_SIZE,
-        mxfp8_rotation_seed: int = 0,
-        mxfp8_rotation_targets: Any = None,
-        mxfp8_fake_quant_targets: Any = None,
-        mxfp8_backward_reduction_axis_fake_quant: bool = False,
+        quant_backend: str = "npu",
+        rounding_mode: str = "rint",
+        probe_quant_error: bool = False,
+        rotation_enable: bool = False,
+        rotation_kind: str = "block_hadamard_sign",
+        rotation_block_size: int = _MXFP8_BLOCK_SIZE,
+        rotation_seed: int = 0,
+        rotation_targets: Any = None,
+        fake_quant_targets: Any = None,
+        backward_reduction_axis_fake_quant: bool = False,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -816,28 +905,30 @@ class MXFP8QATLinear(nn.Linear):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         if isinstance(mode, str):
             mode = QATMode(mode.lower())
-        if mode not in {QATMode.W8A16_MXFP8, QATMode.W8A8_MXFP8}:
-            raise ValueError(f"MXFP8QATLinear only supports w8a16_mxfp8/w8a8_mxfp8 modes, got: {mode}")
+        if mode not in {QATMode.W8A16_MXFP8, QATMode.W8A8_MXFP8, QATMode.W4A8_MXFP4, QATMode.W4A4_MXFP4}:
+            raise ValueError(f"Unsupported MXFP QAT mode: {mode}")
         if group_size != _MXFP8_BLOCK_SIZE:
-            raise ValueError(f"MXFP8 QAT requires group_size={_MXFP8_BLOCK_SIZE}, got: {group_size}")
+            raise ValueError(f"MXFP QAT requires group_size={_MXFP8_BLOCK_SIZE}, got: {group_size}")
         self.mode = mode
         self.group_size = group_size
         self.activation_observer = activation_observer
-        self.mxfp8_quant_backend = normalize_mxfp8_quant_backend(mxfp8_quant_backend)
-        self.mxfp8_rounding_mode = normalize_mxfp8_rounding_mode(mxfp8_rounding_mode)
-        if self.mxfp8_quant_backend == "npu" and self.mxfp8_rounding_mode in _MXFP8_STOCHASTIC_ROUNDING_MODES:
-            raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
-        self.mxfp8_probe_quant_error = mxfp8_probe_quant_error
+        self.quant_backend = normalize_mxfp8_quant_backend(quant_backend)
+        self.weight_quantizer, self.activation_quantizer = get_mxfp_quantizers(mode, self.quant_backend)
+        self.quantize_activation = mode != QATMode.W8A16_MXFP8
+        self.rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
+        if self.quant_backend == "npu" and self.rounding_mode in _MXFP8_STOCHASTIC_ROUNDING_MODES:
+            raise ValueError("MXFP8 stochastic rounding modes require quant_backend='torch'")
+        self.probe_quant_error = probe_quant_error
         self.mxfp8_rotation_config = MXFP8RotationConfig(
-            enable=mxfp8_rotation_enable,
-            kind=normalize_mxfp8_rotation_kind(mxfp8_rotation_kind),
-            block_size=mxfp8_rotation_block_size,
-            seed=mxfp8_rotation_seed,
-            targets=normalize_mxfp8_rotation_targets(mxfp8_rotation_targets),
+            enable=rotation_enable,
+            kind=normalize_mxfp8_rotation_kind(rotation_kind),
+            block_size=rotation_block_size,
+            seed=rotation_seed,
+            targets=normalize_mxfp8_rotation_targets(rotation_targets),
         )
         validate_mxfp8_rotation_config(self.mxfp8_rotation_config, group_size=self.group_size)
-        self.mxfp8_fake_quant_targets = normalize_mxfp8_fake_quant_targets(mxfp8_fake_quant_targets)
-        self.mxfp8_backward_reduction_axis_fake_quant = bool(mxfp8_backward_reduction_axis_fake_quant)
+        self.fake_quant_targets = normalize_mxfp8_fake_quant_targets(fake_quant_targets)
+        self.backward_reduction_axis_fake_quant = bool(backward_reduction_axis_fake_quant)
         self._mxfp8_layer_name = layer_name
         self._mxfp8_layer_type = layer_type if layer_type is not None else _infer_mxfp8_layer_type(layer_name)
         self._mxfp8_layer_index = layer_index if layer_index is not None else _infer_mxfp8_layer_index(layer_name)
@@ -852,16 +943,16 @@ class MXFP8QATLinear(nn.Linear):
         mode: QATMode = QATMode.W8A16_MXFP8,
         group_size: int = _MXFP8_BLOCK_SIZE,
         activation_observer: str = "static_minmax",
-        mxfp8_quant_backend: str = "npu",
-        mxfp8_rounding_mode: str = "rint",
-        mxfp8_probe_quant_error: bool = False,
-        mxfp8_rotation_enable: bool = False,
-        mxfp8_rotation_kind: str = "block_hadamard_sign",
-        mxfp8_rotation_block_size: int = _MXFP8_BLOCK_SIZE,
-        mxfp8_rotation_seed: int = 0,
-        mxfp8_rotation_targets: Any = None,
-        mxfp8_fake_quant_targets: Any = None,
-        mxfp8_backward_reduction_axis_fake_quant: bool = False,
+        quant_backend: str = "npu",
+        rounding_mode: str = "rint",
+        probe_quant_error: bool = False,
+        rotation_enable: bool = False,
+        rotation_kind: str = "block_hadamard_sign",
+        rotation_block_size: int = _MXFP8_BLOCK_SIZE,
+        rotation_seed: int = 0,
+        rotation_targets: Any = None,
+        fake_quant_targets: Any = None,
+        backward_reduction_axis_fake_quant: bool = False,
         layer_name: Optional[str] = None,
         layer_type: Optional[str] = None,
         layer_index: Optional[int] = None,
@@ -874,16 +965,16 @@ class MXFP8QATLinear(nn.Linear):
             mode=mode,
             group_size=group_size,
             activation_observer=activation_observer,
-            mxfp8_quant_backend=mxfp8_quant_backend,
-            mxfp8_rounding_mode=mxfp8_rounding_mode,
-            mxfp8_probe_quant_error=mxfp8_probe_quant_error,
-            mxfp8_rotation_enable=mxfp8_rotation_enable,
-            mxfp8_rotation_kind=mxfp8_rotation_kind,
-            mxfp8_rotation_block_size=mxfp8_rotation_block_size,
-            mxfp8_rotation_seed=mxfp8_rotation_seed,
-            mxfp8_rotation_targets=mxfp8_rotation_targets,
-            mxfp8_fake_quant_targets=mxfp8_fake_quant_targets,
-            mxfp8_backward_reduction_axis_fake_quant=mxfp8_backward_reduction_axis_fake_quant,
+            quant_backend=quant_backend,
+            rounding_mode=rounding_mode,
+            probe_quant_error=probe_quant_error,
+            rotation_enable=rotation_enable,
+            rotation_kind=rotation_kind,
+            rotation_block_size=rotation_block_size,
+            rotation_seed=rotation_seed,
+            rotation_targets=rotation_targets,
+            fake_quant_targets=fake_quant_targets,
+            backward_reduction_axis_fake_quant=backward_reduction_axis_fake_quant,
             layer_name=layer_name,
             layer_type=layer_type,
             layer_index=layer_index,
@@ -903,7 +994,7 @@ class MXFP8QATLinear(nn.Linear):
         self._last_input_scale = None
 
     def _record_quant_error(self, error_type: str, original: torch.Tensor, quantized: torch.Tensor):
-        if not self.mxfp8_probe_quant_error:
+        if not self.probe_quant_error:
             return
 
         diff = (quantized.to(torch.float32) - original.detach().to(torch.float32)).abs()
@@ -914,18 +1005,18 @@ class MXFP8QATLinear(nn.Linear):
             error_sum=diff.sum().item(),
             element_count=diff.numel(),
             qat_mode=self.mode.value,
-            quant_backend=self.mxfp8_quant_backend,
-            rounding_mode=self.mxfp8_rounding_mode,
+            quant_backend=self.quant_backend,
+            rounding_mode=self.rounding_mode,
         )
 
     def _fake_quantize_weight(self, weight: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            weight_q, weight_scale = quantize_mxfp8_tensor(
-                weight, quant_backend=self.mxfp8_quant_backend, rounding_mode=self.mxfp8_rounding_mode
+            weight_q, weight_scale = self.weight_quantizer(
+                weight, quant_backend=self.quant_backend, rounding_mode=self.rounding_mode
             )
             self._last_weight_scale = weight_scale.detach()
             weight_fq = _dequantize_mxfp8(weight_q, weight_scale, weight.dtype)
-            if self.mxfp8_probe_quant_error:
+            if self.probe_quant_error:
                 self._record_quant_error("weight", weight, weight_fq)
                 return weight
         return weight + (weight_fq - weight).detach()
@@ -936,7 +1027,7 @@ class MXFP8QATLinear(nn.Linear):
         return apply_mxfp8_block_rotation(tensor, self.mxfp8_rotation_config)
 
     def _fake_quant_target_enabled(self, target: str) -> bool:
-        return _is_mxfp8_fake_quant_target(self.mxfp8_fake_quant_targets, target)
+        return _is_mxfp8_fake_quant_target(self.fake_quant_targets, target)
 
     def _gradient_transform_enabled(self, target: str) -> bool:
         return is_mxfp8_rotation_target(self.mxfp8_rotation_config, target) or self._fake_quant_target_enabled(target)
@@ -945,12 +1036,10 @@ class MXFP8QATLinear(nn.Linear):
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
         with torch.no_grad():
-            x_q, x_scale = quantize_mxfp8_tensor(
-                x_2d, quant_backend=self.mxfp8_quant_backend, rounding_mode="rint"
-            )
+            x_q, x_scale = self.activation_quantizer(x_2d, quant_backend=self.quant_backend, rounding_mode="rint")
             self._last_input_scale = x_scale.detach().reshape(*original_shape[:-1], x_scale.shape[-1])
             x_fq = _dequantize_mxfp8(x_q, x_scale, x.dtype).reshape(original_shape)
-            if self.mxfp8_probe_quant_error:
+            if self.probe_quant_error:
                 self._record_quant_error("activation", x, x_fq)
                 return x
         return x + (x_fq - x).detach()
@@ -965,34 +1054,34 @@ class MXFP8QATLinear(nn.Linear):
         weight_fq = self._fake_quantize_weight(rotated_weight) if apply_fprop_fake_quant else rotated_weight
         x_fq = (
             self._fake_quantize_activation(rotated_x)
-            if apply_fprop_fake_quant and self.mode == QATMode.W8A8_MXFP8
+            if apply_fprop_fake_quant and self.quantize_activation
             else rotated_x
         )
-        fprop_weight_fake_quantized = apply_fprop_fake_quant and not self.mxfp8_probe_quant_error
+        fprop_weight_fake_quantized = apply_fprop_fake_quant and not self.probe_quant_error
         fprop_activation_fake_quantized = (
-            apply_fprop_fake_quant and self.mode == QATMode.W8A8_MXFP8 and not self.mxfp8_probe_quant_error
+            apply_fprop_fake_quant and self.quantize_activation and not self.probe_quant_error
         )
         _warn_mxfp8_runtime_once(
             (
                 "qat_forward",
                 self.mode.value,
-                self.mxfp8_quant_backend,
-                self.mxfp8_rounding_mode,
-                self.mxfp8_probe_quant_error,
+                self.quant_backend,
+                self.rounding_mode,
+                self.probe_quant_error,
                 self.mxfp8_rotation_config.enable,
-                self.mxfp8_fake_quant_targets,
+                self.fake_quant_targets,
             ),
-            "MXFP8 QAT training forward executed: mode=%s, layer=%s, quant_backend=%s, "
+            "MXFP QAT training forward executed: mode=%s, layer=%s, quant_backend=%s, "
             "rounding_mode=%s, fake_quant_targets=%s, weight_fake_quant=%s, activation_fake_quant=%s, "
             "probe_quant_error=%s, rotation_enable=%s, input_shape=%s",
             self.mode.value,
             self._mxfp8_layer_name,
-            self.mxfp8_quant_backend,
-            self.mxfp8_rounding_mode,
-            self.mxfp8_fake_quant_targets,
+            self.quant_backend,
+            self.rounding_mode,
+            self.fake_quant_targets,
             apply_fprop_fake_quant,
-            apply_fprop_fake_quant and self.mode == QATMode.W8A8_MXFP8,
-            self.mxfp8_probe_quant_error,
+            apply_fprop_fake_quant and self.quantize_activation,
+            self.probe_quant_error,
             self.mxfp8_rotation_config.enable,
             tuple(x.shape),
         )
@@ -1001,22 +1090,24 @@ class MXFP8QATLinear(nn.Linear):
         ):
             dgrad_weight_operand = None
             wgrad_input_operand_t = None
-            if self.mxfp8_backward_reduction_axis_fake_quant:
+            if self.backward_reduction_axis_fake_quant:
                 if self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_DGRAD):
                     dgrad_weight_operand = _prepare_dgrad_weight_operand(
                         rotated_weight,
                         self.mxfp8_rotation_config,
-                        self.mxfp8_fake_quant_targets,
-                        self.mxfp8_quant_backend,
-                        self.mxfp8_rounding_mode,
+                        self.fake_quant_targets,
+                        self.quant_backend,
+                        self.rounding_mode,
+                        quantize_fn=self.weight_quantizer,
                     )
                 if self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_WGRAD):
                     wgrad_input_operand_t = _prepare_wgrad_input_operand_t(
                         rotated_x,
                         self.mxfp8_rotation_config,
-                        self.mxfp8_fake_quant_targets,
-                        self.mxfp8_quant_backend,
-                        self.mxfp8_rounding_mode,
+                        self.fake_quant_targets,
+                        self.quant_backend,
+                        self.rounding_mode,
+                        quantize_fn=self.activation_quantizer,
                     )
             return linear_with_gradient_rotation(
                 x_fq,
@@ -1025,9 +1116,11 @@ class MXFP8QATLinear(nn.Linear):
                 self.mxfp8_rotation_config,
                 dgrad_weight_operand=dgrad_weight_operand,
                 wgrad_input_operand_t=wgrad_input_operand_t,
-                fake_quant_targets=self.mxfp8_fake_quant_targets,
-                quant_backend=self.mxfp8_quant_backend,
-                rounding_mode=self.mxfp8_rounding_mode,
+                fake_quant_targets=self.fake_quant_targets,
+                quant_backend=self.quant_backend,
+                rounding_mode=self.rounding_mode,
+                quantize_fn=self.activation_quantizer,
+                weight_quantize_fn=self.weight_quantizer,
                 skip_dgrad_weight_fake_quant=fprop_weight_fake_quantized,
                 skip_wgrad_input_fake_quant=fprop_activation_fake_quantized,
             )
@@ -1037,15 +1130,15 @@ class MXFP8QATLinear(nn.Linear):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, mode={self.mode.value}, "
-            f"group_size={self.group_size}, mxfp8_quant_backend={self.mxfp8_quant_backend}, "
-            f"mxfp8_rounding_mode={self.mxfp8_rounding_mode}, "
-            f"mxfp8_fake_quant_targets={self.mxfp8_fake_quant_targets}, "
-            f"mxfp8_backward_reduction_axis_fake_quant={self.mxfp8_backward_reduction_axis_fake_quant}, "
-            f"mxfp8_rotation_enable={self.mxfp8_rotation_config.enable}, "
-            f"mxfp8_rotation_targets={self.mxfp8_rotation_config.targets}, "
-            f"mxfp8_rotation_kind={self.mxfp8_rotation_config.kind}, "
-            f"mxfp8_rotation_block_size={self.mxfp8_rotation_config.block_size}, "
-            f"mxfp8_rotation_seed={self.mxfp8_rotation_config.seed}, "
-            f"mxfp8_probe_quant_error={self.mxfp8_probe_quant_error}, "
+            f"group_size={self.group_size}, quant_backend={self.quant_backend}, "
+            f"rounding_mode={self.rounding_mode}, "
+            f"fake_quant_targets={self.fake_quant_targets}, "
+            f"backward_reduction_axis_fake_quant={self.backward_reduction_axis_fake_quant}, "
+            f"rotation_enable={self.mxfp8_rotation_config.enable}, "
+            f"rotation_targets={self.mxfp8_rotation_config.targets}, "
+            f"rotation_kind={self.mxfp8_rotation_config.kind}, "
+            f"rotation_block_size={self.mxfp8_rotation_config.block_size}, "
+            f"rotation_seed={self.mxfp8_rotation_config.seed}, "
+            f"probe_quant_error={self.probe_quant_error}, "
             f"fake_quant_enabled={self.fake_quant_enabled}"
         )

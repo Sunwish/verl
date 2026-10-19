@@ -76,20 +76,20 @@ actor_rollout_ref:
         - lm_head
         - '*mlp.gate'
         activation_observer: null
-        mxfp8_quant_backend: npu
-        mxfp8_rounding_mode: rint
-        mxfp8_fake_quant_targets:
+        quant_backend: npu
+        rounding_mode: rint
+        fake_quant_targets:
         - Fprop
-        mxfp8_backward_reduction_axis_fake_quant: false
+        backward_reduction_axis_fake_quant: false
         fallback_layers: null
-        mxfp8_probe_quant_error: false
-        mxfp8_probe_quant_error_output_path: null
-        mxfp8_rotation_enable: false
-        mxfp8_rotation_targets:
+        probe_quant_error: false
+        probe_quant_error_output_path: null
+        rotation_enable: false
+        rotation_targets:
         - Fprop
-        mxfp8_rotation_kind: block_hadamard_sign
-        mxfp8_rotation_block_size: 32
-        mxfp8_rotation_seed: 0
+        rotation_kind: block_hadamard_sign
+        rotation_block_size: 32
+        rotation_seed: 0
         quantization_config_path: null
     _target_: verl.workers.config.McoreActorConfig
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
@@ -185,20 +185,20 @@ actor_rollout_ref:
       activation_observer: static_minmax
       experts:
         enable: false
-      mxfp8_quant_backend: npu
-      mxfp8_rounding_mode: rint
-      mxfp8_fake_quant_targets:
+      quant_backend: npu
+      rounding_mode: rint
+      fake_quant_targets:
       - Fprop
-      mxfp8_backward_reduction_axis_fake_quant: false
+      backward_reduction_axis_fake_quant: false
       fallback_layers: null
-      mxfp8_probe_quant_error: false
-      mxfp8_probe_quant_error_output_path: null
-      mxfp8_rotation_enable: false
-      mxfp8_rotation_targets:
+      probe_quant_error: false
+      probe_quant_error_output_path: null
+      rotation_enable: false
+      rotation_targets:
       - Fprop
-      mxfp8_rotation_kind: block_hadamard_sign
-      mxfp8_rotation_block_size: 32
-      mxfp8_rotation_seed: 0
+      rotation_kind: block_hadamard_sign
+      rotation_block_size: 32
+      rotation_seed: 0
       quantization_config_path: null
     load_weight: true
   ref:
@@ -289,20 +289,20 @@ actor_rollout_ref:
         - lm_head
         - '*mlp.gate'
         activation_observer: null
-        mxfp8_quant_backend: npu
-        mxfp8_rounding_mode: rint
-        mxfp8_fake_quant_targets:
+        quant_backend: npu
+        rounding_mode: rint
+        fake_quant_targets:
         - Fprop
-        mxfp8_backward_reduction_axis_fake_quant: false
+        backward_reduction_axis_fake_quant: false
         fallback_layers: null
-        mxfp8_probe_quant_error: false
-        mxfp8_probe_quant_error_output_path: null
-        mxfp8_rotation_enable: false
-        mxfp8_rotation_targets:
+        probe_quant_error: false
+        probe_quant_error_output_path: null
+        rotation_enable: false
+        rotation_targets:
         - Fprop
-        mxfp8_rotation_kind: block_hadamard_sign
-        mxfp8_rotation_block_size: 32
-        mxfp8_rotation_seed: 0
+        rotation_kind: block_hadamard_sign
+        rotation_block_size: 32
+        rotation_seed: 0
         quantization_config_path: null
     _target_: verl.workers.config.McoreActorConfig
     load_weight: true
@@ -434,15 +434,15 @@ actor_rollout_ref:
     bootstrap_model_path: null
     quantization: null
     quantization_config_file: null
-    mxfp8_quant_backend: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_quant_backend,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_quant_backend,"npu"}}
-    mxfp8_rounding_mode: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rounding_mode,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rounding_mode,"rint"}}
-    mxfp8_fake_quant_targets: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_fake_quant_targets,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_fake_quant_targets,null}}
-    mxfp8_rotation_enable: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_enable,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_enable,false}}
-    mxfp8_rotation_targets: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_targets,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_targets,null}}
-    mxfp8_rotation_kind: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_kind,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_kind,"block_hadamard_sign"}}
-    mxfp8_rotation_block_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_block_size,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_block_size,32}}
-    mxfp8_rotation_seed: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.mxfp8_rotation_seed,${oc.select:actor_rollout_ref.actor.megatron.qat.mxfp8_rotation_seed,0}}
-    mxfp8_group_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.group_size,${oc.select:actor_rollout_ref.actor.megatron.qat.group_size,32}}
+    quant_backend: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.quant_backend,${oc.select:actor_rollout_ref.actor.megatron.qat.quant_backend,"npu"}}
+    rounding_mode: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.rounding_mode,${oc.select:actor_rollout_ref.actor.megatron.qat.rounding_mode,"rint"}}
+    fake_quant_targets: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.fake_quant_targets,${oc.select:actor_rollout_ref.actor.megatron.qat.fake_quant_targets,null}}
+    rotation_enable: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.rotation_enable,${oc.select:actor_rollout_ref.actor.megatron.qat.rotation_enable,false}}
+    rotation_targets: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.rotation_targets,${oc.select:actor_rollout_ref.actor.megatron.qat.rotation_targets,null}}
+    rotation_kind: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.rotation_kind,${oc.select:actor_rollout_ref.actor.megatron.qat.rotation_kind,"block_hadamard_sign"}}
+    rotation_block_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.rotation_block_size,${oc.select:actor_rollout_ref.actor.megatron.qat.rotation_block_size,32}}
+    rotation_seed: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.rotation_seed,${oc.select:actor_rollout_ref.actor.megatron.qat.rotation_seed,0}}
+    group_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat.group_size,${oc.select:actor_rollout_ref.actor.megatron.qat.group_size,32}}
     mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
     qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
     disaggregation:
@@ -624,20 +624,20 @@ critic:
       - lm_head
       - '*mlp.gate'
       activation_observer: null
-      mxfp8_quant_backend: npu
-      mxfp8_rounding_mode: rint
-      mxfp8_fake_quant_targets:
+      quant_backend: npu
+      rounding_mode: rint
+      fake_quant_targets:
       - Fprop
-      mxfp8_backward_reduction_axis_fake_quant: false
+      backward_reduction_axis_fake_quant: false
       fallback_layers: null
-      mxfp8_probe_quant_error: false
-      mxfp8_probe_quant_error_output_path: null
-      mxfp8_rotation_enable: false
-      mxfp8_rotation_targets:
+      probe_quant_error: false
+      probe_quant_error_output_path: null
+      rotation_enable: false
+      rotation_targets:
       - Fprop
-      mxfp8_rotation_kind: block_hadamard_sign
-      mxfp8_rotation_block_size: 32
-      mxfp8_rotation_seed: 0
+      rotation_kind: block_hadamard_sign
+      rotation_block_size: 32
+      rotation_seed: 0
       quantization_config_path: null
   _target_: verl.workers.config.McoreCriticConfig
   rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}

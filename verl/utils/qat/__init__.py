@@ -15,7 +15,7 @@
 """
 QAT (Quantization-Aware Training) module for verl.
 
-Supports NVFP4 (W4A4 and W4A16) and MXFP8 (W8A16 and W8A8) quantization modes for FSDP training.
+Supports NVFP4 (W4A4/W4A16), MXFP8 (W8A16/W8A8), and MXFP4 (W4A8/W4A4) for FSDP training.
 
 Module Structure:
 - core.py: QATConfig, apply_qat, enable_qat_fuse (training setup)
@@ -45,8 +45,10 @@ from verl.utils.qat.core import (
 )
 from verl.utils.qat.mxfp8_linear import (
     configure_mxfp8_probe,
+    dequantize_mxfp4_tensor,
     mxfp8_probe_step_context,
     normalize_mxfp8_fake_quant_targets,
+    quantize_mxfp4_tensor,
     reset_mxfp8_probe,
     set_mxfp8_probe_step,
 )
@@ -69,6 +71,8 @@ __all__ = [
     "enable_qat_fuse",
     "invalidate_all_scales",
     "configure_mxfp8_probe",
+    "quantize_mxfp4_tensor",
+    "dequantize_mxfp4_tensor",
     "mxfp8_probe_step_context",
     "normalize_mxfp8_fake_quant_targets",
     "reset_mxfp8_probe",

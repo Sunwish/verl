@@ -36,11 +36,13 @@ from verl.utils.qat.mxfp8_rotation import (
     MXFP8_ROTATION_ENABLE_KEY,
     MXFP8_ROTATION_KIND_KEY,
     MXFP8_ROTATION_SEED_KEY,
-    MXFP8_ROTATION_TARGETS_KEY,
     MXFP8_ROTATION_TARGET_FPROP,
+    MXFP8_ROTATION_TARGETS_KEY,
     apply_mxfp8_block_rotation,
-    get_mxfp8_rotation_config as parse_mxfp8_rotation_config,
     is_mxfp8_rotation_target,
+)
+from verl.utils.qat.mxfp8_rotation import (
+    get_mxfp8_rotation_config as parse_mxfp8_rotation_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -269,8 +271,8 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16, stats: dic
     fp8_state.seen_params.clear()
     fp8_state.fp8_param_names.clear()
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
-    mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu")
-    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="rint") if is_mxfp8_npu else "rint"
+    quant_backend = get_mxfp8_quant_backend(default="npu")
+    rounding_mode = get_mxfp8_rounding_mode(default="rint") if is_mxfp8_npu else "rint"
     rotation_config = get_mxfp8_rotation_config(getattr(quant_config, "quant_description", {}) or {})
     if (
         is_mxfp8_npu
@@ -307,8 +309,8 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16, stats: dic
             param_lp, param_scale = quantize_mxfp8_weight_ascend(
                 v,
                 dtype,
-                quant_backend=mxfp8_quant_backend,
-                rounding_mode=mxfp8_rounding_mode,
+                quant_backend=quant_backend,
+                rounding_mode=rounding_mode,
             )
         else:
             param_lp, param_scale = scaled_fp8_blockwise(
@@ -352,8 +354,8 @@ def load_quanted_weights(weights, model_runner, is_drafter=False, return_stats=F
     vllm_dtype = model_runner.vllm_config.model_config.dtype
 
     is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
-    mxfp8_quant_backend = get_mxfp8_quant_backend(default="npu") if is_mxfp8_npu else None
-    mxfp8_rounding_mode = get_mxfp8_rounding_mode(default="rint") if is_mxfp8_npu else None
+    quant_backend = get_mxfp8_quant_backend(default="npu") if is_mxfp8_npu else None
+    rounding_mode = get_mxfp8_rounding_mode(default="rint") if is_mxfp8_npu else None
     rotation_config = get_mxfp8_rotation_config(getattr(quant_config, "quant_description", {}) or {})
     quant_stats = {
         "is_mxfp8": is_mxfp8_npu,
@@ -361,8 +363,8 @@ def load_quanted_weights(weights, model_runner, is_drafter=False, return_stats=F
         "quantized_tensor_count": 0,
         "scale_tensor_count": 0,
         "passthrough_tensor_count": 0,
-        "quant_backend": mxfp8_quant_backend,
-        "rounding_mode": mxfp8_rounding_mode,
+        "quant_backend": quant_backend,
+        "rounding_mode": rounding_mode,
         "rotation_enable": rotation_config.enable,
         "rotation_targets": rotation_config.targets,
         "rotation_kind": rotation_config.kind,

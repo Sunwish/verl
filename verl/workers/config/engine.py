@@ -20,12 +20,9 @@ from typing import Any, Callable, Literal, Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
-from verl.utils.qat.core import QATExpertsConfig, normalize_mxfp8_fallback_layers
+from verl.utils.qat.core import QATConfig, QATExpertsConfig
 from verl.utils.qat.mxfp8_rotation import (
     MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN,
-    MXFP8RotationConfig,
-    normalize_mxfp8_rotation_targets,
-    validate_mxfp8_rotation_config,
 )
 
 from ...utils.profiler import ProfilerConfig
@@ -138,17 +135,17 @@ class QATEngineConfig(BaseConfig):
 
     Args:
         enable (bool): Whether to enable QAT, default False
-        mode (str): Quantization mode, "w4a16", "w4a4", "w8a16_mxfp8", or "w8a8_mxfp8", default "w4a16"
+        mode (str): NVFP4, MXFP8, or MXFP4 QAT mode; default "w4a16"
         group_size (int): Group size for blockwise quantization, default 16
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         experts (QATExpertsConfig): Expert-layer QAT sub-configuration
-        mxfp8_quant_backend (str): MXFP8 quantization backend, "npu" or "torch"
-        mxfp8_rounding_mode (str): MXFP8 rounding mode, "rint", "round", "random", or "hash"
-        mxfp8_fake_quant_targets (list[str]): MXFP8 fake quant targets, Fprop, Dgrad, and/or Wgrad
-        mxfp8_backward_reduction_axis_fake_quant (bool): Use backward reduction-axis operands for MXFP8 Dgrad/Wgrad
-        mxfp8_probe_quant_error (bool): Whether to log MXFP8 quantization error probes
-        mxfp8_probe_quant_error_output_path (Optional[str]): JSONL file path for MXFP8 probe logs
+        quant_backend (str): MXFP backend, "npu" or "torch"; MXFP4 requires "torch"
+        rounding_mode (str): MXFP rounding mode, "rint", "round", "random", or "hash"
+        fake_quant_targets (list[str]): MXFP fake quant targets, Fprop, Dgrad, and/or Wgrad
+        backward_reduction_axis_fake_quant (bool): Use backward reduction-axis operands for MXFP Dgrad/Wgrad
+        probe_quant_error (bool): Whether to log MXFP quantization error probes
+        probe_quant_error_output_path (Optional[str]): JSONL file path for MXFP probe logs
         fallback_layers (str | list): Inclusive layer ranges to keep in high precision, such as "0-3,37-48"
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
     """
@@ -158,73 +155,24 @@ class QATEngineConfig(BaseConfig):
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
-    mxfp8_quant_backend: str = "npu"
-    mxfp8_rounding_mode: str = "rint"
-    mxfp8_probe_quant_error: bool = False
-    mxfp8_probe_quant_error_output_path: Optional[str] = None
-    mxfp8_rotation_enable: bool = False
-    mxfp8_rotation_kind: str = MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN
-    mxfp8_rotation_block_size: int = 32
-    mxfp8_rotation_seed: int = 0
-    mxfp8_rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
-    mxfp8_fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
-    mxfp8_backward_reduction_axis_fake_quant: bool = False
+    quant_backend: str = "npu"
+    rounding_mode: str = "rint"
+    probe_quant_error: bool = False
+    probe_quant_error_output_path: Optional[str] = None
+    rotation_enable: bool = False
+    rotation_kind: str = MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN
+    rotation_block_size: int = 32
+    rotation_seed: int = 0
+    rotation_targets: list[str] = field(default_factory=lambda: ["Fprop"])
+    fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
+    backward_reduction_axis_fake_quant: bool = False
     fallback_layers: Any = None
     experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
     quantization_config_path: Optional[str] = None
 
     def __post_init__(self):
-        from verl.utils.qat.core import _coerce_qat_experts_config
-
-        object.__setattr__(self, "experts", _coerce_qat_experts_config(getattr(self, "experts", None)))
-        object.__setattr__(
-            self,
-            "fallback_layers",
-            [list(layer_range) for layer_range in normalize_mxfp8_fallback_layers(self.fallback_layers)],
-        )
-        object.__setattr__(
-            self,
-            "mxfp8_rotation_targets",
-            list(normalize_mxfp8_rotation_targets(self.mxfp8_rotation_targets)),
-        )
-        object.__setattr__(
-            self,
-            "mxfp8_fake_quant_targets",
-            list(normalize_mxfp8_rotation_targets(self.mxfp8_fake_quant_targets)),
-        )
-        mxfp8_rounding_mode = self.mxfp8_rounding_mode.lower()
-        if mxfp8_rounding_mode not in {"rint", "round", "random", "hash"}:
-            raise ValueError(
-                f"Unsupported MXFP8 rounding mode: {self.mxfp8_rounding_mode}. "
-                "Supported modes: ['hash', 'random', 'rint', 'round']"
-            )
-        if (
-            self.enable
-            and self.mode.lower() in {"w8a16_mxfp8", "w8a8_mxfp8"}
-            and mxfp8_rounding_mode in {"random", "hash"}
-            and self.mxfp8_quant_backend.lower() != "torch"
-        ):
-            raise ValueError("MXFP8 stochastic rounding modes require mxfp8_quant_backend='torch'")
-        if self.enable and self.fallback_layers and self.mode.lower() not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
-            raise ValueError("fallback_layers only supports w8a16_mxfp8/w8a8_mxfp8 modes")
-        if self.mxfp8_probe_quant_error:
-            if not self.enable:
-                raise ValueError("mxfp8_probe_quant_error requires QAT enable=True")
-            if self.mode.lower() not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
-                raise ValueError("mxfp8_probe_quant_error only supports w8a16_mxfp8/w8a8_mxfp8 modes")
-            if not self.mxfp8_probe_quant_error_output_path:
-                raise ValueError("mxfp8_probe_quant_error_output_path is required when mxfp8_probe_quant_error=True")
-        rotation_config = MXFP8RotationConfig(
-            enable=self.mxfp8_rotation_enable,
-            kind=self.mxfp8_rotation_kind,
-            block_size=self.mxfp8_rotation_block_size,
-            seed=self.mxfp8_rotation_seed,
-            targets=tuple(self.mxfp8_rotation_targets),
-        )
-        if rotation_config.enable:
-            if self.mode.lower() not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
-                raise ValueError("mxfp8_rotation_enable only supports w8a16_mxfp8/w8a8_mxfp8 modes")
-            validate_mxfp8_rotation_config(rotation_config, group_size=self.group_size)
+        # Keep engine and direct QAT entry points on the same validation contract.
+        QATConfig.__post_init__(self)
 
 
 @dataclass

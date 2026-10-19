@@ -73,9 +73,11 @@ qat:
 
   # Quantization mode: "w4a16" (weight-only). "w4a4" is experimental and not recommended.
   # MXFP8 modes: "w8a16_mxfp8" (weight-only), "w8a8_mxfp8" (weight + activation).
+  # MXFP4 modes: "w4a8_mxfp4" (FP4/FP8), "w4a4_mxfp4" (FP4/FP4).
+  # MXFP4 requires group_size=32 and quant_backend="torch".
   mode: "w4a16"
 
-  # Quantization group size (NVFP4 requires 16, MXFP8 requires 32)
+  # Quantization group size (NVFP4 requires 16, MXFP8/MXFP4 requires 32)
   group_size: 16
 
   # Patterns to ignore (e.g., lm_head, embed_tokens)
@@ -96,18 +98,18 @@ qat:
 
   # MXFP8 quantization backend: "npu" uses torch_npu, and "torch" uses verl's torch implementation.
   # Future optimized variants can be added here.
-  mxfp8_quant_backend: "npu"
+  quant_backend: "npu"
 
   # MXFP8 rounding mode for the torch backend: "rint", "round", "random", or "hash".
-  # Stochastic modes require mxfp8_quant_backend: "torch".
-  mxfp8_rounding_mode: "rint"
+  # Stochastic modes require quant_backend: "torch".
+  rounding_mode: "rint"
 
   # Select fake-quant targets: Fprop, Dgrad, and/or Wgrad. Defaults to Fprop only.
-  mxfp8_fake_quant_targets: ["Fprop"]
+  fake_quant_targets: ["Fprop"]
 
   # When true, Dgrad/Wgrad use MXFP8 fake-quantized operands prepared along each backward matmul reduction axis.
   # Defaults to false to preserve the historical Fprop-operand reuse behavior.
-  mxfp8_backward_reduction_axis_fake_quant: false
+  backward_reduction_axis_fake_quant: false
 
   # Inclusive transformer layer ranges to keep in high precision, e.g. "0-3,37-48".
   # All linear and MoE submodules under these layers skip MXFP8 QAT and rollout fake quantization.
@@ -117,25 +119,25 @@ qat:
   # When true, MXFP8 QAT layers log per-layer weight/activation quantization errors
   # while matmul still uses the original high-precision tensors.
   # Activation errors are emitted when mode is "w8a8_mxfp8".
-  mxfp8_probe_quant_error: false
+  probe_quant_error: false
 
   # JSONL file path for MXFP8 probe records.
-  mxfp8_probe_quant_error_output_path: null
+  probe_quant_error_output_path: null
 
   # Enable global block-wise Hadamard/random-sign rotation before MXFP8 quantization.
-  mxfp8_rotation_enable: false
+  rotation_enable: false
 
   # Select rotation targets: Fprop, Dgrad, and/or Wgrad. Defaults to Fprop only.
-  mxfp8_rotation_targets: ["Fprop"]
+  rotation_targets: ["Fprop"]
 
   # Rotation implementation. First supported mode repeats one 32x32 block along the hidden dimension.
-  mxfp8_rotation_kind: "block_hadamard_sign"
+  rotation_kind: "block_hadamard_sign"
 
   # Must match MXFP8 group_size for the first implementation.
-  mxfp8_rotation_block_size: 32
+  rotation_block_size: 32
 
   # Deterministic random sign seed for the global 32x32 block.
-  mxfp8_rotation_seed: 0
+  rotation_seed: 0
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
