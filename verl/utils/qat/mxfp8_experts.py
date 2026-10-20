@@ -556,7 +556,21 @@ class MXFP8QATExperts(nn.Module):
             )
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
+        
+        if (
+            torch.is_grad_enabled()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+            and not getattr(MXFP8QATExperts, "_qat_probe_python_logged", False)
+        ):
+            MXFP8QATExperts._qat_probe_python_logged = True
+            print(
+                f"[QAT_PATH] PYTHON_EXPERTS_GRAD_FWD training={self.training} "
+                f"apply_fake_quant={apply_fake_quant} "
+                f"targets={getattr(self, 'fake_quant_targets', None)}",
+                flush=True,
+            )
+        
         return final_hidden_states
 
     def forward(

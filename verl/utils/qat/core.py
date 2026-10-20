@@ -432,13 +432,13 @@ def apply_qat(
         config = QATConfig(**config)
 
     if not config.enable:
-        logger.info("QAT is disabled, returning original model")
+        logger.warning("QAT is disabled, returning original model")
         return model
 
     mode, qat_linear_cls = _get_qat_linear_cls(config.mode)
     if mode.value in _MXFP_MODES and config.group_size != 32:
         raise ValueError(f"MXFP QAT requires group_size=32, got: {config.group_size}")
-    logger.info(
+    logger.warning(
         f"Applying QAT with mode={mode.value}, group_size={config.group_size}, "
         f"rounding_mode={config.rounding_mode}, experts_enable={config.experts.enable}, "
         f"fallback_layers={config.fallback_layers}"
@@ -491,7 +491,7 @@ def apply_qat(
         if _should_quantize_linear(name, module, config, effective_ignore_patterns):
             linear_modules_to_replace.append((name, module))
 
-    logger.info(
+    logger.warning(
         "Found %s linear layers and %s packed expert blocks to convert to QAT",
         len(linear_modules_to_replace),
         len(packed_expert_modules_to_replace),
@@ -561,7 +561,7 @@ def apply_qat(
             logger.warning("apply_qat _set_module: %s", name)
             converted_count += 1
 
-    logger.info(f"Successfully applied QAT to {converted_count} layers")
+    logger.warning(f"Successfully applied QAT to {converted_count} layers")
     if mode.value in _MXFP_MODES:
         logger.warning(
             "MXFP QAT applied to training model: mode=%s, converted_layers=%s, quant_backend=%s, "

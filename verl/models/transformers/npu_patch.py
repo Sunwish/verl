@@ -105,6 +105,18 @@ class NPUGmmFunction(torch.autograd.Function):
             [x], [weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=group_list_type
         )[0]
 
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+            and not getattr(NPUGmmFunction, "_qat_probe_fwd_logged", False)
+        ):
+            NPUGmmFunction._qat_probe_fwd_logged = True
+            print(
+                f"[QAT_PATH] NPU_GMM_FWD x={tuple(x.shape)} "
+                f"weight={tuple(weight.shape)} dtype={x.dtype} device={x.device}",
+                flush=True,
+            )
+
         return output
 
     @staticmethod
@@ -133,6 +145,18 @@ class NPUGmmFunction(torch.autograd.Function):
             group_list_type=group_list_type,
         )[0]
 
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+            and not getattr(NPUGmmFunction, "_qat_probe_bwd_logged", False)
+        ):
+            NPUGmmFunction._qat_probe_bwd_logged = True
+            print(
+                f"[QAT_PATH] NPU_GMM_BWD grad_output={tuple(grad_output.shape)} "
+                f"dx={tuple(dx.shape)} dw={tuple(dw.shape)} dtype={grad_output.dtype}",
+                flush=True,
+            )
+        
         return dx, dw, None, None
 
 
