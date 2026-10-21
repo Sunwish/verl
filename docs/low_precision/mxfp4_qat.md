@@ -51,6 +51,7 @@ actor_rollout_ref.actor.fsdp_config.qat.rotation_enable=True \
 actor_rollout_ref.actor.fsdp_config.qat.rotation_targets='[Fprop]' \
 actor_rollout_ref.actor.fsdp_config.qat.fake_quant_targets='[Fprop]' \
 actor_rollout_ref.actor.fsdp_config.qat.experts.enable=True \
+actor_rollout_ref.actor.fsdp_config.qat.experts.npu_backend=grouped_matmul \
 actor_rollout_ref.actor.fsdp_config.qat.fallback_layers='[0,1]' \
 actor_rollout_ref.rollout.qat_fake_quant=True \
 actor_rollout_ref.rollout.quantization=null
@@ -59,6 +60,12 @@ actor_rollout_ref.rollout.quantization=null
 Change only `qat.mode=w4a4_mxfp4` to quantize activations to FP4 too. Rollout
 inherits actor mode, rotation, rounding, experts, ignore patterns, and fallback
 layers. Rollout fake quant can also run with actor QAT disabled.
+
+On NPU, packed QAT experts default to `experts.npu_backend=grouped_matmul`.
+Set `experts.npu_backend=python` to use the per-expert Python QAT loop instead.
+Both paths support W4A8/W4A4 Fprop/Dgrad/Wgrad fake quantization and block
+rotation; MXFP4 requires `quant_backend=torch` on either execution path. See
+[NPU packed experts](mxfp8_qat.md#npu-packed-experts) for scope and examples.
 
 The renamed keys apply to MXFP8 too: `quant_backend`, `rounding_mode`,
 `fake_quant_targets`, `backward_reduction_axis_fake_quant`, `probe_quant_error`,

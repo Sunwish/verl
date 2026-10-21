@@ -93,8 +93,11 @@ qat:
   # Expert-layer QAT configuration.
   experts:
 
-    # Whether to enable MXFP8 QAT for MoE expert compute. Dense layers still follow qat.enable.
+    # Whether to enable MXFP QAT for MoE expert compute. Dense layers still follow qat.enable.
     enable: false
+
+    # NPU packed QAT experts (Qwen3 MoE): "grouped_matmul" or per-expert "python".
+    npu_backend: grouped_matmul
 
   # MXFP8 quantization backend: "npu" uses torch_npu, and "torch" uses verl's torch implementation.
   # Future optimized variants can be added here.

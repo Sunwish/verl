@@ -167,7 +167,7 @@ def test_apply_qat_mxfp8_replaces_eligible_linear_layers(mode, caplog):
     assert model.proj.rounding_mode == "hash"
     assert isinstance(model.lm_head, nn.Linear)
     assert any(
-        "MXFP8 QAT applied to training model" in record.message
+        "MXFP QAT applied to training model" in record.message
         and f"mode={mode}" in record.message
         and "quant_backend=torch" in record.message
         and "rounding_mode=hash" in record.message
@@ -601,6 +601,147 @@ def test_mxfp8_qat_expert_wrapper_runs_forward_and_invalidate_all_scales():
     assert model.layers[0].mlp.experts._last_down_input_scale is None
 
 
+@pytest.mark.parametrize("mode", ["w8a16_mxfp8", "w8a8_mxfp8", "w4a8_mxfp4", "w4a4_mxfp4"])
+@pytest.mark.parametrize("backward_reduction_axis_fake_quant", [False, True])
+@pytest.mark.parametrize("rotation_targets", [(), ("fprop", "dgrad", "wgrad")])
+@pytest.mark.parametrize("fake_quant_targets", [("fprop", "dgrad", "wgrad"), ("dgrad", "wgrad")])
+def test_mxfp_qat_expert_grouped_backward_matches_python_path(
+    mode, backward_reduction_axis_fake_quant, rotation_targets, fake_quant_targets
+):
+    from types import SimpleNamespace
+
+    torch.manual_seed(7)
+    expert_count = 4
+    hidden_size = 32
+    intermediate_size = 32
+    # Top-2 routing with uneven expert segments and an empty expert.
+    expert_ids = torch.cat([torch.tensor([[0, 2]]).repeat(33, 1), torch.tensor([[0, 3]]).repeat(35, 1)])
+    input_tokens = expert_ids.shape[0]
+    # Keep the CPU GMM oracle independent of shape-dependent FP32 accumulation
+    # near FP4 rounding midpoints. Real NPU kernels still run in the model dtype.
+    source = torch.randn(input_tokens, hidden_size, dtype=torch.float64)
+    expert_ids = expert_ids[torch.randperm(input_tokens)]
+    routing_weights = torch.softmax(torch.randn(input_tokens, 2, dtype=source.dtype), dim=-1)
+    packed_gate_up = torch.randn(expert_count, 2 * intermediate_size, hidden_size, dtype=source.dtype)
+    packed_down = torch.randn(expert_count, hidden_size, intermediate_size, dtype=source.dtype)
+
+    def make_experts():
+        return MXFP8QATExperts(
+            num_experts=expert_count,
+            hidden_dim=hidden_size,
+            intermediate_dim=intermediate_size,
+            act_fn=F.silu,
+            gate_up_proj=packed_gate_up,
+            down_proj=packed_down,
+            mode=mode,
+            quant_backend="torch",
+            rounding_mode="rint",
+            fake_quant_targets=fake_quant_targets,
+            backward_reduction_axis_fake_quant=backward_reduction_axis_fake_quant,
+            rotation_enable=bool(rotation_targets),
+            rotation_targets=rotation_targets or ("fprop",),
+        )
+
+    def grouped_matmul(inputs, weights, *, group_list, split_item, group_type, **kwargs):
+        groups = group_list.to(torch.int64).tolist()
+        if split_item == 2:
+            pieces = []
+            offset = 0
+            for count, weight in zip(groups, weights[0], strict=True):
+                pieces.append(inputs[0][offset : offset + count] @ weight)
+                offset += count
+            return [torch.cat(pieces, dim=0)]
+
+        assert split_item == 3 and group_type == 2
+        pieces = []
+        offset = 0
+        for count in groups:
+            pieces.append(inputs[0][:, offset : offset + count] @ weights[0][offset : offset + count])
+            offset += count
+        return [torch.stack(pieces)]
+
+    def token_permute(hidden_states, selected_experts):
+        expert_ids = selected_experts.reshape(-1).to(torch.int64)
+        token_ids = torch.arange(hidden_states.shape[0]).repeat_interleave(selected_experts.shape[1])
+        order = torch.argsort(expert_ids, stable=True)
+        return hidden_states[token_ids[order]], order
+
+    def token_unpermute(hidden_states, row_ids_map, *, probs):
+        routed = hidden_states.new_zeros((row_ids_map.numel(), hidden_states.shape[-1]))
+        routed = routed.index_copy(0, row_ids_map.to(torch.int64), hidden_states)
+        routed = routed.view(probs.shape[0], probs.shape[1], -1)
+        return (routed * probs.unsqueeze(-1)).sum(dim=1)
+
+    torch_npu = SimpleNamespace(
+        npu_grouped_matmul=grouped_matmul,
+        npu_moe_token_permute=token_permute,
+        npu_moe_token_unpermute=token_unpermute,
+    )
+    python_experts = make_experts()
+    npu_experts = make_experts()
+    python_input = source.clone().requires_grad_()
+    npu_input = source.clone().requires_grad_()
+    python_probs = routing_weights.clone().requires_grad_()
+    npu_probs = routing_weights.clone().requires_grad_()
+
+    expected = python_experts(python_input, expert_ids, python_probs)
+    actual = npu_experts.forward_npu(npu_input, expert_ids, npu_probs, torch_npu)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+    upstream = torch.randn_like(expected)
+    (expected * upstream).sum().backward()
+    (actual * upstream).sum().backward()
+    torch.testing.assert_close(npu_input.grad, python_input.grad, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(npu_probs.grad, python_probs.grad, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(npu_experts.gate_up_proj.grad, python_experts.gate_up_proj.grad, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(npu_experts.down_proj.grad, python_experts.down_proj.grad, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("mode", ["w8a8_mxfp8", "w4a8_mxfp4", "w4a4_mxfp4"])
+def test_mxfp_qat_python_npu_backend_skips_npu_ops(mode):
+    from types import SimpleNamespace
+
+    torch.manual_seed(19)
+    model = _MoeModel()
+    apply_qat(
+        model,
+        QATConfig(
+            enable=True,
+            mode=mode,
+            group_size=32,
+            quant_backend="torch",
+            experts={"enable": True, "npu_backend": "python"},
+            fake_quant_targets=["Fprop", "Dgrad", "Wgrad"],
+            backward_reduction_axis_fake_quant=True,
+            rotation_enable=True,
+            rotation_targets=["Fprop", "Dgrad", "Wgrad"],
+        ),
+    )
+    experts = model.layers[0].mlp.experts
+    assert experts.npu_backend == "python"
+    source = torch.randn(5, 32, dtype=torch.bfloat16)
+    # Exercise top-2 routing and router-weight gradients, too.
+    selected = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0], [0, 1]])
+    probs = torch.rand(5, 2, dtype=torch.bfloat16)
+    expected_input = source.clone().requires_grad_()
+    expected_probs = probs.clone().requires_grad_()
+    expected = experts(expected_input, selected, expected_probs)
+    expected.float().sum().backward()
+    weight_grads = [experts.gate_up_proj.grad.clone(), experts.down_proj.grad.clone()]
+    experts.zero_grad(set_to_none=True)
+
+    actual_input = source.clone().requires_grad_()
+    actual_probs = probs.clone().requires_grad_()
+    # An empty namespace fails if this backend touches any NPU GMM/permutation op.
+    actual = experts.forward_npu(actual_input, selected, actual_probs, SimpleNamespace())
+    actual.float().sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+    torch.testing.assert_close(actual_probs.grad, expected_probs.grad)
+    torch.testing.assert_close(experts.gate_up_proj.grad, weight_grads[0])
+    torch.testing.assert_close(experts.down_proj.grad, weight_grads[1])
+
+
 def test_mxfp8_qat_expert_probe_splits_gate_up_proj_into_gate_and_up(tmp_path):
     model = _MoeModel()
     output_path = tmp_path / "mxfp8_expert_probe.jsonl"
@@ -923,7 +1064,8 @@ def test_mxfp4_apply_qat_experts_fallback_and_probe(mode, tmp_path):
     assert isinstance(model.layers[1].mlp.experts, _PackedExperts)
     expert = model.layers[0].mlp.experts
     x = torch.randn(3, 32, dtype=torch.bfloat16, requires_grad=True)
-    result = expert(x, torch.tensor([[0], [1], [0]]), torch.ones(3, 1, dtype=x.dtype))
+    with mxfp8_probe_step_context(1):
+        result = expert(x, torch.tensor([[0], [1], [0]]), torch.ones(3, 1, dtype=x.dtype))
     result.float().sum().backward()
     assert torch.isfinite(expert.gate_up_proj.grad).all()
     flush_mxfp8_probe()

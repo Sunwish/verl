@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from verl.utils.qat.linear import QATMode
+from verl.utils.qat.mxfp8_grouped_linear import GroupedLinearConfig, grouped_linear_with_gradient_rotation
 from verl.utils.qat.mxfp8_linear import (
     _dequantize_mxfp8,
     _infer_mxfp8_layer_index,
@@ -118,6 +119,7 @@ class MXFP8QATExperts(nn.Module):
         layer_index: Optional[int] = None,
         quantize_gate_up_proj: bool = True,
         quantize_down_proj: bool = True,
+        npu_backend: str = "grouped_matmul",
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -162,6 +164,9 @@ class MXFP8QATExperts(nn.Module):
         self._mxfp8_layer_index = layer_index if layer_index is not None else _infer_mxfp8_layer_index(layer_name)
         self._quantize_gate_up_proj = quantize_gate_up_proj
         self._quantize_down_proj = quantize_down_proj
+        if npu_backend not in {"grouped_matmul", "python"}:
+            raise ValueError(f"Unsupported expert NPU backend: {npu_backend!r}")
+        self.npu_backend = npu_backend
         self.fake_quant_enabled = True
         self._last_gate_up_scale: Optional[torch.Tensor] = None
         self._last_down_scale: Optional[torch.Tensor] = None
@@ -196,6 +201,7 @@ class MXFP8QATExperts(nn.Module):
         layer_index: Optional[int] = None,
         quantize_gate_up_proj: bool = True,
         quantize_down_proj: bool = True,
+        npu_backend: str = "grouped_matmul",
     ) -> MXFP8QATExperts:
         num_experts, hidden_dim, intermediate_dim = _infer_packed_expert_dimensions(module)
         return cls(
@@ -223,6 +229,7 @@ class MXFP8QATExperts(nn.Module):
             layer_index=layer_index,
             quantize_gate_up_proj=quantize_gate_up_proj,
             quantize_down_proj=quantize_down_proj,
+            npu_backend=npu_backend,
             device=getattr(module.gate_up_proj, "device", None),
             dtype=getattr(module.gate_up_proj, "dtype", None),
         )
@@ -461,6 +468,76 @@ class MXFP8QATExperts(nn.Module):
             down_weight.transpose(1, 2).to(input_dtype),
         )
 
+    def _forward_npu_projection(self, input, group_list, torch_npu, *, down=False):
+        """Use GMM with the same forward operands and backward settings as Python experts."""
+        quantize_projection = self._quantize_down_proj if down else self._quantize_gate_up_proj
+        apply_fake_quant = self.fake_quant_enabled and quantize_projection
+        weight_source = self._canonicalize_weight(
+            self.down_proj if down else self.gate_up_proj, kind="down_proj" if down else "gate_up_proj"
+        )
+        input_source = input
+        if apply_fake_quant:
+            input_source = self._rotate_if_enabled(input_source)
+            weight_source = self._rotate_if_enabled(weight_source)
+        weight = (
+            self._prepare_down_weight(self.fake_quant_enabled)
+            if down
+            else self._prepare_gate_up_weight(self.fake_quant_enabled)
+        )
+        if down:
+            prepared_input = self._prepare_down_input(input, self.fake_quant_enabled)
+        else:
+            prepared_input = self._prepare_gate_up_input(input, self.fake_quant_enabled)
+        fprop_quantized = (
+            apply_fake_quant
+            and self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_FPROP)
+            and not self.probe_quant_error
+        )
+        config = GroupedLinearConfig(
+            rotation_config=self.mxfp8_rotation_config,
+            fake_quant_targets=self.fake_quant_targets,
+            quant_backend=self.quant_backend,
+            rounding_mode=self.rounding_mode,
+            quantize_fn=self.activation_quantizer,
+            weight_quantize_fn=self.weight_quantizer,
+            dequantize_fn=self.dequantizer,
+            skip_dgrad_weight_fake_quant=fprop_quantized and not self.backward_reduction_axis_fake_quant,
+            skip_wgrad_input_fake_quant=(
+                fprop_quantized and self.quantize_activation and not self.backward_reduction_axis_fake_quant
+            ),
+        )
+        return grouped_linear_with_gradient_rotation(
+            prepared_input,
+            weight.to(input.dtype),
+            group_list,
+            config,
+            torch_npu.npu_grouped_matmul,
+            dgrad_weight_source=(
+                weight_source.to(input.dtype)
+                if self.backward_reduction_axis_fake_quant
+                and self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_DGRAD)
+                else None
+            ),
+            wgrad_input_source=(
+                input_source
+                if self.backward_reduction_axis_fake_quant
+                and self._fake_quant_target_enabled(MXFP8_ROTATION_TARGET_WGRAD)
+                else None
+            ),
+        )
+
+    def forward_npu(self, hidden_states, selected_experts, routing_weights, torch_npu):
+        """Run routed MXFP QAT experts with the configured NPU backend."""
+        if self.npu_backend == "python":
+            return self(hidden_states, selected_experts, routing_weights)
+        permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, selected_experts.to(torch.int32))
+        group_list = torch.histc(selected_experts.to(torch.float32), bins=self.num_experts, min=0, max=self.num_experts)
+        gate_up = self._forward_npu_projection(permuted_tokens, group_list, torch_npu)
+        gate, up = gate_up.chunk(2, dim=-1)
+        activated = self.act_fn(gate) * up
+        down = self._forward_npu_projection(activated, group_list, torch_npu, down=True)
+        return torch_npu.npu_moe_token_unpermute(down, row_ids_map, probs=routing_weights)
+
     def _prepare_forward_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -556,7 +633,7 @@ class MXFP8QATExperts(nn.Module):
             )
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-        
+
         if (
             torch.is_grad_enabled()
             and torch.distributed.is_initialized()
@@ -570,7 +647,7 @@ class MXFP8QATExperts(nn.Module):
                 f"targets={getattr(self, 'fake_quant_targets', None)}",
                 flush=True,
             )
-        
+
         return final_hidden_states
 
     def forward(
@@ -597,6 +674,7 @@ class MXFP8QATExperts(nn.Module):
             f"num_experts={self.num_experts}, hidden_dim={self.hidden_dim}, "
             f"intermediate_dim={self.intermediate_dim}, "
             f"mode={self.mode.value}, group_size={self.group_size}, quant_backend={self.quant_backend}, "
+            f"npu_backend={self.npu_backend}, "
             f"rounding_mode={self.rounding_mode}, "
             f"fake_quant_targets={self.fake_quant_targets}, "
             f"backward_reduction_axis_fake_quant={self.backward_reduction_axis_fake_quant}, "

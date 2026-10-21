@@ -193,6 +193,12 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
+    if hasattr(self.experts, "forward_npu"):
+        routed_hidden_states = self.experts.forward_npu(
+            hidden_states, selected_experts, routing_weights, torch_npu
+        )
+        return hidden_states, routed_hidden_states, router_logits
+
     # Loop over all available experts in the model and perform the computation on each expert
     # Concat all weights
     input_dtype = hidden_states.dtype
@@ -213,7 +219,9 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         w2 = torch.stack(gate_weight_list).transpose(1, 2).to(input_dtype)
         w3 = torch.stack(down_weight_list).transpose(1, 2).to(input_dtype)
 
-    permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(expert_hidden_states, selected_experts.to(torch.int32))
+    permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(
+        expert_hidden_states, selected_experts.to(torch.int32)
+    )
     num_experts = getattr(
         self, "num_experts", getattr(self.experts, "num_experts", getattr(self.gate, "out_features", None))
     )

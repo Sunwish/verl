@@ -68,6 +68,19 @@ class TestFSDPEngineConfigCPU:
 
 
 class TestQATEngineConfig:
+    def test_expert_npu_backend_default_and_validation(self):
+        from omegaconf import OmegaConf
+
+        from verl.utils.qat.core import QATConfig
+
+        for config_cls in (QATConfig, QATEngineConfig):
+            assert config_cls().experts.npu_backend == "grouped_matmul"
+            config = config_cls(experts=OmegaConf.create({"enable": True, "npu_backend": "python"}))
+            assert config.experts.enable
+            assert config.experts.npu_backend == "python"
+            with pytest.raises(ValueError, match="qat.experts.npu_backend"):
+                config_cls(experts={"npu_backend": "invalid"})
+
     @pytest.mark.parametrize("mode", ["w4a8_mxfp4", "w4a4_mxfp4"])
     def test_mxfp4_shared_options_and_backend_validation(self, mode):
         config = QATEngineConfig(

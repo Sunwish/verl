@@ -59,6 +59,13 @@ class QATExpertsConfig(BaseConfig):
     """Configuration for expert-layer QAT within a broader QAT setup."""
 
     enable: bool = False
+    npu_backend: str = "grouped_matmul"
+
+    def __post_init__(self):
+        if self.npu_backend not in {"grouped_matmul", "python"}:
+            raise ValueError(
+                f"Unsupported qat.experts.npu_backend: {self.npu_backend!r}. Expected 'grouped_matmul' or 'python'."
+            )
 
 
 def _coerce_qat_experts_config(value: Any) -> QATExpertsConfig:
@@ -556,6 +563,7 @@ def apply_qat(
                 layer_index=layer_index,
                 quantize_gate_up_proj=packed_expert_plan["quantize_gate_up_proj"],
                 quantize_down_proj=packed_expert_plan["quantize_down_proj"],
+                npu_backend=config.experts.npu_backend,
             )
             _set_module(model, name, fake_quant_module)
             logger.warning("apply_qat _set_module: %s", name)
@@ -567,7 +575,7 @@ def apply_qat(
             "MXFP QAT applied to training model: mode=%s, converted_layers=%s, quant_backend=%s, "
             "rounding_mode=%s, fake_quant_targets=%s, weight_fake_quant=%s, activation_fake_quant=%s, "
             "backward_reduction_axis_fake_quant=%s, probe_quant_error=%s, rotation_enable=%s, "
-            "rotation_targets=%s, experts_enable=%s",
+            "rotation_targets=%s, experts_enable=%s, experts_npu_backend=%s",
             mode.value,
             converted_count,
             config.quant_backend,
@@ -580,6 +588,7 @@ def apply_qat(
             config.rotation_enable,
             config.rotation_targets,
             config.experts.enable,
+            config.experts.npu_backend,
         )
 
     return model

@@ -4,7 +4,7 @@ MXFP4 W4A8/W4A4 experiments reuse this QAT path. See
 [MXFP4 QAT](mxfp4_qat.md) for modes, the shared configuration key migration,
 and training/rollout validation steps.
 
-Last updated: 07/27/2026
+Last updated: 10/20/2026
 
 verl supports MXFP8 QAT for the Ascend low-precision RL stack. Training keeps matmul in high precision, but inserts
 MXFP8 fake quantization on weights and, in W8A8 mode, activations. Rollout then loads a separate quantized artifact
@@ -58,6 +58,7 @@ actor_rollout_ref:
           - "re:.*mlp.gate$"
         experts:
           enable: false
+          npu_backend: grouped_matmul
         quantization_config_path: "recipe/qat/config/mxfp8_w8a8_ascend.json"
         quant_backend: "torch"
         rounding_mode: "hash"
@@ -77,6 +78,7 @@ actor_rollout_ref:
 | `fsdp_config.qat.group_size` | MXFP8 block size | Must be `32` |
 | `fsdp_config.qat.ignore_patterns` | Layers to skip | `["lm_head", "embed_tokens", "re:.*mlp.gate$"]` |
 | `fsdp_config.qat.experts.enable` | Enable MXFP8 QAT for MoE expert compute | `False` |
+| `fsdp_config.qat.experts.npu_backend` | NPU packed QAT experts execution path | `grouped_matmul` (default) or `python` |
 | `fsdp_config.qat.quantization_config_path` | vLLM quantization config JSON | Required when QAT is enabled |
 | `fsdp_config.qat.quant_backend` | Quantization backend | `npu` or `torch` |
 | `fsdp_config.qat.rounding_mode` | Rounding mode | `rint`, `round`, `random`, or `hash` |
@@ -87,6 +89,29 @@ actor_rollout_ref:
 | `fsdp_config.qat.rotation_targets` | Block-rotation targets | Any of `Fprop`, `Dgrad`, `Wgrad`; defaults to `["Fprop"]` |
 
 ---
+
+## NPU Packed Experts
+
+Qwen3 packed QAT experts support two NPU execution paths. `grouped_matmul`
+keeps the NPU grouped matmul and token permutation kernels; `python` calls the
+existing per-expert QAT loop. Both apply the configured Fprop/Dgrad/Wgrad fake
+quantization and block rotation. This applies to W8A16/W8A8 MXFP8 and W4A8/W4A4
+MXFP4. The Python loop can be slower; it still runs its tensor operations on NPU.
+
+```bash
+# Default; the override can be omitted.
+actor_rollout_ref.actor.fsdp_config.qat.experts.npu_backend=grouped_matmul
+
+# Select the per-expert Python QAT implementation.
+actor_rollout_ref.actor.fsdp_config.qat.experts.npu_backend=python
+```
+
+This option controls converted packed QAT experts only and requires
+`qat.enable=True` and `qat.experts.enable=True`. It does not change rollout
+execution or experts excluded by ignore/fallback settings. `quant_backend`
+separately selects the fake quantizer: MXFP4 still requires `quant_backend=torch`
+even when `experts.npu_backend=grouped_matmul`. Rotation requires
+`rotation_enable=True` and the corresponding `rotation_targets`.
 
 ## Backend And Rounding
 
