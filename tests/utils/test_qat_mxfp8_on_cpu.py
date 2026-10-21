@@ -643,6 +643,7 @@ def test_mxfp_qat_expert_grouped_backward_matches_python_path(
         )
 
     def grouped_matmul(inputs, weights, *, group_list, split_item, group_type, **kwargs):
+        assert group_list.dtype == torch.int64
         groups = group_list.to(torch.int64).tolist()
         if split_item == 2:
             pieces = []

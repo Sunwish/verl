@@ -531,7 +531,10 @@ class MXFP8QATExperts(nn.Module):
         if self.npu_backend == "python":
             return self(hidden_states, selected_experts, routing_weights)
         permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, selected_experts.to(torch.int32))
+        # histc returns float32, while the NPU grouped-matmul operator requires
+        # its per-expert group_list to use int64.
         group_list = torch.histc(selected_experts.to(torch.float32), bins=self.num_experts, min=0, max=self.num_experts)
+        group_list = group_list.to(torch.int64)
         gate_up = self._forward_npu_projection(permuted_tokens, group_list, torch_npu)
         gate, up = gate_up.chunk(2, dim=-1)
         activated = self.act_fn(gate) * up
