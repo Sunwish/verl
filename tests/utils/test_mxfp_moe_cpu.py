@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -7,7 +8,8 @@ from verl.utils.qat.mxfp_moe import (
     _transform_weight,
     attach_mxfp_expert_qat,
     get_mxfp_expert_qat_config,
-    prepare_mxfp_fprop_operands,
+    mxfp_grouped_matmul,
+    prepare_mxfp_fprop_input,
 )
 
 
@@ -61,9 +63,47 @@ def test_wgrad_transform_quantizes_token_reduction_axis():
 def test_gate_up_can_share_detached_fprop_input():
     config = _config()
     x = torch.randn(65, 32, requires_grad=True)
-    weight = torch.randn(4, 32, 64, requires_grad=True)
-    x_fprop, weight_fprop = prepare_mxfp_fprop_operands(x, weight, config)
+    x_fprop = prepare_mxfp_fprop_input(x, config)
     assert x_fprop.shape == x.shape
-    assert weight_fprop.shape == weight.shape
     assert not x_fprop.requires_grad
-    assert not weight_fprop.requires_grad
+
+
+@pytest.mark.parametrize(
+    ("need_input_grad", "need_weight_grad"),
+    [(True, True), (True, False), (False, True)],
+)
+def test_grouped_matmul_recomputes_backward_operands_and_saves_only_inputs(
+    monkeypatch, need_input_grad, need_weight_grad
+):
+    def fake_grouped_matmul(x, weight, group_list, group_list_type, *, split_item=2, group_type=0):
+        if split_item == 2:
+            return x @ weight[0]
+        return (x @ weight).unsqueeze(0)
+
+    monkeypatch.setattr("verl.utils.qat.mxfp_moe._call_grouped_matmul", fake_grouped_matmul)
+    config = _config()
+    x = torch.randn(64, 32, requires_grad=need_input_grad)
+    weight = torch.randn(1, 32, 32, requires_grad=need_weight_grad)
+    group_list = torch.tensor([64])
+    saved_shapes = []
+
+    def pack(tensor):
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        output = mxfp_grouped_matmul(x, weight, group_list, config, name="test").sum()
+
+    expected_shapes = []
+    if need_weight_grad:
+        expected_shapes.append(tuple(x.shape))
+    if need_input_grad:
+        expected_shapes.append(tuple(weight.shape))
+    assert saved_shapes == expected_shapes
+    output.backward()
+    assert (x.grad is not None) == need_input_grad
+    assert (weight.grad is not None) == need_weight_grad
+    if x.grad is not None:
+        assert torch.isfinite(x.grad).all()
+    if weight.grad is not None:
+        assert torch.isfinite(weight.grad).all()
