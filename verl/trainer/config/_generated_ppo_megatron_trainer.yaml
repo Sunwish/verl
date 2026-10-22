@@ -389,8 +389,9 @@ actor_rollout_ref:
       served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
     quantization: null
     quantization_config_file: null
+    qat_fake_quant: false
     mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
-    qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
+    qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,null}
     disaggregation:
       enabled: false
       prefill_replicas: 1

@@ -56,6 +56,22 @@ actor_rollout_ref:
         - re:.*mlp.gate$
         activation_observer: static_minmax
         quantization_config_path: null
+        quant_backend: npu
+        rounding_mode: rint
+        fake_quant_targets:
+        - Fprop
+        backward_reduction_axis_fake_quant: false
+        rotation_enable: false
+        rotation_targets:
+        - Fprop
+        rotation_block_size: 32
+        rotation_seed: 0
+        probe_quant_error: false
+        probe_quant_error_output_path: null
+        fallback_layers: null
+        experts:
+          enable: false
+          npu_backend: grouped_matmul
     _target_: verl.workers.config.FSDPActorConfig
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: fsdp
@@ -230,6 +246,22 @@ actor_rollout_ref:
         - re:.*mlp.gate$
         activation_observer: static_minmax
         quantization_config_path: null
+        quant_backend: npu
+        rounding_mode: rint
+        fake_quant_targets:
+        - Fprop
+        backward_reduction_axis_fake_quant: false
+        rotation_enable: false
+        rotation_targets:
+        - Fprop
+        rotation_block_size: 32
+        rotation_seed: 0
+        probe_quant_error: false
+        probe_quant_error_output_path: null
+        fallback_layers: null
+        experts:
+          enable: false
+          npu_backend: grouped_matmul
     _target_: verl.workers.config.FSDPActorConfig
     ulysses_sequence_parallel_size: ${oc.select:actor_rollout_ref.actor.ulysses_sequence_parallel_size,1}
     entropy_from_logits_with_chunking: false
@@ -361,8 +393,9 @@ actor_rollout_ref:
       served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
     quantization: null
     quantization_config_file: null
+    qat_fake_quant: false
     mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
-    qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
+    qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,null}
     disaggregation:
       enabled: false
       prefill_replicas: 1
@@ -522,6 +555,22 @@ critic:
       - re:.*mlp.gate$
       activation_observer: static_minmax
       quantization_config_path: null
+      quant_backend: npu
+      rounding_mode: rint
+      fake_quant_targets:
+      - Fprop
+      backward_reduction_axis_fake_quant: false
+      rotation_enable: false
+      rotation_targets:
+      - Fprop
+      rotation_block_size: 32
+      rotation_seed: 0
+      probe_quant_error: false
+      probe_quant_error_output_path: null
+      fallback_layers: null
+      experts:
+        enable: false
+        npu_backend: grouped_matmul
   _target_: verl.workers.config.FSDPCriticConfig
   rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
   strategy: fsdp

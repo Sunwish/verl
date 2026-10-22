@@ -852,6 +852,45 @@ class vLLMHttpServer:
         """Process quantization config. Returns (quantization_str, hf_overrides)."""
         quantization = self.config.quantization
         hf_overrides = {}
+        os.environ["VLLM_ASCEND_QAT_FAKE_QUANT"] = "0"
+
+        if getattr(self.config, "qat_fake_quant", False):
+            from verl.utils.qat.vllm_ascend import mxfp_qat_config_to_vllm_ascend_env
+
+            qat_config_dict = getattr(self.config, "qat", None)
+            if not qat_config_dict:
+                raise ValueError("rollout.qat_fake_quant=True requires rollout.qat or an inherited actor QAT config")
+            fake_quant_env = mxfp_qat_config_to_vllm_ascend_env(qat_config_dict)
+            os.environ.update(fake_quant_env)
+            os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
+
+            if not is_torch_npu_available(check_device=False):
+                raise RuntimeError("rollout.qat_fake_quant=True requires an Ascend NPU with vLLM-Ascend")
+            from verl.utils.vllm.npu_vllm_patch import check_vllm_ascend_before_server_launch
+
+            check_vllm_ascend_before_server_launch()
+            logger.warning(
+                "MXFP rollout fake quant enabled on vLLM-Ascend high-precision path: mode=%s, "
+                "backend=%s, rounding=%s, group_size=%s, fake_quant_targets=%s, rotation=%s, "
+                "rotation_targets=%s, rotation_block_size=%s, rotation_seed=%s",
+                fake_quant_env["VLLM_ASCEND_QAT_FAKE_QUANT_MODE"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED"],
+            )
+            hf_overrides["quantization_config"] = None
+            if quantization is not None:
+                logger.warning(
+                    "rollout.qat_fake_quant=True keeps rollout in the high-precision path and ignores "
+                    "rollout.quantization=%s",
+                    quantization,
+                )
+            return None, hf_overrides
 
         if is_torch_npu_available(check_device=False):
             from verl.utils.vllm.npu_vllm_patch import check_vllm_ascend_before_server_launch
