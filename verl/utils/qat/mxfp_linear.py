@@ -94,10 +94,17 @@ class MXFPQATConfig:
         )
 
 
-def _target_tensor(tensor: torch.Tensor, config: MXFPQATConfig, target: str, fmt: str) -> torch.Tensor:
+def _target_tensor(
+    tensor: torch.Tensor,
+    config: MXFPQATConfig,
+    target: str,
+    fmt: str,
+    *,
+    pad_rotation: bool = False,
+) -> torch.Tensor:
     rotated = tensor
     if config.rotation.enable and target in config.rotation.targets:
-        rotated = rotate_blocks(rotated, config.rotation)
+        rotated = rotate_blocks(rotated, config.rotation, pad_to_block=pad_rotation)
     if target in config.fake_quant_targets:
         quantized = fake_quantize(
             rotated,
@@ -117,7 +124,7 @@ def _prepare_dgrad_weight(weight: torch.Tensor, config: MXFPQATConfig) -> torch.
 def _prepare_wgrad_input(input: torch.Tensor, config: MXFPQATConfig) -> torch.Tensor:
     input_2d = input.reshape(-1, input.shape[-1])
     with torch.no_grad():
-        return _target_tensor(input_2d.transpose(0, 1), config, "wgrad", config.activation_format)
+        return _target_tensor(input_2d.transpose(0, 1), config, "wgrad", config.activation_format, pad_rotation=True)
 
 
 class _MXFPLinear(torch.autograd.Function):
@@ -144,6 +151,7 @@ class _MXFPLinear(torch.autograd.Function):
         input_2d = input.reshape(-1, input.shape[-1])
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
         need_input_grad, need_weight_grad = ctx.needs_input_grad[:2]
+        # Return gradients in the transformed operand coordinates; outer autograd handles QDQ and rotation.
 
         grad_input = None
         if need_input_grad:
@@ -172,8 +180,6 @@ class _MXFPLinear(torch.autograd.Function):
                 grad_output_t = grad_output_2d
                 weight_t = weight
             grad_input_2d = grad_output_t.matmul(weight_t)
-            if config.rotation.enable and "fprop" in config.rotation.targets:
-                grad_input_2d = rotate_blocks(grad_input_2d, config.rotation, transpose=True)
             grad_input = grad_input_2d.reshape_as(input)
 
         grad_weight = None
@@ -193,18 +199,18 @@ class _MXFPLinear(torch.autograd.Function):
                     ctx.has_saved_wgrad_input,
                 )
             if ctx.wgrad_enabled:
-                input_t = (
-                    saved_wgrad_input_t if ctx.has_saved_wgrad_input else _prepare_wgrad_input(input, config)
-                )
+                input_t = saved_wgrad_input_t if ctx.has_saved_wgrad_input else _prepare_wgrad_input(input, config)
                 grad_output_t = _target_tensor(
-                    grad_output_2d.transpose(0, 1), config, "wgrad", config.activation_format
+                    grad_output_2d.transpose(0, 1),
+                    config,
+                    "wgrad",
+                    config.activation_format,
+                    pad_rotation=True,
                 )
             else:
                 input_t = input_2d.transpose(0, 1)
                 grad_output_t = grad_output_2d.transpose(0, 1)
             grad_weight = grad_output_t.matmul(input_t.transpose(0, 1))
-            if config.rotation.enable and "fprop" in config.rotation.targets:
-                grad_weight = rotate_blocks(grad_weight, config.rotation, transpose=True)
 
         grad_bias = grad_output_2d.sum(dim=0) if not ctx.bias_is_none and ctx.needs_input_grad[2] else None
         return grad_input, grad_weight, grad_bias, None, None, None, None, None

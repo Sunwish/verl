@@ -64,9 +64,7 @@ def _matrix(block_size: int, seed: int, device: torch.device, dtype: torch.dtype
         return cached
     hadamard = torch.ones((1, 1), dtype=torch.float32)
     while hadamard.shape[0] < block_size:
-        hadamard = torch.cat(
-            (torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0
-        )
+        hadamard = torch.cat((torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0)
     generator = torch.Generator(device="cpu").manual_seed(int(seed) % (2**63 - 1))
     signs = torch.randint(0, 2, (block_size,), generator=generator, dtype=torch.int8).float().mul_(2).sub_(1)
     cached = (hadamard * signs / math.sqrt(block_size)).to(device=device, dtype=dtype)
@@ -74,8 +72,14 @@ def _matrix(block_size: int, seed: int, device: torch.device, dtype: torch.dtype
     return cached
 
 
-def rotate_blocks(tensor: torch.Tensor, config: RotationConfig, *, transpose: bool = False) -> torch.Tensor:
-    """Rotate the last dimension in fixed-size blocks without forming a block diagonal matrix."""
+def rotate_blocks(
+    tensor: torch.Tensor, config: RotationConfig, *, transpose: bool = False, pad_to_block: bool = False
+) -> torch.Tensor:
+    """Rotate the last dimension in fixed-size blocks without forming a block diagonal matrix.
+
+    ``pad_to_block`` keeps the zero-padded tail in the result for reductions whose
+    transformed operands must share complete orthogonal blocks.
+    """
     if not config.enable:
         return tensor
     block_size = config.block_size
@@ -97,4 +101,4 @@ def rotate_blocks(tensor: torch.Tensor, config: RotationConfig, *, transpose: bo
         matrix = matrix.transpose(-1, -2)
     blocks = tensor.to(work_dtype).reshape(*tensor.shape[:-1], -1, block_size)
     result = torch.matmul(blocks, matrix).reshape_as(tensor).to(tensor.dtype)
-    return result[..., :-padding] if padding else result
+    return result if pad_to_block or not padding else result[..., :-padding]

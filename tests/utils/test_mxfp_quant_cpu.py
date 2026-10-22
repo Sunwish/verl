@@ -19,7 +19,9 @@ def test_mode_names_normalize(mode):
     assert normalize_mxfp_mode(mode) in {MXFPMode.W8A8, MXFPMode.W4A8, MXFPMode.W4A4}
 
 
-@pytest.mark.parametrize("quantize,dequantize", [(quantize_mxfp8, dequantize_mxfp8), (quantize_mxfp4, dequantize_mxfp4)])
+@pytest.mark.parametrize(
+    "quantize,dequantize", [(quantize_mxfp8, dequantize_mxfp8), (quantize_mxfp4, dequantize_mxfp4)]
+)
 def test_mxfp_qdq_preserves_shape_and_is_finite(quantize, dequantize):
     x = torch.linspace(-2, 2, 96, dtype=torch.float32).reshape(3, 32)
     payload, scale = quantize(x)
@@ -55,9 +57,7 @@ def test_rotation_is_seeded_and_orthogonal():
 
 def test_linear_replacement_reuses_parameters_and_has_identity_without_transforms():
     linear = torch.nn.Linear(32, 64)
-    config = MXFPQATConfig(
-        mode="mxfp_w8a8", quant_backend="torch", fake_quant_targets=(), rotation_enable=False
-    )
+    config = MXFPQATConfig(mode="mxfp_w8a8", quant_backend="torch", fake_quant_targets=(), rotation_enable=False)
     qat = MXFPQATLinear.from_linear(linear, config)
     assert qat.weight is linear.weight
     assert qat.bias is linear.bias
@@ -98,3 +98,36 @@ def test_linear_fprop_rotation_returns_gradients_in_original_coordinates():
     qat(x).sum().backward()
     assert x.grad.shape == x.shape
     assert qat.weight.grad.shape == linear.weight.shape
+
+
+@pytest.mark.parametrize(
+    "rotation_targets",
+    [("fprop",), ("dgrad",), ("wgrad",), ("fprop", "dgrad", "wgrad")],
+)
+def test_linear_rotation_gradients_match_unrotated_linear(rotation_targets):
+    torch.manual_seed(23)
+    reference = torch.nn.Linear(32, 64)
+    qat_source = torch.nn.Linear(32, 64)
+    qat_source.load_state_dict(reference.state_dict())
+    config = MXFPQATConfig(
+        mode="mxfp_w8a8",
+        quant_backend="torch",
+        fake_quant_targets=(),
+        rotation_enable=True,
+        rotation_targets=rotation_targets,
+        rotation_seed=29,
+    )
+    qat = MXFPQATLinear.from_linear(qat_source, config)
+    x_reference = torch.randn((4, 32), requires_grad=True)
+    x_qat = x_reference.detach().clone().requires_grad_()
+    grad_output = torch.randn((4, 64))
+
+    reference_output = reference(x_reference)
+    qat_output = qat(x_qat)
+    (reference_output * grad_output).sum().backward()
+    (qat_output * grad_output).sum().backward()
+
+    assert torch.allclose(qat_output, reference_output, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(x_qat.grad, x_reference.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(qat.weight.grad, reference.weight.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(qat.bias.grad, reference.bias.grad, atol=1e-5, rtol=1e-5)
