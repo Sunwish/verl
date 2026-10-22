@@ -873,26 +873,38 @@ class FSDPEngine(BaseEngine):
             )
 
         if self._qat_enabled:
-            from verl.utils.qat.quantizer import QATQuantizer
-            from verl.utils.torch_dtypes import PrecisionType
+            from verl.utils.qat.mxfp_linear import is_mxfp_mode
 
-            mixed_precision_config = self.engine_config.mixed_precision
-            if mixed_precision_config is not None:
-                param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            if is_mxfp_mode(self._qat_config.mode):
+                if self.rank == 0:
+                    from verl.utils.qat.mxfp_debug import warn_once
+
+                    warn_once(
+                        ("fsdp_mxfp_weight_sync", self._qat_config.mode),
+                        "FSDP weight sync keeps mode=%s actor weights high precision; skipping NVFP4 packing.",
+                        self._qat_config.mode,
+                    )
             else:
-                param_dtype = torch.bfloat16
+                from verl.utils.qat.quantizer import QATQuantizer
+                from verl.utils.torch_dtypes import PrecisionType
 
-            quantizer = QATQuantizer(
-                mode=self._qat_config.mode,
-                group_size=self._qat_config.group_size,
-                ignore_patterns=list(self._qat_config.ignore_patterns),
-                device=torch.device(get_device_id()),
-                param_dtype=param_dtype,
-            )
-            per_tensor_param = quantizer.quantize_with_fusion(
-                per_tensor_param,
-                target_device=torch.device("cpu"),
-            )
+                mixed_precision_config = self.engine_config.mixed_precision
+                if mixed_precision_config is not None:
+                    param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+                else:
+                    param_dtype = torch.bfloat16
+
+                quantizer = QATQuantizer(
+                    mode=self._qat_config.mode,
+                    group_size=self._qat_config.group_size,
+                    ignore_patterns=list(self._qat_config.ignore_patterns),
+                    device=torch.device(get_device_id()),
+                    param_dtype=param_dtype,
+                )
+                per_tensor_param = quantizer.quantize_with_fusion(
+                    per_tensor_param,
+                    target_device=torch.device("cpu"),
+                )
 
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict

@@ -166,7 +166,8 @@ class _MXFPLinear(torch.autograd.Function):
                 weight_dgrad = (
                     saved_dgrad_weight if ctx.has_saved_dgrad_weight else _prepare_dgrad_weight(weight, config)
                 )
-                weight_t = weight_dgrad.transpose(0, 1)
+                # _prepare_dgrad_weight restores F.linear's [out_features, in_features] layout.
+                weight_t = weight_dgrad
             else:
                 grad_output_t = grad_output_2d
                 weight_t = weight
