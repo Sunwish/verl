@@ -68,6 +68,7 @@ actor_rollout_ref:
         rotation_seed: 0
         probe_quant_error: false
         probe_quant_error_output_path: null
+        probe_quant_error_use_high_precision: true
         fallback_layers: null
         experts:
           enable: false
@@ -258,6 +259,7 @@ actor_rollout_ref:
         rotation_seed: 0
         probe_quant_error: false
         probe_quant_error_output_path: null
+        probe_quant_error_use_high_precision: true
         fallback_layers: null
         experts:
           enable: false
@@ -567,6 +569,7 @@ critic:
       rotation_seed: 0
       probe_quant_error: false
       probe_quant_error_output_path: null
+      probe_quant_error_use_high_precision: true
       fallback_layers: null
       experts:
         enable: false

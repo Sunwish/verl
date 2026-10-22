@@ -248,6 +248,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        qat_probe_step = tu.pop(data, key="qat_probe_step", default=None)
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -268,6 +269,23 @@ class TrainingWorker(Worker, DistProfilerExtension):
             seed=seed + self.engine.get_data_parallel_rank(),
             dataloader_kwargs=dataloader_kwargs,
         )
+
+        qat_config = getattr(self.engine_config, "qat", None)
+        probe_enabled = bool(
+            qat_config is not None
+            and getattr(qat_config, "enable", False)
+            and getattr(qat_config, "probe_quant_error", False)
+            and getattr(self.engine_config, "strategy", "") in {"fsdp", "fsdp2"}
+        )
+        probe_step = None
+        if probe_enabled:
+            from verl.utils.qat.mxfp_linear import is_mxfp_mode
+            from verl.utils.qat.mxfp_probe import begin_quant_error_probe_step
+
+            if is_mxfp_mode(qat_config.mode):
+                probe_step = begin_quant_error_probe_step(qat_config.probe_quant_error_output_path, qat_probe_step)
+            else:
+                probe_enabled = False
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
@@ -318,6 +336,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
                 output = None
+        if probe_enabled:
+            from verl.utils.qat.mxfp_probe import finish_quant_error_probe_step
+
+            finish_quant_error_probe_step(probe_step)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)

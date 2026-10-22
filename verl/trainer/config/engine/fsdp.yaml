@@ -127,9 +127,12 @@ qat:
   # Seed for the deterministic block rotation matrix.
   rotation_seed: 0
 
-  # Reserved quantization-error probe switches for the later probe integration.
+  # Collect one QDQ error summary per training step/layer/module/target/operand.
   probe_quant_error: false
+  # Output file prefix (.json and .html are written); directories get default basenames.
   probe_quant_error_output_path: null
+  # Keep matmul operands high precision while probing; QDQ values are used only for error metrics.
+  probe_quant_error_use_high_precision: true
 
   # Optional per-layer fallback policy. null keeps all eligible layers on the configured MXFP path.
   fallback_layers: null

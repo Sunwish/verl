@@ -519,6 +519,7 @@ class FSDPEngine(BaseEngine):
                 "rotation_seed": self._qat_config.rotation_seed,
                 "probe_quant_error": self._qat_config.probe_quant_error,
                 "probe_quant_error_output_path": self._qat_config.probe_quant_error_output_path,
+                "probe_quant_error_use_high_precision": self._qat_config.probe_quant_error_use_high_precision,
                 "fallback_layers": self._qat_config.fallback_layers,
                 "experts": {
                     "enable": experts_enable,

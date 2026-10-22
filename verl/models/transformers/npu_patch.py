@@ -32,7 +32,7 @@ from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
 from transformers.utils import logging
 
 from verl.utils.qat.mxfp_moe import (
-    get_mxfp_expert_qat_config,
+    get_mxfp_expert_qat_runtime_config,
     mxfp_grouped_matmul,
     prepare_mxfp_fprop_input,
 )
@@ -199,9 +199,11 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         num_experts = self.gate.weight.shape[0]
     tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
 
-    mxfp_qat_config = get_mxfp_expert_qat_config(self)
+    mxfp_qat_config = get_mxfp_expert_qat_runtime_config(self)
     if mxfp_qat_config is not None:
-        permuted_tokens_fprop = prepare_mxfp_fprop_input(permuted_tokens, mxfp_qat_config)
+        permuted_tokens_fprop = prepare_mxfp_fprop_input(
+            permuted_tokens, mxfp_qat_config, probe_module_names=("up_proj", "gate_proj")
+        )
         up_res = mxfp_grouped_matmul(
             permuted_tokens,
             w1,
@@ -223,7 +225,7 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         gate_res = NPUGmmFunction.apply(permuted_tokens, w2, tokens_per_expert)
     act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
     if mxfp_qat_config is not None:
-        act_res_fprop = prepare_mxfp_fprop_input(act_res, mxfp_qat_config)
+        act_res_fprop = prepare_mxfp_fprop_input(act_res, mxfp_qat_config, probe_module_names=("down_proj",))
         down_res = mxfp_grouped_matmul(
             act_res,
             w3,

@@ -163,6 +163,7 @@ class QATEngineConfig(BaseConfig):
     rotation_seed: int = 0
     probe_quant_error: bool = False
     probe_quant_error_output_path: Optional[str] = None
+    probe_quant_error_use_high_precision: bool = True
     fallback_layers: Any = None
     experts: QATExpertsConfig = field(default_factory=QATExpertsConfig)
 

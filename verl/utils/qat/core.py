@@ -48,6 +48,7 @@ class QATConfig(BaseConfig):
     rotation_seed: int = 0
     probe_quant_error: bool = False
     probe_quant_error_output_path: Optional[str] = None
+    probe_quant_error_use_high_precision: bool = True
     fallback_layers: Any = None
     experts: dict[str, Any] = field(default_factory=dict)
 
@@ -117,6 +118,18 @@ def apply_qat(
         mxfp_mode = None
 
     if mxfp_mode is not None:
+        if config.probe_quant_error:
+            if not config.probe_quant_error_output_path:
+                raise ValueError("probe_quant_error_output_path is required when probe_quant_error=True")
+            from verl.utils.qat.mxfp_probe import configure_quant_error_probe
+
+            configure_quant_error_probe(config.probe_quant_error_output_path)
+            warn_once(
+                ("probe", config.probe_quant_error_output_path, config.probe_quant_error_use_high_precision),
+                "MXFP QDQ error probe enabled: output=%s high_precision_matmul=%s; each key is sampled once per step",
+                config.probe_quant_error_output_path,
+                config.probe_quant_error_use_high_precision,
+            )
         from verl.utils.qat.mxfp_linear import MXFPQATConfig, MXFPQATLinear
         from verl.utils.qat.mxfp_moe import attach_mxfp_expert_qat
 
@@ -131,6 +144,9 @@ def apply_qat(
             rotation_targets=config.rotation_targets,
             rotation_block_size=config.rotation_block_size,
             rotation_seed=config.rotation_seed,
+            probe_quant_error=config.probe_quant_error,
+            probe_quant_error_output_path=config.probe_quant_error_output_path,
+            probe_quant_error_use_high_precision=config.probe_quant_error_use_high_precision,
         )
         experts_config = config.experts
         if isinstance(experts_config, dict):
@@ -147,7 +163,8 @@ def apply_qat(
             and not _matches_ignore_patterns(name, config.ignore_patterns)
         ]
         for name, module in modules_to_replace:
-            _set_module(model, name, MXFPQATLinear.from_linear(module, mxfp_config))
+            layer_config = MXFPQATConfig(**{**mxfp_config.__dict__, "layer_name": name})
+            _set_module(model, name, MXFPQATLinear.from_linear(module, layer_config))
         logger.info(
             "Applied %s QAT: dense_linear=%d, packed_moe_blocks=%d, experts_enabled=%s",
             mxfp_mode.value,

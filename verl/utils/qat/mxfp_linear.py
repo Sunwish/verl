@@ -12,9 +12,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from verl.utils.qat.mxfp_quant import MXFPMode, fake_quantize, normalize_mxfp_mode
-from verl.utils.qat.mxfp_rotation import RotationConfig, rotate_blocks
 from verl.utils.qat.mxfp_debug import warn_once
+from verl.utils.qat.mxfp_probe import quantize_with_probe
+from verl.utils.qat.mxfp_quant import MXFPMode, normalize_mxfp_mode
+from verl.utils.qat.mxfp_rotation import RotationConfig, rotate_blocks
 
 _TARGETS = ("fprop", "wgrad", "dgrad")
 _MXFP_MODE_KEYS = {
@@ -60,6 +61,9 @@ class MXFPQATConfig:
     rotation_block_size: int = 32
     rotation_seed: int = 0
     layer_name: str | None = None
+    probe_quant_error: bool = False
+    probe_quant_error_output_path: str | None = None
+    probe_quant_error_use_high_precision: bool = True
 
     def __post_init__(self):
         mode = normalize_mxfp_mode(self.mode)
@@ -101,24 +105,34 @@ def _target_tensor(
     fmt: str,
     *,
     pad_rotation: bool = False,
+    probe_operand: str = "activation",
+    probe_module_name: str | None = None,
 ) -> torch.Tensor:
     rotated = tensor
     if config.rotation.enable and target in config.rotation.targets:
         rotated = rotate_blocks(rotated, config.rotation, pad_to_block=pad_rotation)
     if target in config.fake_quant_targets:
-        quantized = fake_quantize(
+        return quantize_with_probe(
             rotated,
             fmt,
-            quant_backend=config.quant_backend,
-            rounding_mode=config.rounding_mode,
+            config,
+            target=target,
+            operand=probe_operand,
+            module_name=probe_module_name,
+            valid_shape=tuple(tensor.shape) if pad_rotation and tuple(rotated.shape) != tuple(tensor.shape) else None,
         )
-        return rotated + (quantized - rotated).detach()
     return rotated
 
 
 def _prepare_dgrad_weight(weight: torch.Tensor, config: MXFPQATConfig) -> torch.Tensor:
     with torch.no_grad():
-        return _target_tensor(weight.transpose(0, 1), config, "dgrad", config.weight_format).transpose(0, 1)
+        return _target_tensor(
+            weight.transpose(0, 1),
+            config,
+            "dgrad",
+            config.weight_format,
+            probe_operand="weight",
+        ).transpose(0, 1)
 
 
 def _prepare_wgrad_input(input: torch.Tensor, config: MXFPQATConfig) -> torch.Tensor:
@@ -170,7 +184,13 @@ class _MXFPLinear(torch.autograd.Function):
                     ctx.has_saved_dgrad_weight,
                 )
             if ctx.dgrad_enabled:
-                grad_output_t = _target_tensor(grad_output_2d, config, "dgrad", config.activation_format)
+                grad_output_t = _target_tensor(
+                    grad_output_2d,
+                    config,
+                    "dgrad",
+                    config.activation_format,
+                    probe_operand="grad_output",
+                )
                 weight_dgrad = (
                     saved_dgrad_weight if ctx.has_saved_dgrad_weight else _prepare_dgrad_weight(weight, config)
                 )
@@ -206,6 +226,7 @@ class _MXFPLinear(torch.autograd.Function):
                     "wgrad",
                     config.activation_format,
                     pad_rotation=True,
+                    probe_operand="grad_output",
                 )
             else:
                 input_t = input_2d.transpose(0, 1)
@@ -228,7 +249,7 @@ class MXFPQATLinear(nn.Linear):
         self.fake_quant_enabled = True
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, config: MXFPQATConfig) -> "MXFPQATLinear":
+    def from_linear(cls, linear: nn.Linear, config: MXFPQATConfig) -> MXFPQATLinear:
         result = cls.__new__(cls)
         nn.Module.__init__(result)
         result.in_features = linear.in_features
@@ -259,23 +280,20 @@ class MXFPQATLinear(nn.Linear):
         if not self.fake_quant_enabled:
             return F.linear(input, self.weight, self.bias)
 
-        weight = self.weight
-        values = input
-        if config.rotation.enable and "fprop" in config.rotation.targets:
-            values = rotate_blocks(values, config.rotation)
-            weight = rotate_blocks(weight, config.rotation)
-        if "fprop" in config.fake_quant_targets:
-            quantized_weight = fake_quantize(
-                weight, config.weight_format, quant_backend=config.quant_backend, rounding_mode=config.rounding_mode
-            )
-            weight = weight + (quantized_weight - weight).detach()
-            quantized_input = fake_quantize(
-                values,
-                config.activation_format,
-                quant_backend=config.quant_backend,
-                rounding_mode=config.rounding_mode,
-            )
-            values = values + (quantized_input - values).detach()
+        weight = _target_tensor(
+            self.weight,
+            config,
+            "fprop",
+            config.weight_format,
+            probe_operand="weight",
+        )
+        values = _target_tensor(
+            input,
+            config,
+            "fprop",
+            config.activation_format,
+            probe_operand="activation",
+        )
 
         if not input.requires_grad and not self.weight.requires_grad:
             return F.linear(values, weight, self.bias)
