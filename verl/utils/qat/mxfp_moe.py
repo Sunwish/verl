@@ -198,7 +198,7 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
 
         if need_weight_grad:
             dw = _call_grouped_matmul(
-                x_wgrad.transpose(0, 1).contiguous(),
+                x_wgrad.transpose(0, 1),
                 grad_output_wgrad.contiguous(),
                 group_list,
                 group_list_type,

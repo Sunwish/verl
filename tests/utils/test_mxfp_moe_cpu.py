@@ -75,9 +75,12 @@ def test_gate_up_can_share_detached_fprop_input():
 def test_grouped_matmul_recomputes_backward_operands_and_saves_only_inputs(
     monkeypatch, need_input_grad, need_weight_grad
 ):
+    wgrad_input_strides = []
+
     def fake_grouped_matmul(x, weight, group_list, group_list_type, *, split_item=2, group_type=0):
         if split_item == 2:
             return x @ weight[0]
+        wgrad_input_strides.append(x.stride())
         return (x @ weight).unsqueeze(0)
 
     monkeypatch.setattr("verl.utils.qat.mxfp_moe._call_grouped_matmul", fake_grouped_matmul)
@@ -107,3 +110,5 @@ def test_grouped_matmul_recomputes_backward_operands_and_saves_only_inputs(
         assert torch.isfinite(x.grad).all()
     if weight.grad is not None:
         assert torch.isfinite(weight.grad).all()
+    if need_weight_grad:
+        assert wgrad_input_strides == [(1, 32)]
