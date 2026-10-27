@@ -29,6 +29,7 @@ def test_mxfp_qat_config_maps_vllm_ascend_env(mode, expected_mode):
             "ignore_patterns": ["lm_head"],
             "experts": {"enable": True},
             "fallback_layers": [[0, 2], [37, 40]],
+            "mxfp4_scale_alg": "cx",
         }
     )
 
@@ -36,6 +37,7 @@ def test_mxfp_qat_config_maps_vllm_ascend_env(mode, expected_mode):
     assert env["VLLM_ASCEND_QAT_FAKE_QUANT_MODE"] == expected_mode
     assert env["VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND"] == "torch"
     assert env["VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE"] == "hash"
+    assert env["VLLM_ASCEND_QAT_MXFP4_SCALE_ALG"] == "cx"
     assert json.loads(env["VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS"]) == ["fprop", "dgrad", "wgrad"]
     assert env["VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE"] == "true"
     assert json.loads(env["VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS"]) == ["fprop", "wgrad"]

@@ -871,11 +871,12 @@ class vLLMHttpServer:
             check_vllm_ascend_before_server_launch()
             logger.warning(
                 "MXFP rollout fake quant enabled on vLLM-Ascend high-precision path: mode=%s, "
-                "backend=%s, rounding=%s, group_size=%s, fake_quant_targets=%s, rotation=%s, "
+                "backend=%s, rounding=%s, mxfp4_scale_alg=%s, group_size=%s, fake_quant_targets=%s, rotation=%s, "
                 "rotation_targets=%s, rotation_block_size=%s, rotation_seed=%s",
                 fake_quant_env["VLLM_ASCEND_QAT_FAKE_QUANT_MODE"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP4_SCALE_ALG"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE"],

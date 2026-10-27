@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from verl.utils.qat.mxfp_debug import warn_once
 from verl.utils.qat.mxfp_probe import quantize_with_probe
-from verl.utils.qat.mxfp_quant import MXFPMode, normalize_mxfp_mode
+from verl.utils.qat.mxfp_quant import MXFPMode, normalize_mxfp4_scale_alg, normalize_mxfp_mode
 from verl.utils.qat.mxfp_rotation import RotationConfig, rotate_blocks
 
 _TARGETS = ("fprop", "wgrad", "dgrad")
@@ -54,6 +54,7 @@ class MXFPQATConfig:
     group_size: int = 32
     quant_backend: str = "npu"
     rounding_mode: str = "rint"
+    mxfp4_scale_alg: str = "standard"
     fake_quant_targets: tuple[str, ...] = ("fprop",)
     backward_reduction_axis_fake_quant: bool = True
     rotation_enable: bool = False
@@ -69,6 +70,7 @@ class MXFPQATConfig:
         mode = normalize_mxfp_mode(self.mode)
         object.__setattr__(self, "mode", mode.value)
         object.__setattr__(self, "quant_backend", str(self.quant_backend).lower())
+        object.__setattr__(self, "mxfp4_scale_alg", normalize_mxfp4_scale_alg(self.mxfp4_scale_alg))
         if self.group_size != 32:
             raise ValueError(f"MXFP QAT requires group_size=32, got {self.group_size}")
         if mode in (MXFPMode.W4A8, MXFPMode.W4A4) and self.quant_backend != "torch":

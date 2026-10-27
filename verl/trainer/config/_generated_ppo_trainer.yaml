@@ -58,6 +58,7 @@ actor_rollout_ref:
         quantization_config_path: null
         quant_backend: npu
         rounding_mode: rint
+        mxfp4_scale_alg: standard
         fake_quant_targets:
         - Fprop
         backward_reduction_axis_fake_quant: false
@@ -249,6 +250,7 @@ actor_rollout_ref:
         quantization_config_path: null
         quant_backend: npu
         rounding_mode: rint
+        mxfp4_scale_alg: standard
         fake_quant_targets:
         - Fprop
         backward_reduction_axis_fake_quant: false
@@ -559,6 +561,7 @@ critic:
       quantization_config_path: null
       quant_backend: npu
       rounding_mode: rint
+      mxfp4_scale_alg: standard
       fake_quant_targets:
       - Fprop
       backward_reduction_axis_fake_quant: false

@@ -109,6 +109,9 @@ qat:
   # MXFP rounding mode: rint, round, random, or hash (torch backend only for stochastic modes).
   rounding_mode: "rint"
 
+  # MXFP4 shared-scale algorithm: standard (current OCP behavior), tfs, or cx.
+  mxfp4_scale_alg: "standard"
+
   # MXFP pseudo-quantization locations. Valid values are Fprop, Dgrad, and Wgrad.
   fake_quant_targets: [Fprop]
 

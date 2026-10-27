@@ -40,6 +40,7 @@ class QATConfig(BaseConfig):
     quantization_config_path: Optional[str] = None
     quant_backend: str = "npu"
     rounding_mode: str = "rint"
+    mxfp4_scale_alg: str = "standard"
     fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     backward_reduction_axis_fake_quant: bool = False
     rotation_enable: bool = False
@@ -138,6 +139,7 @@ def apply_qat(
             group_size=config.group_size,
             quant_backend=config.quant_backend,
             rounding_mode=config.rounding_mode,
+            mxfp4_scale_alg=config.mxfp4_scale_alg,
             fake_quant_targets=config.fake_quant_targets,
             backward_reduction_axis_fake_quant=config.backward_reduction_axis_fake_quant,
             rotation_enable=config.rotation_enable,
@@ -185,10 +187,12 @@ def apply_qat(
                 tuple(config.fake_quant_targets),
                 tuple(config.rotation_targets),
                 config.rotation_enable,
+                config.mxfp4_scale_alg,
                 experts_enabled,
             ),
             "FSDP2 MXFP QAT configured: mode=%s dense_linear=%d moe_blocks=%d experts=%s "
-            "fprop=%s dgrad=%s wgrad=%s rotation=%s rotation_targets=%s backward_axis_cache=%s",
+            "fprop=%s dgrad=%s wgrad=%s rotation=%s rotation_targets=%s mxfp4_scale_alg=%s "
+            "backward_axis_cache=%s",
             mxfp_mode.value,
             len(modules_to_replace),
             moe_count,
@@ -198,6 +202,7 @@ def apply_qat(
             "wgrad" in mxfp_config.fake_quant_targets,
             mxfp_config.rotation.enable,
             mxfp_config.rotation.targets,
+            mxfp_config.mxfp4_scale_alg,
             mxfp_config.backward_reduction_axis_fake_quant,
         )
         return model

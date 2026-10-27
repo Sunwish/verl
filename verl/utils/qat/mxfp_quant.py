@@ -25,6 +25,7 @@ MXFP4_EMAX = 2
 MXFP4_MIN_PRIVATE_EXP = 0
 MXFP4_MANTISSA_SCALE = 2.0
 MXFP4_MAX_NORM = 6.0
+MXFP4_CX_MAX_NORM = 7.25
 
 
 class MXFPMode(str, Enum):
@@ -68,6 +69,50 @@ def normalize_rounding_mode(mode: str) -> str:
     if mode not in {"rint", "round", "random", "hash"}:
         raise ValueError(f"Unsupported MXFP rounding mode {mode!r}")
     return mode
+
+
+_MXFP4_SCALE_ALIASES = {
+    "standard": "standard",
+    "ocp": "standard",
+    "0": "standard",
+    "tfs": "tfs",
+    "1": "tfs",
+    "cx": "cx",
+    "2": "cx",
+}
+
+
+def normalize_mxfp4_scale_alg(scale_alg: str) -> str:
+    """Normalize the MXFP4 shared-scale algorithm name.
+
+    ``standard`` preserves the existing OCP-style scale. ``tfs`` and ``cx``
+    are the two optimized scale choices used by the MXFP4 experiments.
+    Numeric aliases match the corresponding hardware ``scale_alg`` values.
+    """
+    key = str(scale_alg).strip().lower()
+    try:
+        return _MXFP4_SCALE_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported MXFP4 scale algorithm {scale_alg!r}; expected standard, tfs, or cx") from exc
+
+
+def _mxfp4_shared_scale(amax: torch.Tensor, scale_alg: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the shared exponent and real scale factor for each 32-value block."""
+    scale_alg = normalize_mxfp4_scale_alg(scale_alg)
+    safe_amax = torch.where(amax == 0, torch.ones_like(amax), amax)
+    if scale_alg == "standard":
+        shared_exp = torch.floor(torch.log2(safe_amax)) - MXFP4_EMAX
+    elif scale_alg == "tfs":
+        shared_exp = torch.ceil(torch.log2(safe_amax / MXFP4_MAX_NORM))
+    else:  # CX uses a 7.25 effective maximum and therefore a non-power-of-two scale.
+        shared_exp = torch.ceil(torch.log2(safe_amax))
+    shared_exp = shared_exp.clamp(min=-MXFP8_SCALE_EMAX)
+    shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -MXFP8_SCALE_EMAX), shared_exp)
+    shared_exp = torch.where(shared_exp > MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
+    scale_factor = torch.pow(2.0, shared_exp)
+    if scale_alg == "cx":
+        scale_factor = scale_factor / MXFP4_CX_MAX_NORM
+    return shared_exp, scale_factor
 
 
 def _check_tensor(tensor: torch.Tensor) -> None:
@@ -178,18 +223,19 @@ def quantize_mxfp8(
 
 
 def quantize_mxfp4(
-    tensor: torch.Tensor, *, quant_backend: str = "torch", rounding_mode: str = "rint"
+    tensor: torch.Tensor,
+    *,
+    quant_backend: str = "torch",
+    rounding_mode: str = "rint",
+    scale_alg: str = "standard",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _check_tensor(tensor)
     if normalize_quant_backend(quant_backend) != "torch":
         raise ValueError("MXFP4 QAT requires quant_backend='torch'")
     blocks = tensor.to(torch.float32).reshape(tensor.shape[0], -1, MXFP_GROUP_SIZE)
     amax = blocks.abs().amax(dim=-1)
-    safe_amax = torch.where(amax == 0, torch.ones_like(amax), amax)
-    shared_exp = (torch.floor(torch.log2(safe_amax)) - MXFP4_EMAX).clamp(min=-MXFP8_SCALE_EMAX)
-    shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -MXFP8_SCALE_EMAX), shared_exp)
-    shared_exp = torch.where(shared_exp > MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
-    normalized = blocks * torch.pow(2.0, -shared_exp.unsqueeze(-1))
+    shared_exp, scale_factor = _mxfp4_shared_scale(amax, scale_alg)
+    normalized = blocks / scale_factor.unsqueeze(-1)
     private_exp = torch.floor(torch.log2(normalized.abs() + (normalized == 0).float())).clamp(
         min=MXFP4_MIN_PRIVATE_EXP
     )
@@ -209,10 +255,16 @@ def dequantize_mxfp8(payload: torch.Tensor, scale: torch.Tensor, dtype: torch.dt
     return (blocks * descale.unsqueeze(-1)).reshape_as(payload).to(dtype)
 
 
-def dequantize_mxfp4(payload: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+def dequantize_mxfp4(
+    payload: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, *, scale_alg: str = "standard"
+) -> torch.Tensor:
+    scale_alg = normalize_mxfp4_scale_alg(scale_alg)
     scale = scale.to(torch.float32)
     scale = torch.where(scale == 255, torch.full_like(scale, float("nan")), scale)
-    return dequantize_mxfp8(payload, scale, dtype)
+    result = dequantize_mxfp8(payload, scale, torch.float32)
+    if scale_alg == "cx":
+        result = result / MXFP4_CX_MAX_NORM
+    return result.to(dtype)
 
 
 def fake_quantize(
@@ -221,14 +273,16 @@ def fake_quantize(
     *,
     quant_backend: str = "torch",
     rounding_mode: str = "rint",
+    mxfp4_scale_alg: str = "standard",
 ) -> torch.Tensor:
     """Return the QDQ value; callers provide the STE boundary."""
     warn_once(
-        ("qdq", fmt, quant_backend, rounding_mode),
-        "MXFP QDQ executed: format=%s backend=%s rounding=%s",
+        ("qdq", fmt, quant_backend, rounding_mode, mxfp4_scale_alg),
+        "MXFP QDQ executed: format=%s backend=%s rounding=%s mxfp4_scale_alg=%s",
         fmt,
         quant_backend,
         rounding_mode,
+        mxfp4_scale_alg,
     )
     original_shape = tensor.shape
     padded = (-tensor.shape[-1]) % MXFP_GROUP_SIZE
@@ -236,8 +290,13 @@ def fake_quantize(
         tensor = torch.nn.functional.pad(tensor, (0, padded))
     matrix = tensor.reshape(-1, tensor.shape[-1])
     if fmt == "mxfp4":
-        payload, scale = quantize_mxfp4(matrix, quant_backend=quant_backend, rounding_mode=rounding_mode)
-        result = dequantize_mxfp4(payload, scale, tensor.dtype)
+        payload, scale = quantize_mxfp4(
+            matrix,
+            quant_backend=quant_backend,
+            rounding_mode=rounding_mode,
+            scale_alg=mxfp4_scale_alg,
+        )
+        result = dequantize_mxfp4(payload, scale, tensor.dtype, scale_alg=mxfp4_scale_alg)
     elif fmt == "mxfp8":
         payload, scale = quantize_mxfp8(matrix, quant_backend=quant_backend, rounding_mode=rounding_mode)
         result = dequantize_mxfp8(payload, scale, tensor.dtype)

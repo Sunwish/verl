@@ -1,22 +1,47 @@
 import pytest
 import torch
 
+from verl.utils.qat.mxfp_linear import MXFPQATConfig, MXFPQATLinear
 from verl.utils.qat.mxfp_quant import (
     MXFPMode,
     dequantize_mxfp4,
     dequantize_mxfp8,
     fake_quantize,
+    normalize_mxfp4_scale_alg,
     normalize_mxfp_mode,
     quantize_mxfp4,
     quantize_mxfp8,
 )
 from verl.utils.qat.mxfp_rotation import RotationConfig, _matrix, rotate_blocks
-from verl.utils.qat.mxfp_linear import MXFPQATConfig, MXFPQATLinear
 
 
 @pytest.mark.parametrize("mode", ["mxfp_w8a8", "w8a8_mxfp8", "mxfp_w4a8", "mxfp_w4a4"])
 def test_mode_names_normalize(mode):
     assert normalize_mxfp_mode(mode) in {MXFPMode.W8A8, MXFPMode.W4A8, MXFPMode.W4A4}
+
+
+@pytest.mark.parametrize(
+    ("scale_alg", "expected"),
+    [
+        ("standard", "standard"),
+        ("ocp", "standard"),
+        (0, "standard"),
+        ("tfs", "tfs"),
+        (1, "tfs"),
+        ("cx", "cx"),
+        (2, "cx"),
+    ],
+)
+def test_mxfp4_scale_algorithm_names_normalize(scale_alg, expected):
+    assert normalize_mxfp4_scale_alg(scale_alg) == expected
+
+
+@pytest.mark.parametrize(("scale_alg", "expected_scale"), [("standard", 127.0), ("tfs", 128.0), ("cx", 130.0)])
+def test_mxfp4_scale_algorithms_use_expected_block_scale(scale_alg, expected_scale):
+    x = torch.full((1, 32), 7.0)
+    payload, scale = quantize_mxfp4(x, scale_alg=scale_alg)
+    assert scale.item() == expected_scale
+    assert torch.isfinite(dequantize_mxfp4(payload, scale, x.dtype, scale_alg=scale_alg)).all()
 
 
 @pytest.mark.parametrize(

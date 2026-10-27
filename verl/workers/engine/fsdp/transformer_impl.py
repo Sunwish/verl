@@ -511,6 +511,7 @@ class FSDPEngine(BaseEngine):
                 "activation_observer": self._qat_config.activation_observer,
                 "quant_backend": self._qat_config.quant_backend,
                 "rounding_mode": self._qat_config.rounding_mode,
+                "mxfp4_scale_alg": self._qat_config.mxfp4_scale_alg,
                 "fake_quant_targets": list(self._qat_config.fake_quant_targets),
                 "backward_reduction_axis_fake_quant": self._qat_config.backward_reduction_axis_fake_quant,
                 "rotation_enable": self._qat_config.rotation_enable,
