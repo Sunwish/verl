@@ -108,6 +108,20 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 self.model_config, self.device_name
             )
 
+        qat_config = getattr(self.engine_config, "qat", None)
+        if (
+            self.engine_config.strategy not in {"fsdp", "fsdp2"}
+            and qat_config is not None
+            and getattr(qat_config, "enable", False)
+        ):
+            from verl.utils.qat.mxfp_linear import is_mxfp_mode
+
+            if is_mxfp_mode(getattr(qat_config, "mode", "")):
+                raise ValueError(
+                    "MXFP QAT is supported only with the FSDP/FSDP2 backend; "
+                    f"got backend {self.engine_config.strategy!r}."
+                )
+
         # we use the one defined in model
         # TODO: this is not elegant and should refactor later
         self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)

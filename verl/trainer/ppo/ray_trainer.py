@@ -1312,12 +1312,27 @@ class RayPPOTrainer:
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
-        qat_config = self.config.actor_rollout_ref.actor.fsdp_config.qat
-        probe_quant_error = (
-            qat_config.get("probe_quant_error", False)
-            if hasattr(qat_config, "get")
-            else getattr(qat_config, "probe_quant_error", False)
+        actor_config = self.config.actor_rollout_ref.actor
+        actor_strategy = (
+            actor_config.get("strategy") if hasattr(actor_config, "get") else getattr(actor_config, "strategy", None)
         )
+        probe_quant_error = False
+        if actor_strategy in {"fsdp", "fsdp2"}:
+            fsdp_config = (
+                actor_config.get("fsdp_config")
+                if hasattr(actor_config, "get")
+                else getattr(actor_config, "fsdp_config", None)
+            )
+            qat_config = (
+                fsdp_config.get("qat")
+                if hasattr(fsdp_config, "get")
+                else getattr(fsdp_config, "qat", None)
+            )
+            probe_quant_error = (
+                qat_config.get("probe_quant_error", False)
+                if hasattr(qat_config, "get")
+                else getattr(qat_config, "probe_quant_error", False)
+            )
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=calculate_entropy,
