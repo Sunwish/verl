@@ -104,14 +104,12 @@ def _mxfp4_shared_scale(amax: torch.Tensor, scale_alg: str) -> tuple[torch.Tenso
         shared_exp = torch.floor(torch.log2(safe_amax)) - MXFP4_EMAX
     elif scale_alg == "tfs":
         shared_exp = torch.ceil(torch.log2(safe_amax / MXFP4_MAX_NORM))
-    else:  # CX uses a 7.25 effective maximum and therefore a non-power-of-two scale.
-        shared_exp = torch.ceil(torch.log2(safe_amax))
+    else:  # CX uses 7.25 as the effective maximum when selecting a power-of-two scale.
+        shared_exp = torch.ceil(torch.log2(safe_amax / MXFP4_CX_MAX_NORM))
     shared_exp = shared_exp.clamp(min=-MXFP8_SCALE_EMAX)
     shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -MXFP8_SCALE_EMAX), shared_exp)
     shared_exp = torch.where(shared_exp > MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
     scale_factor = torch.pow(2.0, shared_exp)
-    if scale_alg == "cx":
-        scale_factor = scale_factor / MXFP4_CX_MAX_NORM
     return shared_exp, scale_factor
 
 
@@ -262,8 +260,6 @@ def dequantize_mxfp4(
     scale = scale.to(torch.float32)
     scale = torch.where(scale == 255, torch.full_like(scale, float("nan")), scale)
     result = dequantize_mxfp8(payload, scale, torch.float32)
-    if scale_alg == "cx":
-        result = result / MXFP4_CX_MAX_NORM
     return result.to(dtype)
 
 

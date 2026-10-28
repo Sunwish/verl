@@ -36,12 +36,22 @@ def test_mxfp4_scale_algorithm_names_normalize(scale_alg, expected):
     assert normalize_mxfp4_scale_alg(scale_alg) == expected
 
 
-@pytest.mark.parametrize(("scale_alg", "expected_scale"), [("standard", 127.0), ("tfs", 128.0), ("cx", 130.0)])
-def test_mxfp4_scale_algorithms_use_expected_block_scale(scale_alg, expected_scale):
-    x = torch.full((1, 32), 7.0)
+@pytest.mark.parametrize(
+    ("scale_alg", "value", "expected_scale", "expected_decoded"),
+    [
+        ("standard", 7.0, 127.0, 6.0),
+        ("tfs", 7.0, 128.0, 8.0),
+        ("cx", 7.0, 127.0, 6.0),
+        ("cx", 8.0, 128.0, 8.0),
+        ("cx", 15.0, 129.0, 16.0),
+    ],
+)
+def test_mxfp4_scale_algorithms_use_expected_block_scale(scale_alg, value, expected_scale, expected_decoded):
+    x = torch.full((1, 32), value)
     payload, scale = quantize_mxfp4(x, scale_alg=scale_alg)
     assert scale.item() == expected_scale
-    assert torch.isfinite(dequantize_mxfp4(payload, scale, x.dtype, scale_alg=scale_alg)).all()
+    decoded = dequantize_mxfp4(payload, scale, x.dtype, scale_alg=scale_alg)
+    assert torch.equal(decoded, torch.full_like(x, expected_decoded))
 
 
 @pytest.mark.parametrize(
