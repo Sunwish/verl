@@ -26,6 +26,9 @@ MXFP4_MIN_PRIVATE_EXP = 0
 MXFP4_MANTISSA_SCALE = 2.0
 MXFP4_MAX_NORM = 6.0
 MXFP4_CX_MAX_NORM = 7.25
+MXFP4_MBS_MACROBLOCK_SIZE = 128
+_MXFP4_MBS_MANTISSA_BITS = 23
+_MXFP4_MBS_CORRECTION_BITS = 8
 
 
 class MXFPMode(str, Enum):
@@ -150,9 +153,7 @@ def _quantize_mxfp8_torch(tensor: torch.Tensor, rounding_mode: str) -> tuple[tor
     shared_exp = torch.floor(torch.log2(safe_amax)) - MXFP8_EMAX
     shared_exp = torch.where(shared_exp > MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
     normalized = blocks / torch.pow(2.0, shared_exp.unsqueeze(-1))
-    private_exp = torch.floor(torch.log2(normalized.abs() + (normalized == 0).float())).clamp(
-        min=MXFP8_MIN_PRIVATE_EXP
-    )
+    private_exp = torch.floor(torch.log2(normalized.abs() + (normalized == 0).float())).clamp(min=MXFP8_MIN_PRIVATE_EXP)
     private_scale = torch.pow(2.0, private_exp)
     scaled = normalized / private_scale * MXFP8_MANTISSA_SCALE
     quantized = torch.sign(scaled) * _round_abs(scaled.abs(), rounding_mode)
@@ -176,9 +177,7 @@ def _quantize_mxfp8_torch_a2a3(tensor: torch.Tensor, rounding_mode: str) -> tupl
     shared_exp = torch.floor(torch.log2(safe_amax)) - MXFP8_EMAX
     shared_exp = torch.where(shared_exp > MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
     normalized = blocks / torch.pow(2.0, shared_exp.unsqueeze(-1))
-    private_exp = torch.floor(torch.log2(normalized.abs() + (normalized == 0).float())).clamp(
-        min=MXFP8_MIN_PRIVATE_EXP
-    )
+    private_exp = torch.floor(torch.log2(normalized.abs() + (normalized == 0).float())).clamp(min=MXFP8_MIN_PRIVATE_EXP)
     private_scale = torch.pow(2.0, private_exp)
     scaled = normalized / private_scale * MXFP8_MANTISSA_SCALE
     quantized = torch.sign(scaled) * _round_abs(scaled.abs(), rounding_mode)
@@ -234,15 +233,51 @@ def quantize_mxfp4(
     amax = blocks.abs().amax(dim=-1)
     shared_exp, scale_factor = _mxfp4_shared_scale(amax, scale_alg)
     normalized = blocks / scale_factor.unsqueeze(-1)
-    private_exp = torch.floor(torch.log2(normalized.abs() + (normalized == 0).float())).clamp(
-        min=MXFP4_MIN_PRIVATE_EXP
-    )
+    private_exp = torch.floor(torch.log2(normalized.abs() + (normalized == 0).float())).clamp(min=MXFP4_MIN_PRIVATE_EXP)
     private_scale = torch.pow(2.0, private_exp)
     scaled = normalized / private_scale * MXFP4_MANTISSA_SCALE
     quantized = torch.sign(scaled) * _round_abs(scaled.abs(), rounding_mode)
     quantized = (quantized / MXFP4_MANTISSA_SCALE * private_scale).clamp(-MXFP4_MAX_NORM, MXFP4_MAX_NORM)
     scale = torch.where(torch.isnan(shared_exp), torch.full_like(shared_exp, 255.0), shared_exp + MXFP8_SCALE_EMAX)
     return quantized.reshape_as(tensor), scale
+
+
+def _apply_mxfp4_mbs_correction(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scale row-major 128-value macroblocks and return their shared corrections."""
+    original_shape = tensor.shape
+    values = tensor.to(torch.float32).contiguous().reshape(-1)
+    if values.numel() == 0:
+        return tensor, torch.empty((0,), device=tensor.device, dtype=torch.float32)
+    padding = (-values.numel()) % MXFP4_MBS_MACROBLOCK_SIZE
+    if padding:
+        values = torch.nn.functional.pad(values, (0, padding))
+
+    macroblocks = values.reshape(-1, MXFP4_MBS_MACROBLOCK_SIZE)
+    amax = macroblocks.abs().amax(dim=-1)
+    safe_amax = torch.where(amax == 0, torch.ones_like(amax), amax)
+    inverse_scale = MXFP4_MAX_NORM / safe_amax
+    mantissa_mask = (1 << _MXFP4_MBS_MANTISSA_BITS) - 1
+    mantissa = torch.bitwise_and(inverse_scale.contiguous().view(torch.int32).to(torch.int64), mantissa_mask)
+    top_mantissa = torch.bitwise_right_shift(mantissa, _MXFP4_MBS_MANTISSA_BITS - _MXFP4_MBS_CORRECTION_BITS).to(
+        torch.float32
+    )
+    correction = 1.0 + top_mantissa / (1 << _MXFP4_MBS_CORRECTION_BITS)
+    correction = torch.where(torch.isfinite(amax) & (amax != 0), correction, torch.ones_like(correction))
+    corrected = (macroblocks * correction.unsqueeze(-1)).reshape(-1)[: tensor.numel()]
+    return corrected.reshape(original_shape), correction
+
+
+def _undo_mxfp4_mbs_correction(tensor: torch.Tensor, correction: torch.Tensor) -> torch.Tensor:
+    original_shape = tensor.shape
+    values = tensor.to(torch.float32).contiguous().reshape(-1)
+    if values.numel() == 0:
+        return tensor
+    padding = (-values.numel()) % MXFP4_MBS_MACROBLOCK_SIZE
+    if padding:
+        values = torch.nn.functional.pad(values, (0, padding))
+    macroblocks = values.reshape(-1, MXFP4_MBS_MACROBLOCK_SIZE)
+    result = (macroblocks / correction.unsqueeze(-1)).reshape(-1)[: tensor.numel()]
+    return result.reshape(original_shape).to(tensor.dtype)
 
 
 def dequantize_mxfp8(payload: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -270,17 +305,27 @@ def fake_quantize(
     quant_backend: str = "torch",
     rounding_mode: str = "rint",
     mxfp4_scale_alg: str = "standard",
+    mxfp4_mbs_enable: bool = False,
 ) -> torch.Tensor:
     """Return the QDQ value; callers provide the STE boundary."""
     warn_once(
-        ("qdq", fmt, quant_backend, rounding_mode, mxfp4_scale_alg),
-        "MXFP QDQ executed: format=%s backend=%s rounding=%s mxfp4_scale_alg=%s",
+        ("qdq", fmt, quant_backend, rounding_mode, mxfp4_scale_alg, mxfp4_mbs_enable),
+        "MXFP QDQ executed: format=%s backend=%s rounding=%s mxfp4_scale_alg=%s mxfp4_mbs=%s",
         fmt,
         quant_backend,
         rounding_mode,
         mxfp4_scale_alg,
+        mxfp4_mbs_enable,
     )
     original_shape = tensor.shape
+    original_dtype = tensor.dtype
+    mbs_correction = None
+    if mxfp4_mbs_enable:
+        if fmt != "mxfp4":
+            raise ValueError("MXFP4 MBS requires fmt='mxfp4'")
+        if normalize_mxfp4_scale_alg(mxfp4_scale_alg) != "standard":
+            raise ValueError("MXFP4 MBS currently requires mxfp4_scale_alg='standard'")
+        tensor, mbs_correction = _apply_mxfp4_mbs_correction(tensor)
     padded = (-tensor.shape[-1]) % MXFP_GROUP_SIZE
     if padded:
         tensor = torch.nn.functional.pad(tensor, (0, padded))
@@ -292,13 +337,16 @@ def fake_quantize(
             rounding_mode=rounding_mode,
             scale_alg=mxfp4_scale_alg,
         )
-        result = dequantize_mxfp4(payload, scale, tensor.dtype, scale_alg=mxfp4_scale_alg)
+        result = dequantize_mxfp4(payload, scale, original_dtype, scale_alg=mxfp4_scale_alg)
     elif fmt == "mxfp8":
         payload, scale = quantize_mxfp8(matrix, quant_backend=quant_backend, rounding_mode=rounding_mode)
-        result = dequantize_mxfp8(payload, scale, tensor.dtype)
+        result = dequantize_mxfp8(payload, scale, original_dtype)
     else:
         raise ValueError(f"Unsupported MXFP format {fmt!r}")
     result = result.reshape_as(tensor)
     if padded:
         result = result[..., :-padded]
-    return result.reshape(original_shape)
+    result = result.reshape(original_shape)
+    if mbs_correction is not None:
+        result = _undo_mxfp4_mbs_correction(result, mbs_correction)
+    return result

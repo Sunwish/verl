@@ -55,6 +55,7 @@ def mxfp_qat_config_to_vllm_ascend_env(config: Mapping[str, Any]) -> dict[str, s
     quant_backend = str(config.get("quant_backend", "npu")).lower()
     rounding_mode = normalize_rounding_mode(config.get("rounding_mode", "rint"))
     mxfp4_scale_alg = str(config.get("mxfp4_scale_alg", "standard"))
+    mxfp4_mbs_enable = bool(config.get("mxfp4_mbs_enable", False))
     if quant_backend == "npu" and rounding_mode in {"random", "hash"}:
         raise ValueError("MXFP8 stochastic rounding requires quant_backend='torch'")
     fake_quant_targets = _as_list(config.get("fake_quant_targets"), ["Fprop"])
@@ -70,6 +71,7 @@ def mxfp_qat_config_to_vllm_ascend_env(config: Mapping[str, Any]) -> dict[str, s
         quant_backend=quant_backend,
         rounding_mode=rounding_mode,
         mxfp4_scale_alg=mxfp4_scale_alg,
+        mxfp4_mbs_enable=mxfp4_mbs_enable,
         fake_quant_targets=tuple(fake_quant_targets),
         rotation_enable=rotation_enable,
         rotation_targets=tuple(rotation_targets),
@@ -101,6 +103,7 @@ def mxfp_qat_config_to_vllm_ascend_env(config: Mapping[str, Any]) -> dict[str, s
         "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": qat_config.quant_backend,
         "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": qat_config.rounding_mode,
         "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": qat_config.mxfp4_scale_alg,
+        "VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE": str(qat_config.mxfp4_mbs_enable).lower(),
         "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": str(qat_config.group_size),
         "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS": json.dumps(
             [target for target in ("fprop", "dgrad", "wgrad") if target in qat_config.fake_quant_targets]

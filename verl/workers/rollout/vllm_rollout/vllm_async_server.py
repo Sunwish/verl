@@ -853,6 +853,7 @@ class vLLMHttpServer:
         quantization = self.config.quantization
         hf_overrides = {}
         os.environ["VLLM_ASCEND_QAT_FAKE_QUANT"] = "0"
+        os.environ["VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE"] = "false"
 
         if getattr(self.config, "qat_fake_quant", False):
             from verl.utils.qat.vllm_ascend import mxfp_qat_config_to_vllm_ascend_env
@@ -871,12 +872,14 @@ class vLLMHttpServer:
             check_vllm_ascend_before_server_launch()
             logger.warning(
                 "MXFP rollout fake quant enabled on vLLM-Ascend high-precision path: mode=%s, "
-                "backend=%s, rounding=%s, mxfp4_scale_alg=%s, group_size=%s, fake_quant_targets=%s, rotation=%s, "
+                "backend=%s, rounding=%s, mxfp4_scale_alg=%s, mxfp4_mbs=%s, "
+                "group_size=%s, fake_quant_targets=%s, rotation=%s, "
                 "rotation_targets=%s, rotation_block_size=%s, rotation_seed=%s",
                 fake_quant_env["VLLM_ASCEND_QAT_FAKE_QUANT_MODE"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP4_SCALE_ALG"],
+                fake_quant_env["VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS"],
                 fake_quant_env["VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE"],

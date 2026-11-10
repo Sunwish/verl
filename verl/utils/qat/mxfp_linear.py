@@ -55,6 +55,7 @@ class MXFPQATConfig:
     quant_backend: str = "npu"
     rounding_mode: str = "rint"
     mxfp4_scale_alg: str = "standard"
+    mxfp4_mbs_enable: bool = False
     fake_quant_targets: tuple[str, ...] = ("fprop",)
     backward_reduction_axis_fake_quant: bool = True
     rotation_enable: bool = False
@@ -71,10 +72,15 @@ class MXFPQATConfig:
         object.__setattr__(self, "mode", mode.value)
         object.__setattr__(self, "quant_backend", str(self.quant_backend).lower())
         object.__setattr__(self, "mxfp4_scale_alg", normalize_mxfp4_scale_alg(self.mxfp4_scale_alg))
+        object.__setattr__(self, "mxfp4_mbs_enable", bool(self.mxfp4_mbs_enable))
         if self.group_size != 32:
             raise ValueError(f"MXFP QAT requires group_size=32, got {self.group_size}")
         if mode in (MXFPMode.W4A8, MXFPMode.W4A4) and self.quant_backend != "torch":
             raise ValueError("MXFP4 QAT requires quant_backend='torch'")
+        if self.mxfp4_mbs_enable and mode not in (MXFPMode.W4A8, MXFPMode.W4A4):
+            raise ValueError("MXFP4 MBS requires an MXFP4 QAT mode")
+        if self.mxfp4_mbs_enable and self.mxfp4_scale_alg != "standard":
+            raise ValueError("MXFP4 MBS currently requires mxfp4_scale_alg='standard'")
         if self.quant_backend not in ("torch", "npu"):
             raise ValueError(f"Unsupported MXFP quant backend {self.quant_backend!r}")
         object.__setattr__(self, "fake_quant_targets", _normalize_targets(self.fake_quant_targets))

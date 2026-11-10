@@ -349,6 +349,7 @@ def quantize_with_probe(
                 quant_backend=config.quant_backend,
                 rounding_mode=config.rounding_mode,
                 mxfp4_scale_alg=getattr(config, "mxfp4_scale_alg", "standard"),
+                mxfp4_mbs_enable=getattr(config, "mxfp4_mbs_enable", False) and fmt == "mxfp4",
             )
     else:
         quantized = fake_quantize(
@@ -357,6 +358,7 @@ def quantize_with_probe(
             quant_backend=config.quant_backend,
             rounding_mode=config.rounding_mode,
             mxfp4_scale_alg=getattr(config, "mxfp4_scale_alg", "standard"),
+            mxfp4_mbs_enable=getattr(config, "mxfp4_mbs_enable", False) and fmt == "mxfp4",
         )
     if record_names:
         _PROBE.record_many(

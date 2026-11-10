@@ -80,6 +80,25 @@ def test_fake_quant_pads_and_restores_non_aligned_dimension(fmt):
     assert torch.isfinite(y).all()
 
 
+def test_mxfp4_mbs_matches_macroblock_qdq_with_inverse_correction():
+    x = torch.linspace(-3.8, 4.0, 128, dtype=torch.float32).reshape(1, 128).to(torch.bfloat16)
+    expected = (fake_quantize(x.to(torch.float32) * 1.5, "mxfp4") / 1.5).to(x.dtype)
+
+    actual = fake_quantize(x, "mxfp4", mxfp4_mbs_enable=True)
+
+    assert actual.dtype == x.dtype
+    torch.testing.assert_close(actual, expected)
+    assert not torch.equal(actual, fake_quantize(x, "mxfp4"))
+
+
+def test_mxfp4_mbs_handles_partial_final_macroblock():
+    x = torch.linspace(-2.0, 2.0, 160, dtype=torch.float32).reshape(2, 80)
+    actual = fake_quantize(x, "mxfp4", mxfp4_mbs_enable=True)
+
+    assert actual.shape == x.shape
+    assert torch.isfinite(actual).all()
+
+
 def test_rotation_is_seeded_and_orthogonal():
     config = RotationConfig(enable=True, targets=("fprop",), block_size=8, seed=17)
     matrix_a = _matrix(8, 17, torch.device("cpu"), torch.float32)
@@ -98,6 +117,34 @@ def test_linear_replacement_reuses_parameters_and_has_identity_without_transform
     assert qat.bias is linear.bias
     x = torch.randn((3, 32))
     assert torch.equal(qat(x), linear(x))
+
+
+def test_mxfp4_mbs_config_rejects_unsupported_modes_and_scale_algorithms():
+    config = MXFPQATConfig(mode="mxfp_w4a8", quant_backend="torch", mxfp4_mbs_enable=True)
+    assert config.mxfp4_mbs_enable
+    with pytest.raises(ValueError, match="requires an MXFP4 QAT mode"):
+        MXFPQATConfig(mode="mxfp_w8a8", quant_backend="torch", mxfp4_mbs_enable=True)
+    with pytest.raises(ValueError, match="mxfp4_scale_alg='standard'"):
+        MXFPQATConfig(mode="mxfp_w4a8", quant_backend="torch", mxfp4_scale_alg="tfs", mxfp4_mbs_enable=True)
+
+
+def test_mxfp4_mbs_linear_forward_and_backward_targets():
+    linear = torch.nn.Linear(128, 128)
+    config = MXFPQATConfig(
+        mode="mxfp_w4a4",
+        quant_backend="torch",
+        fake_quant_targets=("fprop", "dgrad", "wgrad"),
+        mxfp4_mbs_enable=True,
+    )
+    qat = MXFPQATLinear.from_linear(linear, config)
+    x = torch.randn((4, 128), requires_grad=True)
+
+    output = qat(x)
+    output.square().mean().backward()
+
+    assert output.shape == (4, 128)
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert qat.weight.grad is not None and torch.isfinite(qat.weight.grad).all()
 
 
 @pytest.mark.parametrize("targets", [("fprop",), ("dgrad",), ("wgrad",), ("fprop", "dgrad", "wgrad")])

@@ -38,6 +38,7 @@ def test_mxfp_qat_config_maps_vllm_ascend_env(mode, expected_mode):
     assert env["VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND"] == "torch"
     assert env["VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE"] == "hash"
     assert env["VLLM_ASCEND_QAT_MXFP4_SCALE_ALG"] == "cx"
+    assert env["VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE"] == "false"
     assert json.loads(env["VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS"]) == ["fprop", "dgrad", "wgrad"]
     assert env["VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE"] == "true"
     assert json.loads(env["VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS"]) == ["fprop", "wgrad"]
@@ -46,9 +47,7 @@ def test_mxfp_qat_config_maps_vllm_ascend_env(mode, expected_mode):
 
 
 def test_mxfp_qat_config_keeps_disabled_experts_in_high_precision():
-    env = mxfp_qat_config_to_vllm_ascend_env(
-        {"mode": "mxfp_w8a8", "group_size": 32, "experts": {"enable": False}}
-    )
+    env = mxfp_qat_config_to_vllm_ascend_env({"mode": "mxfp_w8a8", "group_size": 32, "experts": {"enable": False}})
 
     ignore_patterns = json.loads(env["VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS"])
     assert any("mlp\\.experts" in pattern for pattern in ignore_patterns)
@@ -84,4 +83,22 @@ def test_mxfp_qat_config_rejects_npu_stochastic_rounding():
     with pytest.raises(ValueError, match="requires quant_backend='torch'"):
         mxfp_qat_config_to_vllm_ascend_env(
             {"mode": "mxfp_w8a8", "group_size": 32, "quant_backend": "npu", "rounding_mode": "hash"}
+        )
+
+
+def test_mxfp_qat_config_propagates_mbs_and_rejects_unsupported_scale():
+    env = mxfp_qat_config_to_vllm_ascend_env(
+        {"mode": "mxfp_w4a8", "group_size": 32, "quant_backend": "torch", "mxfp4_mbs_enable": True}
+    )
+    assert env["VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE"] == "true"
+
+    with pytest.raises(ValueError, match="mxfp4_scale_alg='standard'"):
+        mxfp_qat_config_to_vllm_ascend_env(
+            {
+                "mode": "mxfp_w4a8",
+                "group_size": 32,
+                "quant_backend": "torch",
+                "mxfp4_mbs_enable": True,
+                "mxfp4_scale_alg": "cx",
+            }
         )
