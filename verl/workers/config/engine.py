@@ -156,6 +156,7 @@ class QATEngineConfig(BaseConfig):
     quant_backend: str = "npu"
     rounding_mode: str = "rint"
     mxfp4_scale_alg: str = "standard"
+    mxfp4_mbs_enable: bool = False
     fake_quant_targets: list[str] = field(default_factory=lambda: ["Fprop"])
     backward_reduction_axis_fake_quant: bool = False
     rotation_enable: bool = False

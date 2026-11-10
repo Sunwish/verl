@@ -14,6 +14,7 @@
 
 import pytest
 
+from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig
 
 
@@ -51,6 +52,21 @@ class TestFSDPEngineConfigCPU:
         assert config.param_offload is False
         assert config.optimizer_offload is False
         assert config.fsdp_size == -1
+
+    def test_mxfp4_mbs_qat_config_from_target(self):
+        config = omega_conf_to_dataclass(
+            {
+                "_target_": "verl.workers.config.FSDPEngineConfig",
+                "qat": {
+                    "_target_": "verl.workers.config.QATEngineConfig",
+                    "enable": True,
+                    "mode": "mxfp_w4a8",
+                    "mxfp4_mbs_enable": True,
+                },
+            }
+        )
+
+        assert config.qat.mxfp4_mbs_enable is True
 
     @pytest.mark.parametrize(
         "offload_params",

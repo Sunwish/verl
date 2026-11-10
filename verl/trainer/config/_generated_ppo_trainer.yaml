@@ -59,6 +59,7 @@ actor_rollout_ref:
         quant_backend: npu
         rounding_mode: rint
         mxfp4_scale_alg: standard
+        mxfp4_mbs_enable: false
         fake_quant_targets:
         - Fprop
         backward_reduction_axis_fake_quant: false
@@ -252,6 +253,7 @@ actor_rollout_ref:
         quant_backend: npu
         rounding_mode: rint
         mxfp4_scale_alg: standard
+        mxfp4_mbs_enable: false
         fake_quant_targets:
         - Fprop
         backward_reduction_axis_fake_quant: false
@@ -564,6 +566,7 @@ critic:
       quant_backend: npu
       rounding_mode: rint
       mxfp4_scale_alg: standard
+      mxfp4_mbs_enable: false
       fake_quant_targets:
       - Fprop
       backward_reduction_axis_fake_quant: false
