@@ -31,7 +31,13 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from verl.utils.fsdp_router_replay import FSDPRouterReplay, r3_route_fingerprint, validate_vllm_r3_routes
+from verl.utils.fsdp_router_replay import (
+    FSDPRouterReplay,
+    log_r3_probability_comparison,
+    r3_route_fingerprint,
+    route_alignment_diagnostics,
+    validate_vllm_r3_routes,
+)
 from verl.utils.qat.mxfp_linear import MXFPQATConfig
 from verl.utils.qat.mxfp_moe import (
     attach_mxfp_expert_qat,
@@ -347,3 +353,111 @@ def test_fingerprint_detects_token_layer_slot_reordering():
     assert fingerprint == r3_route_fingerprint(routes.to(torch.uint8))
     for dimension in range(3):
         assert fingerprint != r3_route_fingerprint(routes.flip(dimension))
+
+
+def test_alignment_diagnostics_ignore_slot_order_and_detect_token_and_layer_shifts():
+    torch.manual_seed(281)
+    native = torch.stack([torch.randperm(128)[:8] for _ in range(20 * 5)]).view(20, 5, 8)
+    mask = torch.ones(20, dtype=torch.bool)
+    mask[[9, 19]] = False
+    offsets = [0, 10, 20]
+    slots = route_alignment_diagnostics(native.flip(-1), native, mask, offsets)
+    assert slots["set_equal_fraction_per_layer"] == [1] * 5
+    shifted = native.clone()
+    for start, end in ((0, 10), (10, 20)):
+        shifted[start : end - 1] = native[start + 1 : end]
+    token = route_alignment_diagnostics(shifted, native, mask, offsets)
+    assert token["token_delta_set_overlap"][1] == [1] * 5
+    assert max(token["token_delta_set_overlap"][0]) < 0.2
+    layer = route_alignment_diagnostics(native.roll(-1, 1), native, mask, offsets)
+    assert layer["layer_delta_set_overlap"][1] == [1] * 4
+
+
+def test_alignment_diagnostics_never_compare_across_sequence_boundaries():
+    # A global shift would match at token 1 -> 2, which crosses samples.
+    native = torch.tensor([[[0, 1]], [[2, 3]], [[4, 5]], [[6, 7]]])
+    targets = torch.tensor([[[2, 3]], [[4, 5]], [[6, 7]], [[0, 1]]])
+    result = route_alignment_diagnostics(targets, native, torch.ones(4, dtype=torch.bool), [0, 2, 4])
+    assert result["token_delta_set_overlap"][1] == [1]
+    short = route_alignment_diagnostics(targets, native, torch.ones(4, dtype=torch.bool), [0, 1, 2, 3, 4])
+    assert short["token_delta_set_overlap"][2] == []
+    assert short["token_delta_set_overlap"][-2] == []
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_native_diagnostic_is_independent_and_preserves_replay_outputs_and_counters(block_class, dtype, caplog):
+    torch.manual_seed(39)
+    block = block_class().to(dtype)
+    reference = copy.deepcopy(block)
+    x = torch.randn(7, 32, dtype=dtype)
+    native_expected = reference(x)[0]
+    replay = FSDPRouterReplay(1, 4, 2, 1, False, debug_native_compare=True)
+    replay.install(block)
+    ids, routes, mask = _nested_inputs([4, 3], layers=1)
+    with caplog.at_level("WARNING"), replay.batch(True):
+        replay.set_microbatch(ids, routes, mask)
+        output = block(x)[0]
+        cached_indices = replay._forward_indices[0].clone()
+        stats = replay._stats.clone()
+        with replay.native_diagnostic():
+            native_actual = block(x)[0]
+            assert replay.diagnosing_native and not replay.active
+        torch.testing.assert_close(native_actual, native_expected)
+        assert replay.active and not replay.diagnosing_native
+        assert replay._forward_calls == [1]
+        assert replay._backward_calls == [0]
+        torch.testing.assert_close(replay._stats, stats)
+        torch.testing.assert_close(replay._forward_indices[0], cached_indices)
+        torch.testing.assert_close(output, _oracle(reference, x, cached_indices))
+        replay.finish_microbatch(True)
+    assert "path=native_hidden" in caplog.text and "path=replay_hidden" in caplog.text
+    assert "forward_calls=1 recompute_calls=0" in caplog.text
+    assert not replay._diagnostic_indices
+
+
+def test_replay_native_expert_ids_with_different_slot_order_preserves_output(block_class):
+    torch.manual_seed(30)
+    block = block_class().to(torch.bfloat16)
+    reference = copy.deepcopy(block)
+    x = torch.randn(7, 32, dtype=torch.bfloat16)
+    ids, routes, mask = _nested_inputs([4, 3], layers=1)
+    indices = reference.gate(x).float().softmax(-1).topk(2).indices.flip(-1)
+    routes = torch.nested.nested_tensor_from_jagged(indices.unsqueeze(1), ids.offsets())
+    replay = FSDPRouterReplay(1, 4, 2, 0, False)
+    replay.install(block)
+    expected = reference(x)[0]
+    with replay.batch(True):
+        replay.set_microbatch(ids, routes, mask)
+        actual = block(x)[0]
+        replay.finish_microbatch(True)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_probability_comparison_uses_valid_tokens_and_keeps_inputs_unchanged(caplog):
+    native = torch.tensor([[0.01, 0.2, 0.3, 0.9, 0.8, 0.5]]).log()
+    replay = torch.tensor([[0.9, 0.01, 0.8, 0.2, 0.3, 0.5]]).log()
+    rollout = native.clone()
+    mask = torch.tensor([[1, 1, 1, 1, 1, 0]])
+    rollout[0, -1] = float("nan")
+    before = replay.clone()
+    with caplog.at_level("WARNING"):
+        stats = log_r3_probability_comparison(replay, native, rollout, mask, rank=1, batch=1)
+    assert stats["native_rollout_pearson"] == pytest.approx(1)
+    assert stats["replay_rollout_pearson"] < 0
+    assert stats["native_rollout_mean_abs_prob_diff"] == 0
+    torch.testing.assert_close(replay, before)
+    assert "[R3][PROB_COMPARE] rank=1 batch=1 valid_tokens=5" in caplog.text
+
+
+def test_native_diagnostic_failure_cleans_up_and_propagates(block_class):
+    block = block_class()
+    replay = FSDPRouterReplay(1, 4, 2, 1, False, debug_native_compare=True)
+    replay.install(block)
+    ids, routes, mask = _nested_inputs([4, 3], layers=1)
+    with pytest.raises(RuntimeError, match="native failure"), replay.batch(True):
+        replay.set_microbatch(ids, routes, mask)
+        block(torch.randn(7, 32))
+        with replay.native_diagnostic():
+            raise RuntimeError("native failure")
+    assert not replay.active and not replay.diagnosing_native
+    assert replay._targets is None and not replay._forward_indices and not replay._diagnostic_indices

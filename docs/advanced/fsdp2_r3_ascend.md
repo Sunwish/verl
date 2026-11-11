@@ -32,6 +32,21 @@ bash examples/grpo_trainer/run_qwen3_moe_r3_fsdp2.sh --smoke "$BASELINE"
 
 `--smoke` 默认运行 2 个训练 step，保留原始 64/32、rollout n=4、512/512 等场景参数；使用带时间戳的新实验目录，禁用自动续训、保存及评测。无需缩短序列或改成 eager 就可先尝试原场景。不要指向旧实验的 RUN_ROOT/CKPT_DIR，除非有意续训它。
 
+### Pearson 下降时的同批次对照
+
+`[VERIFY] PASS` 证明采集 ID 被用于 forward/backward，不证明这些 ID 对应正确 token，也不证明训推概率数值一致。BF16 关闭 R3 时 Pearson 约 0.98、开启后约 0.6，应视为待定位回归，不能验收。
+
+```bash
+bash examples/grpo_trainer/run_qwen3_moe_r3_fsdp2.sh --smoke --diagnose "$BASELINE"
+```
+
+`--diagnose` 仅在每个 rank、每轮 old-log-prob 的第一个微批次额外执行一次原生路由 forward；使用同一输入、同一权重、eval/no-grad。它不替换 PPO 使用的回放概率，不改采集、更新、graph、async 或量化配置。该诊断有额外时间开销，默认关闭。
+
+- `[PROB_COMPARE]` 同批次的 `native_rollout_pearson`、`replay_rollout_pearson` 和 `replay_native_pearson`，以及概率/对数概率绝对差。如果原生高而回放低，可以排除不同 run 的采样差异，将问题收敛到回放路径。
+- `[ROUTE_COMPARE]` 对每层比较专家集合，而非 top-k 槽位顺序。`native_hidden` 是独立原生 forward，`replay_hidden` 是回放 forward 进入各层时的原生 top-k。`token_delta_set_overlap[d]` 比较 capture[t] 与 native[t+d]，不跨样本边界；`layer_delta_set_overlap` 检查相邻层错位。相邻 token 本身可能相似，偏移重合度仅提供线索，不能单独判定错位或用于自动修正。
+
+保留完整 `train.log`（含 CAPTURE、TP_CAPTURE、rank 0），不能只截 VERIFY。Pearson 的实现比较有效 response token 上 `exp(old_log_probs)` 与 `exp(rollout_log_probs)`，在 actor 参数更新之前计算。R3 保留当前 router 的混合权重，不保证 BF16 概率逐位一致，但明显恶化需要查明原因。
+
 若第一轮需要区分采集问题和图/异步问题，可单独运行：
 
 ```bash

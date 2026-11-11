@@ -18,12 +18,17 @@
 set -euo pipefail
 
 smoke=false
-if [[ ${1:-} == --smoke ]]; then
-    smoke=true
+diagnose=false
+while [[ ${1:-} == --smoke || ${1:-} == --diagnose ]]; do
+    if [[ $1 == --smoke ]]; then
+        smoke=true
+    else
+        diagnose=true
+    fi
     shift
-fi
+done
 if [[ $# -lt 1 || ! -f $1 ]]; then
-    echo "Usage: bash $0 [--smoke] /path/to/original_baseline_resume.sh [Hydra overrides...]" >&2
+    echo "Usage: bash $0 [--smoke] [--diagnose] /path/to/original_baseline_resume.sh [Hydra overrides...]" >&2
     exit 2
 fi
 baseline_script=$(realpath "$1")
@@ -84,6 +89,7 @@ echo "[R3] baseline=${baseline_script} smoke=${smoke} RUN_ROOT=${RUN_ROOT} LOG_D
 bash "$baseline_script" "$@" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.router_replay.mode=R3 \
+    actor_rollout_ref.actor.fsdp_config.router_replay.debug_native_compare=$diagnose \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.enable_rollout_routing_replay=True \
     actor_rollout_ref.rollout.enable_prefix_caching=False \

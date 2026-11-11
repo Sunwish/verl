@@ -177,6 +177,8 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         replay, layer = replay_binding
         norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
         selected_experts, routing_weights = replay.route(layer, router_logits, selected_experts, norm_topk_prob)
+    elif replay_binding is not None and replay_binding[0].diagnosing_native:
+        replay_binding[0].record_native(replay_binding[1], selected_experts)
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 

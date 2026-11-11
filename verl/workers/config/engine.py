@@ -66,6 +66,9 @@ class EngineRouterReplayConfig(BaseConfig):
     mode: str = "disabled"
     record_file: Optional[str] = None
     replay_file: Optional[str] = None
+    # FSDP2 R3: compare native and replay forwards on the same old-log-prob
+    # micro-batch. Diagnostic only; adds one forward per rank per rollout batch.
+    debug_native_compare: bool = False
 
     def __post_init__(self):
         """Validate router replay configuration."""

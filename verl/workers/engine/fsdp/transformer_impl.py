@@ -178,13 +178,15 @@ class FSDPEngine(BaseEngine):
                 hf_config.num_experts_per_tok,
                 self.rank,
                 self.model_config.enable_gradient_checkpointing,
+                debug_native_compare=self.engine_config.router_replay.debug_native_compare,
             )
             logger.warning(
-                "[R3][CONFIG] rank=%s qat=%s qat_mode=%s rotation=%s reference_replay=disabled",
+                "[R3][CONFIG] rank=%s qat=%s qat_mode=%s rotation=%s reference_replay=disabled native_compare=%s",
                 self.rank,
                 self._qat_enabled,
                 getattr(self._qat_config, "mode", None),
                 getattr(self._qat_config, "rotation_enable", False),
+                self._router_replay.debug_native_compare,
             )
         if self._qat_enabled:
             logger.info(f"QAT enabled: mode={self._qat_config.mode}, group_size={self._qat_config.group_size}")
@@ -1378,6 +1380,33 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
+            if replay is not None and replay.compare_native_this_microbatch:
+                from verl.utils.fsdp_router_replay import log_r3_probability_comparison
+                from verl.workers.utils.padding import no_padding_2_padding
+
+                if not forward_only or "rollout_log_probs" not in micro_batch:
+                    raise RuntimeError("[R3][NATIVE_COMPARE] require old-log-prob inference with rollout_log_probs")
+                # Release the full-vocabulary replay logits before the extra
+                # forward. Only small selected-token log-probs are retained.
+                del raw_output
+                with replay.native_diagnostic():
+                    native_raw = self.module(**model_inputs, use_cache=False)
+                    native_output = self.prepare_model_outputs(
+                        output=native_raw,
+                        output_args=output_args,
+                        micro_batch=micro_batch,
+                        logits_processor_func=loss_function,
+                    )
+                    del native_raw
+                log_r3_probability_comparison(
+                    no_padding_2_padding(model_output["log_probs"], micro_batch),
+                    no_padding_2_padding(native_output["log_probs"], micro_batch),
+                    micro_batch["rollout_log_probs"],
+                    micro_batch["response_mask"],
+                    replay.rank,
+                    replay._batch_id,
+                )
+                del native_output
 
             if loss_function is not None:
                 loss, metrics = loss_function(

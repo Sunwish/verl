@@ -111,3 +111,72 @@ def test_r3_rejects_bypassed_old_log_prob_before_worker_launch():
     )
     with pytest.raises(ValueError, match="bypass_mode=False"):
         validate_config(config, use_reference_policy=True, use_critic=False)
+
+
+def test_production_forward_step_compares_native_without_replacing_replay_probabilities(caplog):
+    from verl.workers.utils.padding import no_padding_2_padding
+
+    path = Path(__file__).parents[2] / "verl/workers/engine/fsdp/transformer_impl.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "FSDPEngineWithLMHead")
+    tree.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward_step"]
+    ns = {
+        "torch": torch,
+        "TensorDict": TensorDict,
+        "ContextManager": object,
+        "nullcontext": nullcontext,
+        "get_device_name": lambda: "cpu",
+        "get_device_id": lambda: "cpu",
+    }
+    exec(compile(tree, str(path), "exec"), ns)
+
+    offsets = torch.tensor([0, 5, 9])
+    ids = torch.nested.nested_tensor_from_jagged(torch.arange(9), offsets)
+    targets = torch.tensor([2, 3]).expand(9, 1, 2).clone()
+    routes = torch.nested.nested_tensor_from_jagged(targets, offsets)
+    replay = FSDPRouterReplay(1, 4, 2, 1, False, debug_native_compare=True)
+    mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    replay_logs = torch.linspace(-2, -0.1, 9)
+    native_logs = replay_logs.flip(0).clone()
+    data = TensorDict(
+        {
+            "input_ids": ids,
+            "routed_experts": routes,
+            "response_mask": mask,
+            "prompts": torch.ones(2, 2, dtype=torch.long),
+            "responses": torch.ones(2, 3, dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 1, 0]]),
+        },
+        batch_size=[2],
+    )
+    expected = no_padding_2_padding(torch.nested.nested_tensor_from_jagged(replay_logs, offsets), data)
+    data["rollout_log_probs"] = no_padding_2_padding(native_logs, data)
+    calls = []
+
+    def model(use_cache):
+        assert not use_cache
+        calls.append(replay.active)
+        native = torch.tensor([0, 1]).expand(9, 2)
+        if replay.active:
+            replay.route(0, torch.zeros(9, 4), native, True)
+            logs = replay_logs
+        else:
+            assert not torch.is_grad_enabled()
+            replay.record_native(0, native)
+            logs = native_logs
+        return torch.nested.nested_tensor_from_jagged(logs, offsets)
+
+    engine = SimpleNamespace(
+        _router_replay=replay,
+        _autocast_dtype=torch.float32,
+        module=model,
+        prepare_model_inputs=lambda **kwargs: ({}, {}),
+        prepare_model_outputs=lambda **kwargs: {"log_probs": kwargs["output"]},
+    )
+    with caplog.at_level("WARNING"), replay.batch(True):
+        _, output = ns["forward_step"](engine, data, loss_function=None, forward_only=True)
+        torch.testing.assert_close(no_padding_2_padding(output["model_output"]["log_probs"], data), expected)
+        replay.finish_microbatch(True)
+    assert calls == [True, False]
+    assert "'native_rollout_pearson': 1.0" in caplog.text
+    assert "[R3][VERIFY]" in caplog.text and "forward_calls=1 recompute_calls=0" in caplog.text

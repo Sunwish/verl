@@ -121,6 +121,8 @@ def audit_r3_log(text: str, ranks: int, min_batches: int, require_native_diff: b
         raise ValueError("R3 audit FAILED:\n" + "\n".join(errors[:30]))
     return {
         "status": "PASS",
+        "validation_scope": "capture_transport_dispatch_only",
+        "numerical_equivalence": "NOT_CERTIFIED",
         "ranks": ranks,
         "unique_rollout_signatures": len(captures),
         "transport_microbatches": len(transports),

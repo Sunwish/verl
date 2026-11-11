@@ -40,6 +40,68 @@ def r3_route_fingerprint(routes: torch.Tensor) -> torch.Tensor:
     return (routes.reshape(-1).to(torch.int64) * weights).sum()
 
 
+def route_alignment_diagnostics(targets, native, mask, offsets) -> dict:
+    """Compare expert *sets*, including nearby rows without crossing sequences.
+
+    token_delta=d compares capture[t] to native[t+d]. This only diagnoses a
+    possible shift; consecutive tokens can legitimately share expert sets.
+    Run on CPU outside forward/checkpoint/graph capture.
+    """
+    targets, native = targets.long(), native.long()
+    target_sets, native_sets = targets.sort(-1).values, native.sort(-1).values
+    selected = mask.bool()
+    equal = target_sets == native_sets
+    overlap = (targets.unsqueeze(-1) == native.unsqueeze(-2)).any(-1).float().mean(-1)
+    result = {
+        "captured_tokens": int(selected.sum()),
+        "set_equal_fraction_per_layer": equal.all(-1)[selected].float().mean(0).tolist(),
+        "set_overlap_per_layer": overlap[selected].mean(0).tolist(),
+        "token_delta_set_overlap": {},
+    }
+    for delta in (-2, -1, 0, 1, 2):
+        matches, count = 0, 0
+        for start, end in zip(offsets[:-1], offsets[1:], strict=True):
+            lo, hi = max(start, start - delta), min(end, end - delta)
+            if lo >= hi:
+                continue
+            valid = selected[lo:hi]
+            if valid.any():
+                a, b = targets[lo:hi][valid], native[lo + delta : hi + delta][valid]
+                matches += (a.unsqueeze(-1) == b.unsqueeze(-2)).any(-1).sum((0, 2))
+                count += a.shape[0] * targets.shape[-1]
+        result["token_delta_set_overlap"][delta] = (matches.float() / count).tolist() if count else []
+    result["layer_delta_set_overlap"] = {}
+    for delta in (-1, 1):
+        lo, hi = max(0, -delta), min(targets.shape[1], targets.shape[1] - delta)
+        if lo < hi:
+            a, b = targets[selected, lo:hi], native[selected, lo + delta : hi + delta]
+            result["layer_delta_set_overlap"][delta] = (
+                (a.unsqueeze(-1) == b.unsqueeze(-2)).any(-1).float().mean((0, 2)).tolist()
+            )
+    return result
+
+
+def log_r3_probability_comparison(replay_log_probs, native_log_probs, rollout_log_probs, response_mask, rank, batch):
+    """Log same-token numerical evidence; never substitute the PPO old policy."""
+    from verl.utils.debug.metrics import pearson_correlation_coefficient
+
+    mask = response_mask.detach().cpu().bool()
+    values = [p.detach().float().cpu() for p in (replay_log_probs, native_log_probs, rollout_log_probs)]
+    if not mask.any():
+        raise RuntimeError("[R3][PROB_COMPARE] diagnostic has no valid response tokens")
+    summary = {}
+    for name, logs in zip(("replay", "native", "rollout"), values, strict=True):
+        if logs.shape != mask.shape or not torch.isfinite(logs[mask]).all():
+            raise RuntimeError(f"[R3][PROB_COMPARE] invalid {name} log-probability tensor")
+        summary[f"{name}_mean_log_prob"] = logs[mask].mean().item()
+    for name, a, b in (("replay_rollout", 0, 2), ("native_rollout", 1, 2), ("replay_native", 0, 1)):
+        summary[f"{name}_pearson"] = pearson_correlation_coefficient(values[a].exp(), values[b].exp(), mask)
+        summary[f"{name}_mean_abs_prob_diff"] = (values[a].exp() - values[b].exp())[mask].abs().mean().item()
+        summary[f"{name}_mean_abs_log_prob_diff"] = (values[a] - values[b])[mask].abs().mean().item()
+    logger.warning("[R3][PROB_COMPARE] rank=%s batch=%s valid_tokens=%s %s", rank, batch, mask.sum().item(), summary)
+    return summary
+
+
 def validate_vllm_r3_routes(
     routes: torch.Tensor,
     prompt_length: int,
@@ -89,7 +151,15 @@ def validate_vllm_r3_routes(
 class FSDPRouterReplay:
     """Bind validated rollout expert IDs to Qwen3 model layers and audit their use."""
 
-    def __init__(self, num_layers: int, num_experts: int, top_k: int, rank: int, checkpointing: bool):
+    def __init__(
+        self,
+        num_layers: int,
+        num_experts: int,
+        top_k: int,
+        rank: int,
+        checkpointing: bool,
+        debug_native_compare: bool = False,
+    ):
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.top_k = top_k
@@ -102,6 +172,8 @@ class FSDPRouterReplay:
         self._microbatch = 0
         self._backward = False
         self._phase = "inactive"
+        self.debug_native_compare = debug_native_compare
+        self.diagnosing_native = False
 
     def install(self, model: nn.Module) -> None:
         """Attach to the exact NPU MoE entry point before FSDP wraps the modules."""
@@ -170,11 +242,13 @@ class FSDPRouterReplay:
             raise
         finally:
             self.active = False
+            self.diagnosing_native = False
             self._targets = self._mask = None
             self._totals = None
             self._backward = False
             self._forward_indices = {}
             self._layer_diffs = []
+            self._diagnostic_indices = {}
 
     def set_microbatch(self, input_ids: torch.Tensor, routes: torch.Tensor | None, response_mask: torch.Tensor) -> None:
         """Validate nested alignment and prepare all captured input positions.
@@ -219,9 +293,11 @@ class FSDPRouterReplay:
         self._forward_indices: dict[int, torch.Tensor] = {}
         self._backward = False
         self._stats = torch.zeros(4, dtype=torch.int64, device=targets.device)
+        self._diagnostic_indices = {}
         self._layer_diffs = []
         self._microbatch += 1
         lengths_cpu = lengths.cpu().tolist()
+        self._diagnostic_offsets = input_ids.offsets().cpu().tolist() if self.debug_native_compare else None
         # Audit signatures on CPU, both to keep the signature arithmetic identical
         # to rollout validation and avoid relying on NPU int64 pow/remainder kernels.
         # Copy the narrow transport dtype once rather than the expanded int64 targets.
@@ -280,6 +356,8 @@ class FSDPRouterReplay:
         else:
             indices = torch.where(self._mask.unsqueeze(-1), target, native_indices)
             self._forward_indices[layer] = indices.detach().clone()
+            if self.compare_native_this_microbatch:
+                self._diagnostic_indices[layer] = native_indices.detach().clone()
         weights = torch.softmax(router_logits, dim=-1, dtype=torch.float32).gather(-1, indices)
         if norm_topk_prob:
             weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -295,6 +373,49 @@ class FSDPRouterReplay:
         else:
             self._stats[2] += replay_diff.detach()
         return indices, weights
+
+    @property
+    def compare_native_this_microbatch(self) -> bool:
+        return self.debug_native_compare and self._phase == "old_log_prob" and self._microbatch == 1
+
+    def record_native(self, layer: int, indices: torch.Tensor) -> None:
+        """Observe an independent native forward without overriding its routing."""
+        if not self.diagnosing_native or layer in self._diagnostic_indices:
+            raise RuntimeError(f"[R3][NATIVE_COMPARE] unexpected native layer={layer}")
+        self._diagnostic_indices[layer] = indices.detach().clone()
+
+    @contextmanager
+    def native_diagnostic(self) -> Iterator[None]:
+        """Run a no-grad control on identical inputs and weights, preserving replay state."""
+        if not self.active or self._backward or not self.compare_native_this_microbatch:
+            raise RuntimeError("[R3][NATIVE_COMPARE] diagnostic outside first old-log-prob micro-batch")
+        replay_native = self._diagnostic_indices
+        self._diagnostic_indices = {}
+        self.active = False
+        self.diagnosing_native = True
+        try:
+            with torch.no_grad():
+                yield
+            if set(self._diagnostic_indices) != set(range(self.num_layers)):
+                raise RuntimeError("[R3][NATIVE_COMPARE] native forward did not observe every layer")
+            targets = self._targets.detach().cpu()
+            mask = self._mask.cpu()
+            offsets = self._diagnostic_offsets
+            for path, observed in (("replay_hidden", replay_native), ("native_hidden", self._diagnostic_indices)):
+                native = torch.stack([observed[layer] for layer in range(self.num_layers)], dim=1).cpu()
+                stats = route_alignment_diagnostics(targets, native, mask, offsets)
+                logger.warning(
+                    "[R3][ROUTE_COMPARE] rank=%s batch=%s microbatch=%s path=%s %s",
+                    self.rank,
+                    self._batch_id,
+                    self._microbatch,
+                    path,
+                    stats,
+                )
+        finally:
+            self.active = True
+            self.diagnosing_native = False
+            self._diagnostic_indices = {}
 
     def mark_backward(self) -> None:
         """Mark checkpoint re-entries as recomputation, retaining this micro-batch's targets."""
@@ -327,3 +448,4 @@ class FSDPRouterReplay:
         self._backward_total += sum(self._backward_calls)
         self._targets = self._mask = None
         self._forward_indices.clear()
+        self._diagnostic_indices.clear()

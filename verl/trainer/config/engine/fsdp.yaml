@@ -66,6 +66,7 @@ router_replay:
   mode: disabled
   record_file: null
   replay_file: null
+  debug_native_compare: false
 
 # Mixed precision training param dtype
 dtype: bfloat16 # ["bfloat16", "float16"]
