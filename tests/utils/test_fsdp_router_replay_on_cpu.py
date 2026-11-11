@@ -71,10 +71,11 @@ def block_class(monkeypatch):
 
     def permute(x, indices):
         order = indices.flatten().argsort(stable=True)
-        return x[order // indices.shape[-1]], order
+        # CANN returns the inverse map: token-slot -> sorted expert-buffer row.
+        return x[order // indices.shape[-1]], order.argsort()
 
-    def unpermute(x, order, probs):
-        restored = torch.zeros_like(x).index_copy(0, order, x)
+    def unpermute(x, mapping, probs):
+        restored = x.index_select(0, mapping)
         return (restored.view(*probs.shape, -1) * probs.unsqueeze(-1)).sum(dim=1)
 
     path = Path(__file__).parents[2] / "verl/models/transformers/npu_patch.py"
@@ -102,13 +103,13 @@ def block_class(monkeypatch):
     exec(compile(tree, str(path), "exec"), ns)
     monkeypatch.setattr("verl.utils.qat.mxfp_moe._call_grouped_matmul", _qat_gmm)
 
-    def init(self):
+    def init(self, num_experts=4, top_k=2):
         nn.Module.__init__(self)
-        self.gate = nn.Linear(32, 4, bias=False)
-        self.top_k, self.num_experts, self.norm_topk_prob = 2, 4, True
+        self.gate = nn.Linear(32, num_experts, bias=False)
+        self.top_k, self.num_experts, self.norm_topk_prob = top_k, num_experts, True
         self.experts = nn.Module()
-        self.experts.gate_up_proj = nn.Parameter(torch.randn(4, 64, 32) * 0.08)
-        self.experts.down_proj = nn.Parameter(torch.randn(4, 32, 32) * 0.08)
+        self.experts.gate_up_proj = nn.Parameter(torch.randn(num_experts, 64, 32) * 0.08)
+        self.experts.down_proj = nn.Parameter(torch.randn(num_experts, 32, 32) * 0.08)
 
     return type(
         "Qwen3MoeSparseMoeBlock",
@@ -461,3 +462,194 @@ def test_native_diagnostic_failure_cleans_up_and_propagates(block_class):
             raise RuntimeError("native failure")
     assert not replay.active and not replay.diagnosing_native
     assert replay._targets is None and not replay._forward_indices and not replay._diagnostic_indices
+    assert replay._moe_diagnostic is None
+
+
+def _moe_log(caplog, tag, path):
+    messages = [record.getMessage() for record in caplog.records if f"[R3][{tag}]" in record.getMessage()]
+    message = next(message for message in messages if f"path={path} " in message)
+    return ast.literal_eval(message[message.index("{") :])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("new_gate_api", [False, True])
+@pytest.mark.parametrize("qat", [False, True])
+def test_top8_128_experts_diagnostics_and_slot_permutation(block_class, dtype, new_gate_api, qat, caplog):
+    torch.manual_seed(154)
+    block = block_class(num_experts=128, top_k=8).to(dtype)
+    if new_gate_api:
+
+        class TupleGate(nn.Module):
+            def __init__(self, gate):
+                super().__init__()
+                self.weight = gate.weight
+                self.top_k, self.norm_topk_prob = 8, True
+
+            def forward(self, x):
+                logits = F.linear(x, self.weight)
+                weights, indices = logits.float().softmax(-1).topk(self.top_k)
+                return logits, (weights / weights.sum(-1, keepdim=True)).to(logits.dtype), indices
+
+        block.gate = TupleGate(block.gate)
+    if qat:
+        config = MXFPQATConfig(
+            mode="mxfp_w4a8",
+            quant_backend="torch",
+            fake_quant_targets=("fprop", "dgrad", "wgrad"),
+            backward_reduction_axis_fake_quant=True,
+            rotation_enable=True,
+            rotation_targets=("fprop", "dgrad"),
+            rotation_block_size=32,
+            rotation_seed=7,
+        )
+        assert attach_mxfp_expert_qat(block, config) == 1
+    reference = copy.deepcopy(block)
+    x = torch.randn(17, 32, dtype=dtype)
+    native_ids = F.linear(x, block.gate.weight).float().softmax(-1).topk(8).indices
+    ids, _, mask = _nested_inputs([9, 8], layers=1)
+    routes = torch.nested.nested_tensor_from_jagged(native_ids.flip(-1).unsqueeze(1), ids.offsets())
+    replay = FSDPRouterReplay(1, 128, 8, 2, False, debug_native_compare=True)
+    replay.install(block)
+    with caplog.at_level("WARNING"), torch.no_grad(), replay.batch(True):
+        replay.set_microbatch(ids, routes, mask)
+        replay_out = block(x)
+        replay_out = replay_out if new_gate_api else replay_out[0]
+        with replay.native_diagnostic():
+            native_out = block(x)
+            native_out = native_out if new_gate_api else native_out[0]
+        assert replay._moe_diagnostic is None
+        replay.finish_microbatch(True)
+    expected = reference(x)
+    expected = expected if new_gate_api else expected[0]
+    # BF16 summation can change by one ulp when the top-8 slots are reordered.
+    torch.testing.assert_close(replay_out, native_out, atol=0.001, rtol=0.02)
+    torch.testing.assert_close(native_out, expected)
+    for path in ("replay", "native"):
+        dispatch = _moe_log(caplog, "MOE_DISPATCH", path)
+        assert dispatch["integer_invariants"] == "PASS"
+        assert dispatch["sample_permuted_input_ref"]["max_abs"] == 0
+        weights = _moe_log(caplog, "MOE_WEIGHTS", path)
+        assert weights["top_k"] == 8 and weights["experts"] == 128
+        assert weights["selected_weights_cpu_ref"]["max_abs"] < (0.002 if dtype == torch.bfloat16 else 1e-6)
+        merge = _moe_log(caplog, "MOE_MERGE", path)
+        assert merge["cast_weights_vs_observed_precast"]["max_abs"] == 0
+        assert merge["unpermute_vs_cpu_dtype_merge"]["max_abs"] == 0
+        assert merge["qat"] == qat
+    pair = _moe_log(caplog, "MOE_COMPARE", "replay_vs_native")
+    assert pair["sample_same_set_different_order_tokens"] > 0
+    assert pair["sample_same_set_tokens"] == pair["sample_tokens"]
+    for stage in ("permuted", "up", "gate", "activation", "down"):
+        assert pair["shared_experts"][stage]["max_abs"] == 0
+    assert pair["input"]["max_abs"] == pair["logits"]["max_abs"] == 0
+
+
+@pytest.mark.parametrize("damage", ["weights", "permuted", "histogram", "row_map", "gmm", "merge"])
+def test_moe_diagnostics_locate_injected_kernel_errors(block_class, monkeypatch, caplog, damage):
+    torch.manual_seed(81)
+    block = block_class(num_experts=128, top_k=8)
+    x = torch.randn(7, 32)
+    ids, _, mask = _nested_inputs([4, 3], layers=1)
+    native = block.gate(x).float().softmax(-1).topk(8).indices
+    routes = torch.nested.nested_tensor_from_jagged(native.flip(-1).unsqueeze(1), ids.offsets())
+    replay = FSDPRouterReplay(1, 128, 8, 1, False, debug_native_compare=True)
+    replay.install(block)
+    namespace = block.forward.__func__.__globals__
+    kernels = namespace["torch_npu"]
+    if damage == "weights":
+        original = replay.route
+
+        def bad_weights(*args):
+            experts, weights = original(*args)
+            return experts, weights.roll(1, -1)
+
+        monkeypatch.setattr(replay, "route", bad_weights)
+    elif damage in ("permuted", "row_map"):
+        original = kernels.npu_moe_token_permute
+
+        def bad_permute(*args):
+            tokens, mapping = original(*args)
+            return (tokens.roll(1, 0), mapping) if damage == "permuted" else (tokens, mapping.roll(1))
+
+        monkeypatch.setattr(kernels, "npu_moe_token_permute", bad_permute)
+    elif damage == "histogram":
+        original = torch.histc
+        monkeypatch.setattr(torch, "histc", lambda *args, **kwargs: original(*args, **kwargs).roll(1))
+    elif damage == "gmm":
+        original = namespace["NPUGmmFunction"].apply
+        monkeypatch.setattr(
+            namespace["NPUGmmFunction"], "apply", lambda *args: original(*args) * (1.3 if replay.active else 1)
+        )
+    else:
+        original = kernels.npu_moe_token_unpermute
+        monkeypatch.setattr(kernels, "npu_moe_token_unpermute", lambda *args, **kwargs: original(*args, **kwargs) + 1)
+    with caplog.at_level("WARNING"), replay.batch(True):
+        replay.set_microbatch(ids, routes, mask)
+        block(x)
+        with replay.native_diagnostic():
+            block(x)
+        replay.finish_microbatch(True)
+    if damage == "weights":
+        assert _moe_log(caplog, "MOE_WEIGHTS", "replay")["selected_weights_cpu_ref"]["max_abs"] > 0.001
+    elif damage == "permuted":
+        assert _moe_log(caplog, "MOE_DISPATCH", "replay")["sample_permuted_input_ref"]["max_abs"] > 1
+    elif damage == "histogram":
+        assert _moe_log(caplog, "MOE_DISPATCH", "replay")["histogram_mismatch_experts"] > 0
+    elif damage == "row_map":
+        assert _moe_log(caplog, "MOE_DISPATCH", "replay")["expert_group_mismatch_rows"] > 0
+    elif damage == "gmm":
+        pair = _moe_log(caplog, "MOE_COMPARE", "replay_vs_native")
+        assert pair["shared_experts"]["permuted"]["max_abs"] == 0
+        assert pair["shared_experts"]["up"]["relative_rms"] == pytest.approx(0.3)
+    else:
+        assert _moe_log(caplog, "MOE_MERGE", "replay")["unpermute_vs_cpu_fp32_merge"]["mean_abs"] > 0.99
+
+
+def test_dispatch_oracle_rejects_forward_sort_and_duplicate_maps():
+    from verl.utils.fsdp_router_replay_debug import dispatch_diagnostics
+
+    ids = torch.tensor([[2, 0], [1, 2], [0, 1]])
+    forward = ids.flatten().argsort(stable=True)
+    inverse = forward.argsort()
+    histogram = torch.bincount(ids.flatten(), minlength=4)
+    assert dispatch_diagnostics(ids, inverse, histogram, 4)["expert_group_mismatch_rows"] == 0
+    assert dispatch_diagnostics(ids, forward, histogram, 4)["expert_group_mismatch_rows"] > 0
+    invalid = inverse.clone()
+    invalid[0] = invalid[1]
+    assert not dispatch_diagnostics(ids, invalid, histogram, 4)["row_map_is_permutation"]
+    assert dispatch_diagnostics(ids, inverse, histogram.float() + 0.1, 4)["histogram_mismatch_experts"] == 4
+
+
+def test_invalid_row_map_fails_with_diagnostics_and_cleans_state(block_class, monkeypatch, caplog):
+    block = block_class()
+    replay = FSDPRouterReplay(1, 4, 2, 1, False, debug_native_compare=True)
+    replay.install(block)
+    kernels = block.forward.__func__.__globals__["torch_npu"]
+    original = kernels.npu_moe_token_permute
+
+    def bad_permute(*args):
+        tokens, mapping = original(*args)
+        mapping[0] = mapping[1]
+        return tokens, mapping
+
+    monkeypatch.setattr(kernels, "npu_moe_token_permute", bad_permute)
+    ids, routes, mask = _nested_inputs([4, 3], layers=1)
+    with caplog.at_level("WARNING"), pytest.raises(RuntimeError, match="invalid permute row map"), replay.batch(True):
+        replay.set_microbatch(ids, routes, mask)
+        block(torch.randn(7, 32))
+    assert not _moe_log(caplog, "MOE_DISPATCH", "replay")["row_map_is_permutation"]
+    assert replay._moe_diagnostic is None and not replay.active and replay._targets is None
+
+
+@pytest.mark.parametrize("enabled,forward_only", [(False, True), (True, False)])
+def test_moe_diagnostics_do_not_run_when_disabled_or_during_actor_update(block_class, enabled, forward_only, caplog):
+    block = block_class()
+    replay = FSDPRouterReplay(1, 4, 2, 1, False, debug_native_compare=enabled)
+    replay.install(block)
+    ids, routes, mask = _nested_inputs([4, 3], layers=1)
+    with caplog.at_level("WARNING"), replay.batch(forward_only):
+        replay.set_microbatch(ids, routes, mask)
+        assert replay.moe_diagnostic(0) is None
+        assert replay.moe_diagnostic(1) is None
+        block(torch.randn(7, 32))
+        replay.finish_microbatch(forward_only)
+    assert "[R3][MOE_" not in caplog.text

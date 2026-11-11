@@ -45,6 +45,29 @@ bash examples/grpo_trainer/run_qwen3_moe_r3_fsdp2.sh --smoke --diagnose "$BASELI
 - `[PROB_COMPARE]` 同批次的 `native_rollout_pearson`、`replay_rollout_pearson` 和 `replay_native_pearson`，以及概率/对数概率绝对差。如果原生高而回放低，可以排除不同 run 的采样差异，将问题收敛到回放路径。
 - `[ROUTE_COMPARE]` 对每层比较专家集合，而非 top-k 槽位顺序。`native_hidden` 是独立原生 forward，`replay_hidden` 是回放 forward 进入各层时的原生 top-k。`token_delta_set_overlap[d]` 比较 capture[t] 与 native[t+d]，不跨样本边界；`layer_delta_set_overlap` 检查相邻层错位。相邻 token 本身可能相似，偏移重合度仅提供线索，不能单独判定错位或用于自动修正。
 
+### 第 0 层 MoE 算子对照
+
+同一个 `--diagnose` 命令还会输出以下 WARNING，不需要新增参数。每个 rank、每轮 old-log-prob 的首微批次分别观察 replay/native 第 0 层，不改前向结果和 PPO 概率，也不在 actor 更新或 checkpoint 重算中执行。
+
+| 日志 | 重点字段与定位方式 |
+| --- | --- |
+| `[MOE_WEIGHTS]` | 全部 token 的 gate logits 在 CPU FP32 上重新 softmax、按实际专家 ID gather、归一化。`selected_weights_cpu_ref` 检查回放权重；`native_weights_cpu_ref` 对照原生 gate 的精度。同时记录 cast 后误差、归一化行和、dtype、stride、128 专家/top-8，以及采样 token 行号。 |
+| `[MOE_DISPATCH]` | 全部 token-slot 的行映射必须是置换，按映射后的专家分组必须与排序后的专家 ID 一致，histc 必须等于 CPU bincount。`integer_invariants=PASS` 只表示这三个整数条件；`sample_permuted_input_ref` 另行检查实际分发的 hidden state 是否对应原 token。 |
+| `[MOE_MERGE]` | 将采样 token 的实际 down 输出按行映射搬到 CPU，乘实际 cast 后路由权重，独立求和。`unpermute_vs_cpu_fp32_merge` / `unpermute_vs_cpu_dtype_merge` 分别参考 FP32 累加和原 dtype 运算；另查 cast 及 SwiGLU。BF16 有舍入差异，不要求浮点误差逐位为零。 |
+| `[MOE_COMPARE]` | 两次实际前向的 input/logits、按专家 ID 对齐的 permuted/up/gate/activation/down、相同专家集合上的 weights/output。`shared_experts` 也比较集合有变化的 token 的公共专家，权重因归一化分母变化可以不同，因此判断权重用 `same_set_weights`。 |
+
+`tensor_difference` 字段含 `max_abs`、`mean_abs`、`relative_rms`、参考 RMS 和非有限值数。`relative_rms` 是误差 RMS / 参考 RMS；参考接近零时必须结合绝对误差判断。诊断只报告数值，不按任意容差输出数值验收 PASS。
+
+定位顺序：先查 WEIGHTS 的 CPU 参考；再查 DISPATCH 的整数条件和采样输入；然后在 COMPARE 中沿 `permuted -> up/gate -> activation -> down -> output` 找第一个明显增大的误差。如果公共专家的 down 一致、同集合权重一致，而同集合输出不一致，结合 MERGE 可直接检查 unpermute 的加权合并。如果各阶段都接近，仍需结合实际改变专家集合的 token 和后续层传播继续分析，不能据此宣告整个模型通过。
+
+路由权重和整数行映射检查覆盖第 0 层全部 token。激活只采样最多 32 个 token，覆盖相同集合、改变集合、未捕获位置和样本边界，并在各组内分散取点；两次前向使用相同行号。不会搬运专家权重或整个 top-k 展开的激活，但同步和 CPU 计算仍增加诊断耗时。检查按照 [Ascend permute API](https://github.com/Ascend/op-plugin/blob/master/docs/en/custom_APIs/torch_npu/torch_npu-npu_moe_token_permute.md) 的逆映射契约 `row_map[token*K+slot] -> expert_buffer_row`；无效映射会先输出日志再报错，避免错误索引。
+
+下一轮优先继续 BF16 原配置，保持图模式和 async 不变，保留完整 `train.log`、`r3_environment.log`。至少要同时看到每个 rank/batch 的 WEIGHTS、DISPATCH、MERGE 各两条（replay/native）、一条 COMPARE，以及原有 PROB_COMPARE。可用下面的命令提取便于阅读的副本，完整日志仍需保留：
+
+```bash
+grep -E '\[R3\]\[(MOE_WEIGHTS|MOE_DISPATCH|MOE_MERGE|MOE_COMPARE|PROB_COMPARE)\]' "$LOG_DIR/train.log" > "$LOG_DIR/r3_moe_diagnostics.log"
+```
+
 保留完整 `train.log`（含 CAPTURE、TP_CAPTURE、rank 0），不能只截 VERIFY。Pearson 的实现比较有效 response token 上 `exp(old_log_probs)` 与 `exp(rollout_log_probs)`，在 actor 参数更新之前计算。R3 保留当前 router 的混合权重，不保证 BF16 概率逐位一致，但明显恶化需要查明原因。
 
 若第一轮需要区分采集问题和图/异步问题，可单独运行：
@@ -103,6 +126,6 @@ python3 -m pytest tests/utils/test_fsdp_router_replay_on_cpu.py \
 python3 -m pytest --noconftest tests/ut/patch/worker/test_r3_capture_layout_cpu.py -q
 ```
 
-CPU 测试使用生产前向/driver 代码和真实 autograd/checkpoint/QAT，只替换 NPU 算子、collective 和分布式环境。覆盖 BF16/FP32、两种 Transformers gate API、专家和 gate 梯度对照、带/不带 checkpoint 数值梯度一致、W4A8 F/D/W + F/D 旋转、动态打包、无效输入拒绝、reference 隔离、TP=8 的 1/7/8/9/63/65 token 采集与日志损坏检测。
+CPU 测试使用生产前向/driver 代码和真实 autograd/checkpoint/QAT，只替换 NPU 算子、collective 和分布式环境。覆盖 BF16/FP32、两种 Transformers gate API、专家和 gate 梯度对照、带/不带 checkpoint 数值梯度一致、W4A8 F/D/W + F/D 旋转、动态打包、无效输入拒绝、reference 隔离、TP=8 的 1/7/8/9/63/65 token 采集与日志损坏检测。算子诊断另外覆盖 128 专家/top-8 的槽位重排，并分别注入错误权重、分发激活、histogram、行映射、GMM 和合并输出，检查对应日志能定位错误；CPU permute 替身遵循 CANN 逆映射契约。
 
 本地 Windows 无 Ascend，尚不能声明 8 卡 NPU 端到端通过。服务器首跑需保存完整 `train.log`、`r3_environment.log`、自动检查结果；失败时保留第一次 traceback 前后的日志及 Ray worker 对应日志。若缺失 CAPTURE/VERIFY，检查工具会失败，不会把训练进程正常退出当作功能验收。

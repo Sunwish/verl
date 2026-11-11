@@ -174,6 +174,7 @@ class FSDPRouterReplay:
         self._phase = "inactive"
         self.debug_native_compare = debug_native_compare
         self.diagnosing_native = False
+        self._moe_diagnostic = None
 
     def install(self, model: nn.Module) -> None:
         """Attach to the exact NPU MoE entry point before FSDP wraps the modules."""
@@ -249,6 +250,7 @@ class FSDPRouterReplay:
             self._forward_indices = {}
             self._layer_diffs = []
             self._diagnostic_indices = {}
+            self._moe_diagnostic = None
 
     def set_microbatch(self, input_ids: torch.Tensor, routes: torch.Tensor | None, response_mask: torch.Tensor) -> None:
         """Validate nested alignment and prepare all captured input positions.
@@ -294,6 +296,7 @@ class FSDPRouterReplay:
         self._backward = False
         self._stats = torch.zeros(4, dtype=torch.int64, device=targets.device)
         self._diagnostic_indices = {}
+        self._moe_diagnostic = None
         self._layer_diffs = []
         self._microbatch += 1
         lengths_cpu = lengths.cpu().tolist()
@@ -378,6 +381,18 @@ class FSDPRouterReplay:
     def compare_native_this_microbatch(self) -> bool:
         return self.debug_native_compare and self._phase == "old_log_prob" and self._microbatch == 1
 
+    def moe_diagnostic(self, layer: int):
+        """Observe only the first MoE in the paired no-grad diagnostic forwards."""
+        if layer != 0 or not self.compare_native_this_microbatch or self._backward:
+            return None
+        if not (self.active or self.diagnosing_native):
+            return None
+        if self._moe_diagnostic is None:
+            from verl.utils.fsdp_router_replay_debug import R3MoEDiagnostic
+
+            self._moe_diagnostic = R3MoEDiagnostic(self.rank, self._batch_id, self._mask, self._diagnostic_offsets)
+        return self._moe_diagnostic
+
     def record_native(self, layer: int, indices: torch.Tensor) -> None:
         """Observe an independent native forward without overriding its routing."""
         if not self.diagnosing_native or layer in self._diagnostic_indices:
@@ -416,6 +431,7 @@ class FSDPRouterReplay:
             self.active = True
             self.diagnosing_native = False
             self._diagnostic_indices = {}
+            self._moe_diagnostic = None
 
     def mark_backward(self) -> None:
         """Mark checkpoint re-entries as recomputation, retaining this micro-batch's targets."""
@@ -449,3 +465,4 @@ class FSDPRouterReplay:
         self._targets = self._mask = None
         self._forward_indices.clear()
         self._diagnostic_indices.clear()
+        self._moe_diagnostic = None

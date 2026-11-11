@@ -173,12 +173,28 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         if norm_topk_prob:  # only diff with mixtral sparse moe block!
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     replay_binding = getattr(self, "_fsdp_r3_replay", None)
+    diagnostic = replay_binding[0].moe_diagnostic(replay_binding[1]) if replay_binding is not None else None
+    if diagnostic is not None:
+        native_experts, native_weights = selected_experts, routing_weights
+        diagnostic_path = "native" if replay_binding[0].diagnosing_native else "replay"
     if replay_binding is not None and replay_binding[0].active:
         replay, layer = replay_binding
         norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
         selected_experts, routing_weights = replay.route(layer, router_logits, selected_experts, norm_topk_prob)
     elif replay_binding is not None and replay_binding[0].diagnosing_native:
         replay_binding[0].record_native(replay_binding[1], selected_experts)
+    if diagnostic is not None:
+        norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
+        diagnostic.routing(
+            diagnostic_path,
+            hidden_states,
+            router_logits,
+            native_experts,
+            native_weights,
+            selected_experts,
+            routing_weights,
+            norm_topk_prob,
+        )
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -205,6 +221,16 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     if num_experts is None:
         num_experts = self.gate.weight.shape[0]
     tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
+    if diagnostic is not None:
+        diagnostic.dispatch(
+            diagnostic_path,
+            hidden_states,
+            selected_experts,
+            permuted_tokens,
+            row_ids_map,
+            tokens_per_expert,
+            num_experts,
+        )
 
     mxfp_qat_config = get_mxfp_expert_qat_runtime_config(self)
     if mxfp_qat_config is not None:
@@ -245,6 +271,17 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         down_res = NPUGmmFunction.apply(act_res, w3, tokens_per_expert)
 
     routed_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)
+    if diagnostic is not None:
+        diagnostic.outputs(
+            diagnostic_path,
+            up_res,
+            gate_res,
+            act_res,
+            down_res,
+            routed_hidden_states,
+            routing_weights,
+            qat=mxfp_qat_config is not None,
+        )
 
     return hidden_states, routed_hidden_states, router_logits
 
