@@ -21,6 +21,7 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import torch
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
@@ -356,6 +357,16 @@ class vLLMHttpServer:
 
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
+            logger.warning(
+                "[R3][ROLLOUT_CONFIG] replica=%s TP=%s EP=%s DP=%s eager=%s prefix_cache=%s "
+                "enable_return_routed_experts=True; Qwen3 capture is validated before transport",
+                self.replica_rank,
+                self.config.tensor_model_parallel_size,
+                self.config.expert_parallel_size,
+                self.config.data_parallel_size,
+                self.config.enforce_eager,
+                self.config.enable_prefix_caching,
+            )
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
@@ -569,6 +580,21 @@ class vLLMHttpServer:
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
+            hf_config = self.model_config.hf_config
+            if hf_config.model_type == "qwen3_moe":
+                from verl.utils.fsdp_router_replay import validate_vllm_r3_routes
+
+                if routed_experts is None:
+                    raise RuntimeError(f"[R3][CAPTURE_INVALID] request={request_id} vLLM returned no routed_experts")
+                validate_vllm_r3_routes(
+                    torch.as_tensor(routed_experts),
+                    len(prompt_ids),
+                    len(token_ids),
+                    hf_config.num_hidden_layers,
+                    hf_config.num_experts_per_tok,
+                    hf_config.num_experts,
+                    request_id,
+                )
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason

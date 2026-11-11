@@ -86,6 +86,14 @@ def validate_config(
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
+    if (
+        config.actor_rollout_ref.actor.strategy in ("fsdp", "fsdp2")
+        and OmegaConf.select(config, "actor_rollout_ref.actor.fsdp_config.router_replay.mode", default="disabled")
+        == "R3"
+        and OmegaConf.select(config, "algorithm.rollout_correction.bypass_mode", default=False)
+    ):
+        raise ValueError("FSDP2 R3 requires algorithm.rollout_correction.bypass_mode=False for old-log-prob replay")
+
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = (

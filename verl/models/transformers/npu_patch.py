@@ -172,6 +172,11 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
         if norm_topk_prob:  # only diff with mixtral sparse moe block!
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    replay_binding = getattr(self, "_fsdp_r3_replay", None)
+    if replay_binding is not None and replay_binding[0].active:
+        replay, layer = replay_binding
+        norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
+        selected_experts, routing_weights = replay.route(layer, router_logits, selected_experts, norm_topk_prob)
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 

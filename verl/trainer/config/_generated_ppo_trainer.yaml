@@ -44,6 +44,11 @@ actor_rollout_ref:
       entropy_checkpointing: false
       forward_only: false
       strategy: fsdp
+      router_replay:
+        _target_: verl.workers.config.EngineRouterReplayConfig
+        mode: disabled
+        record_file: null
+        replay_file: null
       dtype: bfloat16
       qat:
         _target_: verl.workers.config.QATEngineConfig
@@ -237,6 +242,11 @@ actor_rollout_ref:
       entropy_checkpointing: false
       forward_only: true
       strategy: fsdp
+      router_replay:
+        _target_: verl.workers.config.EngineRouterReplayConfig
+        mode: disabled
+        record_file: null
+        replay_file: null
       dtype: bfloat16
       qat:
         _target_: verl.workers.config.QATEngineConfig
@@ -549,6 +559,11 @@ critic:
     entropy_checkpointing: false
     forward_only: false
     strategy: fsdp
+    router_replay:
+      _target_: verl.workers.config.EngineRouterReplayConfig
+      mode: disabled
+      record_file: null
+      replay_file: null
     dtype: bfloat16
     qat:
       _target_: verl.workers.config.QATEngineConfig

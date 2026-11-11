@@ -59,6 +59,14 @@ forward_only: false
 # fsdp or fsdp2
 strategy: fsdp
 
+# Qwen3 MoE on Ascend, FSDP2/SP=1 only. R3 also requires vLLM rollout capture.
+# Diagnostics and strict validation are always enabled at WARNING level.
+router_replay:
+  _target_: verl.workers.config.EngineRouterReplayConfig
+  mode: disabled
+  record_file: null
+  replay_file: null
+
 # Mixed precision training param dtype
 dtype: bfloat16 # ["bfloat16", "float16"]
 

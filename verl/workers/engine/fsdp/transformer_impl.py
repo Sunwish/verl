@@ -152,6 +152,40 @@ class FSDPEngine(BaseEngine):
         # QAT (Quantization-Aware Training)
         self._qat_config = getattr(self.engine_config, "qat", None)
         self._qat_enabled = self._qat_config is not None and getattr(self._qat_config, "enable", False)
+        self._router_replay = None
+        replay_mode = self.engine_config.router_replay.mode
+        if replay_mode != "disabled":
+            if (
+                replay_mode != "R3"
+                or self.engine_config.strategy != "fsdp2"
+                or device_name != "npu"
+                or self.model_config.hf_config.model_type != "qwen3_moe"
+                or self.ulysses_sequence_parallel_size != 1
+                or not self.use_remove_padding
+                or self.engine_config.use_torch_compile
+                or self._is_lora
+            ):
+                raise ValueError(
+                    "R3 currently requires Qwen3 MoE / FSDP2 / NPU / SP=1 / use_remove_padding=True / "
+                    "use_torch_compile=False / no LoRA"
+                )
+            from verl.utils.fsdp_router_replay import FSDPRouterReplay
+
+            hf_config = self.model_config.hf_config
+            self._router_replay = FSDPRouterReplay(
+                hf_config.num_hidden_layers,
+                hf_config.num_experts,
+                hf_config.num_experts_per_tok,
+                self.rank,
+                self.model_config.enable_gradient_checkpointing,
+            )
+            logger.warning(
+                "[R3][CONFIG] rank=%s qat=%s qat_mode=%s rotation=%s reference_replay=disabled",
+                self.rank,
+                self._qat_enabled,
+                getattr(self._qat_config, "mode", None),
+                getattr(self._qat_config, "rotation_enable", False),
+            )
         if self._qat_enabled:
             logger.info(f"QAT enabled: mode={self._qat_config.mode}, group_size={self._qat_config.group_size}")
 
@@ -582,6 +616,9 @@ class FSDPEngine(BaseEngine):
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
 
+        if self._router_replay is not None:
+            self._router_replay.install(module)
+
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
         if self.rank == 0:
@@ -667,17 +704,29 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
-        for micro_batch in micro_batches:
-            with ctx:
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+        replay = getattr(self, "_router_replay", None)
+        replay_active = replay is not None and tu.get_non_tensor_data(data, "enable_routing_replay", default=False)
+        if replay is not None and not replay_active:
+            raise RuntimeError("[R3] actor engine received a batch without enable_routing_replay=True")
+        replay_context = replay.batch(forward_only) if replay_active else nullcontext()
+        with replay_context:
+            for micro_batch in micro_batches:
+                with ctx:
+                    loss, meta_info = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
 
-                if not forward_only:
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                    if not forward_only:
+                        if replay_active:
+                            replay.mark_backward()
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                    if replay_active:
+                        replay.finish_microbatch(forward_only)
 
-            output_lst.append(meta_info)
+                output_lst.append(meta_info)
 
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -1302,6 +1351,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        replay = getattr(self, "_router_replay", None)
+        if replay is not None and replay.active:
+            replay.set_microbatch(
+                micro_batch["input_ids"],
+                micro_batch.get("routed_experts"),
+                micro_batch["response_mask"],
+            )
 
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
         # autocast is a no-op at best and a footgun at worst, so skip it entirely.
