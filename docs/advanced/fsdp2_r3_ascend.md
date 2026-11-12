@@ -1,6 +1,6 @@
 # Qwen3 MoE 的 FSDP2 + vLLM-Ascend R3 路由回放
 
-Last updated: 11/11/2026
+Last updated: 11/12/2026
 
 适用场景：Qwen3-30B-A3B，单机 8 张 A2，actor FSDP2、SP=1，rollout vLLM-Ascend TP=8 / EP=8 / DP=1。同时支持当前脚本中的 BF16 和 MXFP W4A8 F/D/W 伪量化 + F/D 旋转。路由回放固定专家 ID，混合权重由当前 actor gate logits 重新计算并归一化，保留 gate 和专家参数的梯度。
 
@@ -46,6 +46,12 @@ bash examples/grpo_trainer/run_qwen3_moe_r3_fsdp2.sh --smoke --diagnose "$BASELI
 - `[ROUTE_COMPARE]` 对每层比较专家集合，而非 top-k 槽位顺序。`native_hidden` 是独立原生 forward，`replay_hidden` 是回放 forward 进入各层时的原生 top-k。`token_delta_set_overlap[d]` 比较 capture[t] 与 native[t+d]，不跨样本边界；`layer_delta_set_overlap` 检查相邻层错位。相邻 token 本身可能相似，偏移重合度仅提供线索，不能单独判定错位或用于自动修正。
 
 ### 第 0 层 MoE 算子对照
+
+2026-11-12 BF16 日志已定位到一个明确回归：Transformers 5.0/5.1 的 `Qwen3MoeTopKRouter.forward` 返回 `(probabilities, weights, indices)`，第一个张量虽然命名为 `router_logits`，实际已经过 softmax；较新版本返回原始 logits。之前 R3 统一对第一个张量再做 softmax，把权重压平到约 1/8。即使专家集合和顺序完全一致，也会改变 MoE 输出。这是接口兼容错误，不能归因于正常 BF16 误差。参见 [Transformers 5.1 源码](https://github.com/huggingface/transformers/blob/v5.1.0/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L243)。
+
+修复在 R3 tuple gate 路径上显式执行 `F.linear(hidden_states, gate.weight, bias)` 得到原始 logits，再且仅做一次 softmax；不按版本号或数值阈值猜测 tuple 的含义。保留原生 gate 的专家选择，保留当前策略 gate 和专家梯度；old-log-prob、actor 更新、checkpoint 重算均生效。额外增加一次较小的 gate 投影。独立 native 对照继续使用原生权重，只为诊断补原始 logits。未启用 R3 的模型沿用原生路径。
+
+安装时每个 rank 的 `[ROUTER_CONTRACT]` 日志确认采用明确的原始 logits 来源。`[MOE_WEIGHTS]` 现在增加 `router_logits_source`、`gate_class`、`gate_first_return_row_sum_min/max`，并比较 gate 第一返回值与 raw logits / raw softmax。对于返回概率的 gate，行和应接近 1，`gate_first_return_vs_raw_softmax` 误差很小；`native_weights_cpu_ref` 和相同集合上的 `same_set_weights` 应回到正常舍入误差水平。此前日志的 `native_weights_cpu_ref` 比较使用了错误的“logits”参考，不能据此认定 native gate 算错。
 
 同一个 `--diagnose` 命令还会输出以下 WARNING，不需要新增参数。每个 rank、每轮 old-log-prob 的首微批次分别观察 replay/native 第 0 层，不改前向结果和 PPO 概率，也不在 actor 更新或 checkpoint 重算中执行。
 
@@ -126,6 +132,6 @@ python3 -m pytest tests/utils/test_fsdp_router_replay_on_cpu.py \
 python3 -m pytest --noconftest tests/ut/patch/worker/test_r3_capture_layout_cpu.py -q
 ```
 
-CPU 测试使用生产前向/driver 代码和真实 autograd/checkpoint/QAT，只替换 NPU 算子、collective 和分布式环境。覆盖 BF16/FP32、两种 Transformers gate API、专家和 gate 梯度对照、带/不带 checkpoint 数值梯度一致、W4A8 F/D/W + F/D 旋转、动态打包、无效输入拒绝、reference 隔离、TP=8 的 1/7/8/9/63/65 token 采集与日志损坏检测。算子诊断另外覆盖 128 专家/top-8 的槽位重排，并分别注入错误权重、分发激活、histogram、行映射、GMM 和合并输出，检查对应日志能定位错误；CPU permute 替身遵循 CANN 逆映射契约。
+CPU 测试使用生产前向/driver 代码和真实 autograd/checkpoint/QAT，只替换 NPU 算子、collective 和分布式环境。覆盖 BF16/FP32、三种 gate 返回接口（旧版 Linear、tuple raw logits、tuple probabilities）、专家和 gate 梯度对照、带/不带 checkpoint 数值梯度一致、norm_topk_prob 开/关、W4A8 F/D/W + F/D 旋转、动态打包、无效输入拒绝、reference 隔离、TP=8 的 1/7/8/9/63/65 token 采集与日志损坏检测。返回概率的 gate 在旧实现上有 6 项回归测试失败，修复后通过。算子诊断另外覆盖 128 专家/top-8 的槽位重排，并分别注入错误权重、分发激活、histogram、行映射、GMM 和合并输出，检查对应日志能定位错误；CPU permute 替身遵循 CANN 逆映射契约。
 
 本地 Windows 无 Ascend，尚不能声明 8 卡 NPU 端到端通过。服务器首跑需保存完整 `train.log`、`r3_environment.log`、自动检查结果；失败时保留第一次 traceback 前后的日志及 Ray worker 对应日志。若缺失 CAPTURE/VERIFY，检查工具会失败，不会把训练进程正常退出当作功能验收。

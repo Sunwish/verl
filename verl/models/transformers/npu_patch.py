@@ -160,9 +160,18 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     """
     hidden_dim = hidden_states.shape[-1]
     hidden_states = hidden_states.view(-1, hidden_dim)
+    replay_binding = getattr(self, "_fsdp_r3_replay", None)
     gate_output = self.gate(hidden_states)
+    logits_source = "gate_linear_return"
     if isinstance(gate_output, tuple) and len(gate_output) == 3:
         router_logits, routing_weights, selected_experts = gate_output
+        if replay_binding is not None and (replay_binding[0].active or replay_binding[0].diagnosing_native):
+            # HF 5.0/5.1 returns post-softmax probabilities in tuple[0];
+            # newer releases return raw logits. Never softmax that ambiguous
+            # value again. Project explicitly for R3, preserving autograd and
+            # the native gate's expert choices for uncaptured positions.
+            router_logits = F.linear(hidden_states, self.gate.weight, getattr(self.gate, "bias", None))
+            logits_source = "explicit_gate_linear"
     else:
         router_logits = gate_output
         top_k = getattr(self.gate, "top_k", getattr(self, "top_k", getattr(self, "num_experts_per_tok", 2)))
@@ -172,7 +181,6 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
         if norm_topk_prob:  # only diff with mixtral sparse moe block!
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    replay_binding = getattr(self, "_fsdp_r3_replay", None)
     diagnostic = replay_binding[0].moe_diagnostic(replay_binding[1]) if replay_binding is not None else None
     if diagnostic is not None:
         native_experts, native_weights = selected_experts, routing_weights
@@ -194,6 +202,9 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
             selected_experts,
             routing_weights,
             norm_topk_prob,
+            gate_first_return=gate_output[0] if isinstance(gate_output, tuple) else gate_output,
+            gate_class=f"{type(self.gate).__module__}.{type(self.gate).__name__}",
+            logits_source=logits_source,
         )
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)

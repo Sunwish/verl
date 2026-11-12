@@ -82,6 +82,12 @@ for module, package in (("verl", "verl"), ("vllm", "vllm"), ("vllm_ascend", "vll
     root = Path(spec.origin).resolve().parent.parent
     result = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
     logging.warning("[R3][ENV] module=%s version=%s file=%s git=%s", module, version, spec.origin, result.stdout.strip())
+for package in ("transformers", "torch", "torch-npu"):
+    try:
+        version = importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        version = "not-installed"
+    logging.warning("[R3][ENV] package=%s version=%s", package, version)
 logging.warning("[R3][ENV] python=%s repo=%s", sys.executable, sys.argv[1])
 PY
 

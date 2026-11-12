@@ -128,7 +128,8 @@ def _nested_inputs(lengths, layers=2):
 
 def _oracle(block, x, indices):
     weights = block.gate(x).float().softmax(-1).gather(-1, indices)
-    weights = weights / weights.sum(-1, keepdim=True)
+    if block.norm_topk_prob:
+        weights = weights / weights.sum(-1, keepdim=True)
     outputs = []
     for token, chosen in zip(x, indices, strict=True):
         experts = []
@@ -140,12 +141,12 @@ def _oracle(block, x, indices):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("new_gate_api", [False, True])
-def test_production_dispatch_and_gate_expert_gradients_match_oracle(block_class, dtype, new_gate_api, caplog):
+@pytest.mark.parametrize("gate_api", ["legacy", "tuple_logits", "tuple_probs"])
+def test_production_dispatch_and_gate_expert_gradients_match_oracle(block_class, dtype, gate_api, caplog):
     torch.manual_seed(27)
     block = block_class().to(dtype)
     oracle = copy.deepcopy(block)
-    if new_gate_api:
+    if gate_api != "legacy":
 
         class TupleGate(nn.Module):
             def __init__(self, gate):
@@ -155,8 +156,12 @@ def test_production_dispatch_and_gate_expert_gradients_match_oracle(block_class,
 
             def forward(self, x):
                 logits = F.linear(x, self.weight)
-                weights, indices = logits.float().softmax(-1).topk(2)
-                return logits, weights / weights.sum(-1, keepdim=True), indices
+                probs = logits.float().softmax(-1)
+                weights, indices = probs.topk(2)
+                # Transformers 5.0/5.1 returns probabilities in tuple[0],
+                # whereas later releases return the pre-softmax logits.
+                first = probs if gate_api == "tuple_probs" else logits
+                return first, (weights / weights.sum(-1, keepdim=True)).to(first.dtype), indices
 
         block.gate = TupleGate(block.gate)
     replay = FSDPRouterReplay(1, 4, 2, 0, False)
@@ -472,12 +477,12 @@ def _moe_log(caplog, tag, path):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("new_gate_api", [False, True])
+@pytest.mark.parametrize("gate_api", ["legacy", "tuple_logits", "tuple_probs"])
 @pytest.mark.parametrize("qat", [False, True])
-def test_top8_128_experts_diagnostics_and_slot_permutation(block_class, dtype, new_gate_api, qat, caplog):
+def test_top8_128_experts_diagnostics_and_slot_permutation(block_class, dtype, gate_api, qat, caplog):
     torch.manual_seed(154)
     block = block_class(num_experts=128, top_k=8).to(dtype)
-    if new_gate_api:
+    if gate_api != "legacy":
 
         class TupleGate(nn.Module):
             def __init__(self, gate):
@@ -487,8 +492,10 @@ def test_top8_128_experts_diagnostics_and_slot_permutation(block_class, dtype, n
 
             def forward(self, x):
                 logits = F.linear(x, self.weight)
-                weights, indices = logits.float().softmax(-1).topk(self.top_k)
-                return logits, (weights / weights.sum(-1, keepdim=True)).to(logits.dtype), indices
+                probs = logits.float().softmax(-1)
+                weights, indices = probs.topk(self.top_k)
+                first = probs if gate_api == "tuple_probs" else logits
+                return first, (weights / weights.sum(-1, keepdim=True)).to(first.dtype), indices
 
         block.gate = TupleGate(block.gate)
     if qat:
@@ -513,14 +520,14 @@ def test_top8_128_experts_diagnostics_and_slot_permutation(block_class, dtype, n
     with caplog.at_level("WARNING"), torch.no_grad(), replay.batch(True):
         replay.set_microbatch(ids, routes, mask)
         replay_out = block(x)
-        replay_out = replay_out if new_gate_api else replay_out[0]
+        replay_out = replay_out[0] if gate_api == "legacy" else replay_out
         with replay.native_diagnostic():
             native_out = block(x)
-            native_out = native_out if new_gate_api else native_out[0]
+            native_out = native_out[0] if gate_api == "legacy" else native_out
         assert replay._moe_diagnostic is None
         replay.finish_microbatch(True)
     expected = reference(x)
-    expected = expected if new_gate_api else expected[0]
+    expected = expected[0] if gate_api == "legacy" else expected
     # BF16 summation can change by one ulp when the top-8 slots are reordered.
     torch.testing.assert_close(replay_out, native_out, atol=0.001, rtol=0.02)
     torch.testing.assert_close(native_out, expected)
@@ -530,7 +537,13 @@ def test_top8_128_experts_diagnostics_and_slot_permutation(block_class, dtype, n
         assert dispatch["sample_permuted_input_ref"]["max_abs"] == 0
         weights = _moe_log(caplog, "MOE_WEIGHTS", path)
         assert weights["top_k"] == 8 and weights["experts"] == 128
+        source = "gate_linear_return" if gate_api == "legacy" else "explicit_gate_linear"
+        assert weights["router_logits_source"] == source
         assert weights["selected_weights_cpu_ref"]["max_abs"] < (0.002 if dtype == torch.bfloat16 else 1e-6)
+        assert weights["native_weights_cpu_ref"]["max_abs"] < (0.002 if dtype == torch.bfloat16 else 1e-6)
+        if gate_api == "tuple_probs":
+            assert weights["gate_first_return_vs_raw_softmax"]["max_abs"] < 1e-6
+            assert weights["gate_first_return_vs_raw_logits"]["max_abs"] > 0.1
         merge = _moe_log(caplog, "MOE_MERGE", path)
         assert merge["cast_weights_vs_observed_precast"]["max_abs"] == 0
         assert merge["unpermute_vs_cpu_dtype_merge"]["max_abs"] == 0
@@ -541,6 +554,60 @@ def test_top8_128_experts_diagnostics_and_slot_permutation(block_class, dtype, n
     for stage in ("permuted", "up", "gate", "activation", "down"):
         assert pair["shared_experts"][stage]["max_abs"] == 0
     assert pair["input"]["max_abs"] == pair["logits"]["max_abs"] == 0
+    assert pair["same_set_weights"]["max_abs"] < 1e-6
+
+
+@pytest.mark.parametrize("first_is_probs", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_tuple_router_contract_checkpoint_forward_and_gradients(block_class, first_is_probs, normalize, dtype):
+    torch.manual_seed(647)
+    base = block_class(num_experts=128, top_k=8).to(dtype)
+    base.norm_topk_prob = normalize
+    oracle = copy.deepcopy(base)
+
+    class TupleGate(nn.Module):
+        def __init__(self, gate):
+            super().__init__()
+            self.weight = gate.weight
+            self.top_k, self.norm_topk_prob = 8, normalize
+
+        def forward(self, x):
+            raw = F.linear(x, self.weight)
+            probs = raw.float().softmax(-1)
+            weights, selected = probs.topk(self.top_k)
+            if self.norm_topk_prob:
+                weights = weights / weights.sum(-1, keepdim=True)
+            first = probs if first_is_probs else raw
+            return first, weights.to(first.dtype), selected
+
+    base.gate = TupleGate(base.gate)
+    ids, _, mask = _nested_inputs([5, 4], layers=1)
+    targets = torch.stack([torch.randperm(128)[:8] for _ in range(9)])
+    routes = torch.nested.nested_tensor_from_jagged(targets.unsqueeze(1), ids.offsets())
+    x = torch.randn(9, 32, dtype=dtype)
+    oracle_x = x.detach().clone().requires_grad_()
+    chosen = targets.clone()
+    chosen[[4, 8]] = oracle.gate(oracle_x).float().softmax(-1).topk(8).indices[[4, 8]]
+    expected = _oracle(oracle, oracle_x, chosen)
+    expected.float().square().sum().backward()
+    tolerance = {"atol": 0.008, "rtol": 0.03} if dtype == torch.bfloat16 else {"atol": 2e-6, "rtol": 1e-4}
+    for checkpointing in (False, True):
+        block = copy.deepcopy(base)
+        replay = FSDPRouterReplay(1, 128, 8, 0, checkpointing)
+        replay.install(block)
+        actual_x = x.detach().clone().requires_grad_()
+        with replay.batch(False):
+            replay.set_microbatch(ids, routes, mask)
+            actual = checkpoint(block, actual_x, use_reentrant=False) if checkpointing else block(actual_x)
+            replay.mark_backward()
+            actual.float().square().sum().backward()
+            replay.finish_microbatch(False)
+        torch.testing.assert_close(actual, expected, **tolerance)
+        torch.testing.assert_close(actual_x.grad, oracle_x.grad, **tolerance)
+        for (_, param), (_, reference) in zip(block.named_parameters(), oracle.named_parameters(), strict=True):
+            torch.testing.assert_close(param.grad, reference.grad, **tolerance)
+        assert block.gate.weight.grad.abs().sum() > 0
 
 
 @pytest.mark.parametrize("damage", ["weights", "permuted", "histogram", "row_map", "gmm", "merge"])

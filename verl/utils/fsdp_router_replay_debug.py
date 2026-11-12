@@ -106,9 +106,24 @@ class R3MoEDiagnostic:
         )
 
     @torch.no_grad()
-    def routing(self, path, hidden, logits, native_ids, native_weights, ids, weights, normalize):
+    def routing(
+        self,
+        path,
+        hidden,
+        logits,
+        native_ids,
+        native_weights,
+        ids,
+        weights,
+        normalize,
+        *,
+        gate_first_return,
+        gate_class,
+        logits_source,
+    ):
         ids_cpu, native_cpu = ids.detach().cpu().long(), native_ids.detach().cpu().long()
         logits_cpu, weights_cpu = logits.detach().cpu(), weights.detach().cpu()
+        gate_return_cpu = gate_first_return.detach().float().cpu()
         reference = routing_weight_reference(logits_cpu, ids_cpu, normalize)
         same_set = ids_cpu.sort(-1).values.eq(native_cpu.sort(-1).values).all(-1)
         if path == "replay":
@@ -138,6 +153,12 @@ class R3MoEDiagnostic:
             "top_k": ids_cpu.shape[-1],
             "experts": logits.shape[-1],
             "normalize": normalize,
+            "gate_class": gate_class,
+            "router_logits_source": logits_source,
+            "gate_first_return_row_sum_min": gate_return_cpu.sum(-1).min().item(),
+            "gate_first_return_row_sum_max": gate_return_cpu.sum(-1).max().item(),
+            "gate_first_return_vs_raw_logits": tensor_difference(gate_return_cpu, logits_cpu),
+            "gate_first_return_vs_raw_softmax": tensor_difference(gate_return_cpu, logits_cpu.float().softmax(-1)),
             "hidden_dtype": str(hidden.dtype),
             "logits_dtype": str(logits.dtype),
             "weights_precast_dtype": str(weights.dtype),

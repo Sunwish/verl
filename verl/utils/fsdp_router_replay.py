@@ -193,6 +193,11 @@ class FSDPRouterReplay:
             self.top_k,
             self.checkpointing,
         )
+        logger.warning(
+            "[R3][ROUTER_CONTRACT] rank=%s tuple_gate_logits_source=explicit_gate_linear "
+            "linear_gate_logits_source=gate_linear_return ambiguous_tuple_first_value_not_used_as_logits=True",
+            self.rank,
+        )
 
     @contextmanager
     def batch(self, forward_only: bool) -> Iterator[None]:
