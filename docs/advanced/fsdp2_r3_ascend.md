@@ -92,21 +92,38 @@ bash examples/grpo_trainer/run_qwen3_moe_r3_fsdp2.sh --smoke "$BASELINE" \
 actor_rollout_ref.actor.fsdp_config.router_replay.mode=R3
 actor_rollout_ref.rollout.enable_rollout_routing_replay=True
 actor_rollout_ref.rollout.enable_prefix_caching=False
+actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent
 actor_rollout_ref.ref.fsdp_config.router_replay.mode=disabled
+++actor_rollout_ref.actor.use_rollout_log_probs=False
 algorithm.rollout_correction.bypass_mode=False
 ```
 
 不能打开 bypass_mode，否则 old-log-prob 不再进入本次回放路径。不要使用旧的 `actor.router_replay.mode` 字段：本实现读取 `actor.fsdp_config.router_replay.mode`。
 
+`default_agent_loop` 和 `use_rollout_log_probs` 在当前仓库默认已经分别为 `single_turn_agent`、`False`；显式配置用于固定复现条件，当前 R3 会校验这两个取值。当前 trainer 是否重算 old-log-prob 实际由 `bypass_mode` 决定。reference 继续使用自己的路由，不能直接把 ref mode 改为 R3：reference 调用会关闭回放标志，启用控制器后将拒绝该批次。强制 reference 使用 actor rollout 的专家还会改变参考概率和 KL 约束，不属于本次实现。
+
 ## WARNING 日志与验收
 
-所有新增功能日志均为 WARNING，无需打开 INFO。保留 `RAY_DEDUP_LOGS=0`。启动包装脚本在训练成功退出后自动执行下面的检查；也可独立运行：
+所有新增功能日志均为 WARNING，无需打开 INFO。保留 `RAY_DEDUP_LOGS=0`。包装脚本设置并通过 Ray runtime env 传递 `VERL_R3_LOG_DIR`，将 CAPTURE、INSTALL、TRANSPORT、VERIFY 及 MoE 对照写入该目录的每个 host/PID 独立文件，绕过各进程日志级别与 Ray 控制台转发造成的证据遗漏。每条记录写入后关闭文件；文件写入失败直接报错。日志函数不调整全局 logging 配置，也不改变路由或计算结果。
+
+每次包装启动在 `$LOG_DIR/r3_evidence/` 下建立独立子目录，禁止混入别的训练 run。服务器单机八卡场景各进程可访问此目录；扩展到多节点时必须使用共享目录或集中收集文件。包装脚本在训练非零退出后也执行审计，生成 `r3_log_audit.json` 和 `r3_audit.stderr.log`；`r3_launcher_status.json` 分别记录训练和审计退出码。如果训练退出码非零，最终继续返回该退出码，即使审计 PASS 也不会隐藏退出故障。
+
+可独立运行：
 
 ```bash
 python3 scripts/check_fsdp_r3_log.py /path/to/logs/train.log --ranks 8 --min-batches 2
 # 额外要求本次训练确实遇到了“原生路由与 rollout 不同”的位置：
 python3 scripts/check_fsdp_r3_log.py /path/to/logs/train.log --ranks 8 --min-batches 2 --require-native-diff
+# 新启动的 run：使用启动 WARNING 中打印的实际 VERL_R3_LOG_DIR。
+python3 scripts/check_fsdp_r3_log.py /path/to/logs/train.log --ranks 8 --min-batches 2 \
+  --evidence-dir /path/to/logs/r3_evidence/THIS_RUN_DIR > /path/to/logs/r3_log_audit.json
+# 旧 run：如果主日志缺失记录，可补充对应 Ray session 的原始 worker 日志。
+python3 scripts/check_fsdp_r3_log.py /path/to/logs/train.log --ranks 8 --min-batches 2 \
+  --extra-log /tmp/ray/session_THIS_RUN/logs/worker-ROLLOUT.err \
+  --extra-log /tmp/ray/session_THIS_RUN/logs/worker-RANK0.err
 ```
+
+新增审计 CLI 在失败时也输出有效 JSON 并返回非零，区分 `MISSING_EVIDENCE`、`INVALID_EVIDENCE`、读入或解析失败。同一次 run 的重复镜像记录按 request 或 rank/phase/batch/microbatch 去重；同一标识对应矛盾内容会失败。`No validated rollout CAPTURE records` 和 rank 0 缺少 VERIFY 表示证据不完整；大量 unknown signature 通常是 CAPTURE 缺失的后果，不能单凭它认定实际 ID 错误，也不能根据 Pearson 提高改为 PASS。旧日志没有原始证据时无法追溯补造，需重新运行。
 
 | 日志 | 能说明什么 |
 | --- | --- |

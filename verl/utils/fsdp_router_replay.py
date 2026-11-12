@@ -19,14 +19,13 @@ There is deliberately no process-global replay slot: actor and reference models
 can coexist in the same worker without sharing replay state.
 """
 
-import logging
 from contextlib import contextmanager
 from typing import Iterator
 
 import torch
 from torch import nn
 
-logger = logging.getLogger(__name__)
+from verl.utils.fsdp_router_replay_logging import r3_warning
 
 
 def r3_route_fingerprint(routes: torch.Tensor) -> torch.Tensor:
@@ -98,7 +97,7 @@ def log_r3_probability_comparison(replay_log_probs, native_log_probs, rollout_lo
         summary[f"{name}_pearson"] = pearson_correlation_coefficient(values[a].exp(), values[b].exp(), mask)
         summary[f"{name}_mean_abs_prob_diff"] = (values[a].exp() - values[b].exp())[mask].abs().mean().item()
         summary[f"{name}_mean_abs_log_prob_diff"] = (values[a] - values[b])[mask].abs().mean().item()
-    logger.warning("[R3][PROB_COMPARE] rank=%s batch=%s valid_tokens=%s %s", rank, batch, mask.sum().item(), summary)
+    r3_warning("[R3][PROB_COMPARE] rank=%s batch=%s valid_tokens=%s %s", rank, batch, mask.sum().item(), summary)
     return summary
 
 
@@ -135,7 +134,7 @@ def validate_vllm_r3_routes(
             f"expert_range=[0,{num_experts}); possible incomplete TP gather or stale capture buffer"
         )
     checksum = (routes.to(torch.int64) * torch.arange(1, num_layers + 1).view(1, -1, 1)).sum().item()
-    logger.warning(
+    r3_warning(
         "[R3][CAPTURE] request=%s prompt=%s response=%s shape=%s input_token_routing=True "
         "last_generated_token_uncaptured=True invalid_ids=0 duplicate_rows=0 route_checksum=%s "
         "fingerprint=%s status=PASS",
@@ -185,7 +184,7 @@ class FSDPRouterReplay:
             if getattr(block.forward, "__name__", "") != "qwen3_moe_sparse_moe_block_forward_npu":
                 raise ValueError(f"[R3] layer={layer} is not using verl's Qwen3 NPU MoE forward")
             block._fsdp_r3_replay = (self, layer)
-        logger.warning(
+        r3_warning(
             "[R3][INSTALL] rank=%s layers=%s experts=%s top_k=%s checkpointing=%s scope=qwen3_moe/fsdp2/npu/sp1",
             self.rank,
             self.num_layers,
@@ -193,7 +192,7 @@ class FSDPRouterReplay:
             self.top_k,
             self.checkpointing,
         )
-        logger.warning(
+        r3_warning(
             "[R3][ROUTER_CONTRACT] rank=%s tuple_gate_logits_source=explicit_gate_linear "
             "linear_gate_logits_source=gate_linear_return ambiguous_tuple_first_value_not_used_as_logits=True",
             self.rank,
@@ -216,7 +215,7 @@ class FSDPRouterReplay:
             if self._microbatch == 0:
                 raise RuntimeError("[R3] replay batch completed without any routed micro-batches")
             slots, native_diff, replay_diff, checksum = self._totals.cpu().tolist()
-            logger.warning(
+            r3_warning(
                 "[R3][VERIFY] rank=%s phase=%s batch=%s microbatches=%s layers=%s "
                 "forward_calls=%s recompute_calls=%s replayed_slots=%s native_diff_slots=%s "
                 "replay_mismatch_slots=%s target_checksum=%s coverage=1.000000 status=PASS",
@@ -233,7 +232,7 @@ class FSDPRouterReplay:
                 checksum,
             )
         except Exception:
-            logger.warning(
+            r3_warning(
                 "[R3][FAILED] rank=%s phase=%s batch=%s microbatch=%s backward=%s forward_layers=%s "
                 "recompute_layers=%s",
                 self.rank,
@@ -315,7 +314,7 @@ class FSDPRouterReplay:
         # Every real sample is logged on every rank. The audit tool matches these
         # against rollout CAPTURE fingerprints after padding, DP redistribution,
         # sample shuffling, and dynamic micro-batch packing.
-        logger.warning(
+        r3_warning(
             "[R3][TRANSPORT] rank=%s phase=%s batch=%s microbatch=%s captured_lengths=%s "
             "sample_fingerprints=%s synthetic_samples=%s",
             self.rank,
@@ -327,7 +326,7 @@ class FSDPRouterReplay:
             (~real_samples_cpu).sum().item(),
         )
         if self.rank == 0 and self._microbatch == 1:
-            logger.warning(
+            r3_warning(
                 "[R3][TARGET] rank=%s phase=%s batch=%s microbatch=%s lengths=%s captured_tokens=%s "
                 "native_only_tokens=%s first_token_layer0=%s",
                 self.rank,
@@ -424,7 +423,7 @@ class FSDPRouterReplay:
             for path, observed in (("replay_hidden", replay_native), ("native_hidden", self._diagnostic_indices)):
                 native = torch.stack([observed[layer] for layer in range(self.num_layers)], dim=1).cpu()
                 stats = route_alignment_diagnostics(targets, native, mask, offsets)
-                logger.warning(
+                r3_warning(
                     "[R3][ROUTE_COMPARE] rank=%s batch=%s microbatch=%s path=%s %s",
                     self.rank,
                     self._batch_id,
@@ -453,7 +452,7 @@ class FSDPRouterReplay:
         if self._stats[2].item() != 0:
             raise RuntimeError("[R3] actual dispatch indices differ from replay targets")
         if self.rank == 0 and self._microbatch == 1:
-            logger.warning(
+            r3_warning(
                 "[R3][LAYERS] rank=%s phase=%s batch=%s microbatch=%s native_diff_slots_per_layer=%s "
                 "forward_calls=%s recompute_calls=%s",
                 self.rank,

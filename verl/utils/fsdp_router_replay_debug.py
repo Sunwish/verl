@@ -18,11 +18,9 @@ Expert intermediates are sampled by token and aligned by expert ID across the
 two real forwards. No expert weights or full expanded activation are copied.
 """
 
-import logging
-
 import torch
 
-logger = logging.getLogger(__name__)
+from verl.utils.fsdp_router_replay_logging import r3_warning
 
 
 def tensor_difference(actual, expected):
@@ -96,7 +94,7 @@ class R3MoEDiagnostic:
         self.snapshots = {}
 
     def _log(self, tag, path, stats):
-        logger.warning(
+        r3_warning(
             "[R3][%s] rank=%s batch=%s microbatch=1 layer=0 path=%s %s",
             tag,
             self.rank,

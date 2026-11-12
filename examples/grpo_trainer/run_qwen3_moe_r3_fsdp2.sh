@@ -58,6 +58,9 @@ export RAY_DEDUP_LOGS=0
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 mkdir -p "$LOG_DIR"
+LOG_DIR=$(realpath "$LOG_DIR")
+export VERL_R3_LOG_DIR="$LOG_DIR/r3_evidence/${run_stamp}_${BASHPID}"
+mkdir -p "$VERL_R3_LOG_DIR"
 cp "$launcher_script" "$LOG_DIR/r3_launcher.sh"
 
 # Record actual import locations and installed versions without importing NPU
@@ -91,7 +94,8 @@ for package in ("transformers", "torch", "torch-npu"):
 logging.warning("[R3][ENV] python=%s repo=%s", sys.executable, sys.argv[1])
 PY
 
-echo "[R3] baseline=${baseline_script} smoke=${smoke} RUN_ROOT=${RUN_ROOT} LOG_DIR=${LOG_DIR}" >&2
+echo "WARNING [R3] baseline=${baseline_script} smoke=${smoke} RUN_ROOT=${RUN_ROOT} LOG_DIR=${LOG_DIR} VERL_R3_LOG_DIR=${VERL_R3_LOG_DIR}" >&2
+training_status=0
 bash "$baseline_script" "$@" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.router_replay.mode=R3 \
@@ -102,6 +106,18 @@ bash "$baseline_script" "$@" \
     actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent \
     actor_rollout_ref.ref.fsdp_config.router_replay.mode=disabled \
     ++actor_rollout_ref.actor.use_rollout_log_probs=False \
-    algorithm.rollout_correction.bypass_mode=False
+    algorithm.rollout_correction.bypass_mode=False || training_status=$?
 
-python3 scripts/check_fsdp_r3_log.py "$LOG_DIR/train.log" --ranks 8 --min-batches 2 | tee "$LOG_DIR/r3_log_audit.json"
+# A teardown abort must not prevent collecting the completed training evidence.
+# Preserve the training failure even if the replay invariants themselves pass.
+audit_status=0
+python3 scripts/check_fsdp_r3_log.py "$LOG_DIR/train.log" --ranks 8 --min-batches 2 \
+    --evidence-dir "$VERL_R3_LOG_DIR" \
+    2> >(tee "$LOG_DIR/r3_audit.stderr.log" >&2) | tee "$LOG_DIR/r3_log_audit.json" || audit_status=$?
+printf '{"training_exit_code": %d, "audit_exit_code": %d}\n' "$training_status" "$audit_status" \
+    | tee "$LOG_DIR/r3_launcher_status.json"
+echo "WARNING [R3][LAUNCHER_EXIT] training_exit_code=$training_status audit_exit_code=$audit_status evidence_dir=$VERL_R3_LOG_DIR" >&2
+if (( training_status != 0 )); then
+    exit "$training_status"
+fi
+exit "$audit_status"

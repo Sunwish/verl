@@ -63,4 +63,8 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    # Explicitly forward the run-specific evidence directory even when Ray
+    # connects to an existing cluster whose workers do not inherit this shell.
+    if os.environ.get("VERL_R3_LOG_DIR"):
+        runtime_env["env_vars"]["VERL_R3_LOG_DIR"] = os.environ["VERL_R3_LOG_DIR"]
     return runtime_env
