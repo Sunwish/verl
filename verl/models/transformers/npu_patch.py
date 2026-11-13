@@ -154,9 +154,18 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     """
     hidden_dim = hidden_states.shape[-1]
     hidden_states = hidden_states.view(-1, hidden_dim)
+    replay_binding = getattr(self, "_fsdp_r3_replay", None)
     gate_output = self.gate(hidden_states)
+    logits_source = "gate_linear_return"
     if isinstance(gate_output, tuple) and len(gate_output) == 3:
         router_logits, routing_weights, selected_experts = gate_output
+        if replay_binding is not None and (replay_binding[0].active or replay_binding[0].diagnosing_native):
+            # HF 5.0/5.1 returns post-softmax probabilities in tuple[0];
+            # newer releases return raw logits. Never softmax that ambiguous
+            # value again. Project explicitly for R3, preserving autograd and
+            # the native gate's expert choices for uncaptured positions.
+            router_logits = F.linear(hidden_states, self.gate.weight, getattr(self.gate, "bias", None))
+            logits_source = "explicit_gate_linear"
     else:
         router_logits = gate_output
         top_k = getattr(self.gate, "top_k", getattr(self, "top_k", getattr(self, "num_experts_per_tok", 2)))
@@ -166,6 +175,31 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
         norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
         if norm_topk_prob:  # only diff with mixtral sparse moe block!
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    diagnostic = replay_binding[0].moe_diagnostic(replay_binding[1]) if replay_binding is not None else None
+    if diagnostic is not None:
+        native_experts, native_weights = selected_experts, routing_weights
+        diagnostic_path = "native" if replay_binding[0].diagnosing_native else "replay"
+    if replay_binding is not None and replay_binding[0].active:
+        replay, layer = replay_binding
+        norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
+        selected_experts, routing_weights = replay.route(layer, router_logits, selected_experts, norm_topk_prob)
+    elif replay_binding is not None and replay_binding[0].diagnosing_native:
+        replay_binding[0].record_native(replay_binding[1], selected_experts)
+    if diagnostic is not None:
+        norm_topk_prob = getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True))
+        diagnostic.routing(
+            diagnostic_path,
+            hidden_states,
+            router_logits,
+            native_experts,
+            native_weights,
+            selected_experts,
+            routing_weights,
+            norm_topk_prob,
+            gate_first_return=gate_output[0] if isinstance(gate_output, tuple) else gate_output,
+            gate_class=f"{type(self.gate).__module__}.{type(self.gate).__name__}",
+            logits_source=logits_source,
+        )
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -196,6 +230,16 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     if num_experts is None:
         num_experts = self.gate.weight.shape[0]
     tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
+    if diagnostic is not None:
+        diagnostic.dispatch(
+            diagnostic_path,
+            hidden_states,
+            selected_experts,
+            permuted_tokens,
+            row_ids_map,
+            tokens_per_expert,
+            num_experts,
+        )
 
     up_res = NPUGmmFunction.apply(permuted_tokens, w1, tokens_per_expert)
     gate_res = NPUGmmFunction.apply(permuted_tokens, w2, tokens_per_expert)
@@ -205,6 +249,17 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     down_res = NPUGmmFunction.apply(act_res, w3, tokens_per_expert)
 
     routed_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)
+    if diagnostic is not None:
+        diagnostic.outputs(
+            diagnostic_path,
+            up_res,
+            gate_res,
+            act_res,
+            down_res,
+            routed_hidden_states,
+            routing_weights,
+            qat=mxfp_qat_config is not None,
+        )
 
     return hidden_states, routed_hidden_states, router_logits
 

@@ -477,14 +477,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             tool_config = None
 
-        # Router replay is supported on the megatron engine and on the veomni
-        # engine. Both expose `router_replay` on their per-strategy engine
-        # config (the field lives on the shared `EngineConfig` base).
+        # Router replay is configured on each strategy's engine config.
         actor_strategy = self.config.actor.strategy
         if actor_strategy == "megatron":
             rr_mode = self.config.actor.megatron.router_replay.mode
         elif actor_strategy == "veomni":
             rr_mode = self.config.actor.veomni.router_replay.mode
+        elif actor_strategy in ("fsdp", "fsdp2"):
+            rr_mode = self.config.actor.fsdp_config.router_replay.mode
+            if rr_mode != "disabled":
+                if actor_strategy != "fsdp2" or rr_mode != "R3":
+                    raise ValueError("FSDP router replay currently requires actor.strategy=fsdp2 and mode=R3")
+                if self.config.rollout.name != "vllm" or not self.config.rollout.enable_rollout_routing_replay:
+                    raise ValueError("FSDP2 R3 requires rollout.name=vllm and enable_rollout_routing_replay=True")
+                if self.config.rollout.agent.default_agent_loop != "single_turn_agent":
+                    raise ValueError("FSDP2 R3 currently supports the single_turn_agent rollout only")
+                if self.config.rollout.enable_prefix_caching:
+                    raise ValueError("FSDP2 R3 requires enable_prefix_caching=False to capture full prompt routing")
+                if self.config.rollout.data_parallel_size != 1:
+                    raise ValueError("FSDP2 R3 currently requires rollout.data_parallel_size=1")
+                if self.config.actor.get("use_rollout_log_probs", False):
+                    raise ValueError("FSDP2 R3 requires use_rollout_log_probs=False to verify actor old-log-probs")
         else:
             rr_mode = "disabled"
         self.enable_routing_replay = rr_mode != "disabled"
