@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -153,7 +154,7 @@ def test_probe_is_stable_during_checkpoint_recompute(tmp_path, monkeypatch, high
     assert result.shape == source.shape
     assert result.dtype == source.dtype
 
-    # Simulate checkpoint recomputation after the probe ContextVar is no longer active.
+    # Simulate checkpoint recomputation after sampling has finished.
     finish_quant_error_probe_step(step)
     result.sum().backward()
 
@@ -190,20 +191,25 @@ def test_qat_without_probe_preserves_fake_quant_grad_context(monkeypatch):
     torch.testing.assert_close(source.grad, torch.ones_like(source))
 
 
+@pytest.mark.parametrize("mode", ["mxfp_w8a8", "mxfp_w4a8"])
 @pytest.mark.parametrize("rotation", [False, True])
 @pytest.mark.parametrize("high_precision", [False, True])
-def test_dense_probe_measures_independent_backward_qdq(tmp_path, monkeypatch, rotation, high_precision):
+@pytest.mark.parametrize("worker_thread", [False, True])
+@pytest.mark.parametrize("reentrant", [None, False, True])
+def test_dense_probe_measures_independent_backward_qdq(
+    tmp_path, monkeypatch, rotation, high_precision, worker_thread, mode, reentrant
+):
     torch.manual_seed(59)
     output_path = tmp_path / "independent.json"
     probe = mxfp_probe.MXFPQuantErrorProbe(output_path)
     monkeypatch.setattr(mxfp_probe, "_PROBE", probe)
     config = MXFPQATConfig(
-        mode="mxfp_w4a8",
+        mode=mode,
         quant_backend="torch",
         fake_quant_targets=("fprop", "dgrad", "wgrad"),
         rotation_enable=rotation,
         rotation_targets=("fprop", "dgrad", "wgrad"),
-        mxfp4_mbs_enable=True,
+        mxfp4_mbs_enable=mode == "mxfp_w4a8",
         layer_name="model.layers.3.self_attn.q_proj",
         probe_quant_error=True,
         probe_quant_error_use_high_precision=high_precision,
@@ -212,7 +218,13 @@ def test_dense_probe_measures_independent_backward_qdq(tmp_path, monkeypatch, ro
     x = torch.randn(64, 32, requires_grad=True)
     grad_output = torch.randn(64, 64)
     step = begin_quant_error_probe_step(output_path, 8)
-    qat(x).backward(grad_output)
+    output = qat(x) if reentrant is None else checkpoint(qat, x, use_reentrant=reentrant)
+    if worker_thread:
+        # Autograd device workers do not inherit the forward Python ContextVar.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(output.backward, grad_output).result()
+    else:
+        output.backward(grad_output)
     finish_quant_error_probe_step(step)
     records = {
         (record["target"], record["operand"]): record
@@ -239,7 +251,10 @@ def test_dense_probe_measures_independent_backward_qdq(tmp_path, monkeypatch, ro
 
 @pytest.mark.parametrize("reentrant", [False, True])
 @pytest.mark.parametrize("high_precision", [False, True])
-def test_moe_probe_records_recomputed_backward_operands(tmp_path, monkeypatch, reentrant, high_precision):
+@pytest.mark.parametrize("worker_thread", [False, True])
+def test_moe_probe_records_recomputed_backward_operands(
+    tmp_path, monkeypatch, reentrant, high_precision, worker_thread
+):
     def grouped_matmul(x, weight, groups, group_list_type, *, split_item=2, group_type=0):
         counts = groups.tolist()
         if split_item == 2:
@@ -273,7 +288,12 @@ def test_moe_probe_records_recomputed_backward_operands(tmp_path, monkeypatch, r
     step = begin_quant_error_probe_step(output_path, 9)
     output = checkpoint(run, x, weight, use_reentrant=reentrant)
     assert {key[3] for key in probe._pending} == {"fprop"}
-    output.sum().backward()
+    loss = output.sum()
+    if worker_thread:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(loss.backward).result()
+    else:
+        loss.backward()
     finish_quant_error_probe_step(step)
     records = json.loads(output_path.read_text(encoding="utf-8"))["records"]
     assert {(record["target"], record["operand"]) for record in records} == {
@@ -294,3 +314,37 @@ def test_moe_probe_records_recomputed_backward_operands(tmp_path, monkeypatch, r
         assert record["count"] == expected_count
     assert torch.isfinite(x.grad).all()
     assert torch.isfinite(weight.grad).all()
+
+
+@pytest.mark.parametrize("high_precision", [False, True])
+def test_probe_step_lifecycle_is_shared_across_threads(tmp_path, monkeypatch, high_precision):
+    output_path = tmp_path / "threaded.json"
+    probe = mxfp_probe.MXFPQuantErrorProbe(output_path)
+    monkeypatch.setattr(mxfp_probe, "_PROBE", probe)
+    config = _config(
+        fake_quant_targets=("dgrad", "wgrad"),
+        probe_quant_error_use_high_precision=high_precision,
+    )
+    source = torch.randn(2, 32)
+
+    def observe(target):
+        return quantize_with_probe(source, "mxfp8", config, target=target, operand="activation")
+
+    def assert_compute(result):
+        expected = source if high_precision else mxfp_quant.fake_quantize(source, "mxfp8")
+        torch.testing.assert_close(result, expected)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        step = begin_quant_error_probe_step(output_path, 10, first_step_only=True)
+        assert_compute(executor.submit(observe, "dgrad").result())
+        executor.submit(finish_quant_error_probe_step, step).result()
+        assert not probe.active  # Finishing in the worker also closes sampling here.
+        assert_compute(observe("wgrad"))
+        assert_compute(executor.submit(observe, "wgrad").result())
+        assert executor.submit(begin_quant_error_probe_step, output_path, 11, first_step_only=True).result() is None
+        assert_compute(executor.submit(observe, "wgrad").result())
+
+    assert not probe._pending
+    assert not probe._claimed
+    records = json.loads(output_path.read_text(encoding="utf-8"))["records"]
+    assert [(record["step"], record["target"]) for record in records] == [(10, "dgrad")]

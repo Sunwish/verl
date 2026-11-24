@@ -66,6 +66,12 @@ masks exclude synthetic entries from the reported metrics.
 Dgrad/Wgrad observations are collected when backward actually prepares those
 operands. The existing per-step key deduplication prevents checkpoint replay or
 shared expert inputs from adding duplicate records.
+The active step is shared by the rank-local probe across threads from
+`begin_quant_error_probe_step` until `finish_quant_error_probe_step`, covering
+autograd device workers and checkpoint recomputation. A thread-local
+`ContextVar` would lose Dgrad/Wgrad observations when backward runs on another
+thread. Finishing the step closes sampling for all threads; first-step-only
+sampling still leaves subsequent low-precision computation enabled.
 `probe_quant_error_use_high_precision=false` keeps QDQ in the compute path;
 `true` records QDQ but feeds the corresponding pre-QDQ value to the GEMM.
 The output remains JSON with the existing record keys and metrics.

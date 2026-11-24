@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import contextvars
 import json
 import logging
 import os
@@ -20,7 +19,6 @@ import torch
 logger = logging.getLogger(__name__)
 _STATS_CHUNK_SIZE = 1 << 20
 
-_ACTIVE_STEP: contextvars.ContextVar[int | None] = contextvars.ContextVar("mxfp_probe_step", default=None)
 _MODULE_ALIASES = {
     "q_proj": "q",
     "k_proj": "k",
@@ -67,34 +65,38 @@ class MXFPQuantErrorProbe:
         self._claimed: set[tuple[int, str, str, str, str]] = set()
         self._fallback_step = 0
         self._first_step_collected = False
+        # One rank-local probe spans the whole serialized train batch, including
+        # autograd device workers and checkpoint recomputation. ContextVars are
+        # thread-local and do not propagate from forward to those workers.
+        self._active_step: int | None = None
         self._lock = threading.Lock()
 
     @property
     def active(self) -> bool:
-        return _ACTIVE_STEP.get() is not None
+        with self._lock:
+            return self._active_step is not None
 
     def begin_step(self, step: int | None, *, first_step_only: bool = False) -> int | None:
-        if first_step_only:
-            with self._lock:
+        with self._lock:
+            if first_step_only:
                 if self._first_step_collected:
-                    _ACTIVE_STEP.set(None)
+                    self._active_step = None
                     return None
                 self._first_step_collected = True
-        if step is None:
-            self._fallback_step += 1
-            step = self._fallback_step
-        step = int(step)
-        _ACTIVE_STEP.set(step)
-        return step
+            if step is None:
+                self._fallback_step += 1
+                step = self._fallback_step
+            self._active_step = int(step)
+            return self._active_step
 
     def claim(self, layer_name: str, module_name: str, target: str, operand: str) -> bool:
         """Reserve a key before QDQ so simultaneous expert paths quantify it once."""
-        step = _ACTIVE_STEP.get()
-        if step is None:
-            return False
         full_name = f"{layer_name}.{module_name}" if module_name else layer_name
-        key = (step, layer_name, _module_label(module_name or full_name), target, operand)
         with self._lock:
+            step = self._active_step
+            if step is None:
+                return False
+            key = (step, layer_name, _module_label(module_name or full_name), target, operand)
             if key in self._claimed or key in self._pending or key in self._history:
                 return False
             self._claimed.add(key)
@@ -113,7 +115,8 @@ class MXFPQuantErrorProbe:
         valid_indices: torch.Tensor | None = None,
         indices_dim: int = 0,
     ) -> bool:
-        step = _ACTIVE_STEP.get()
+        with self._lock:
+            step = self._active_step
         if step is None:
             return False
 
@@ -189,6 +192,9 @@ class MXFPQuantErrorProbe:
             module = _module_label(module_name or full_name)
             records.append(((step, layer_name, module, target, operand), dict(common_record, module=module)))
         with self._lock:
+            # A finished step must not acquire late records from another thread.
+            if self._active_step != step:
+                return False
             # Concurrent calls for one logical key retain only the first observation.
             for key, record in records:
                 self._pending.setdefault(key, record)
@@ -197,6 +203,8 @@ class MXFPQuantErrorProbe:
     def finish_step(self, step: int) -> None:
         step = int(step)
         with self._lock:
+            if self._active_step == step:
+                self._active_step = None
             local_records = [record for key, record in self._pending.items() if key[0] == step]
 
         gathered = [local_records]
@@ -240,7 +248,6 @@ class MXFPQuantErrorProbe:
         with self._lock:
             self._pending = {key: record for key, record in self._pending.items() if key[0] != step}
             self._claimed = {key for key in self._claimed if key[0] != step}
-        _ACTIVE_STEP.set(None)
 
     @staticmethod
     def _public_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -340,7 +347,7 @@ def quantize_with_probe(
         else []
     )
     # Keep the model-visible path independent of the per-step probe state. A
-    # checkpoint recomputation may run without the ContextVar set by begin_step.
+    # checkpoint recomputation may run after sampling has finished.
     high_precision = probe_configured and bool(getattr(config, "probe_quant_error_use_high_precision", True))
     if high_precision and not record_names:
         return tensor
