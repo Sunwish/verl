@@ -195,7 +195,7 @@ def apply_qat(
             ),
             "FSDP2 MXFP QAT configured: mode=%s dense_linear=%d moe_blocks=%d experts=%s "
             "fprop=%s dgrad=%s wgrad=%s rotation=%s rotation_targets=%s mxfp4_scale_alg=%s mxfp4_mbs=%s "
-            "backward_axis_cache=%s",
+            "backward_operands=on_demand backward_axis_cache_compat=%s",
             mxfp_mode.value,
             len(modules_to_replace),
             moe_count,

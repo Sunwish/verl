@@ -205,8 +205,8 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
         # their gradient runs. save_for_backward lets checkpoint hooks release
         # retained tensors between forward and backward.
         ctx.save_for_backward(
-            x if need_weight_grad else None,
-            weight if need_input_grad else None,
+            x if need_weight_grad and _enabled(config, "wgrad") else None,
+            weight if need_input_grad and _enabled(config, "dgrad") else None,
             x_fprop.detach() if need_weight_grad and not _enabled(config, "wgrad") else None,
             weight_fprop.detach() if need_input_grad and not _enabled(config, "dgrad") else None,
         )
@@ -274,6 +274,9 @@ class _MXFPGroupedMatmul(torch.autograd.Function):
             if not _enabled(config, "dgrad"):
                 # The fallback uses fprop-rotated weights; map dx back to raw input coordinates.
                 dx = _inverse_input_rotation(dx, config, feature_dim=-1)
+            # Do not keep the large dgrad QDQ/contiguous buffers alive while
+            # allocating the independently padded wgrad operands below.
+            del grad_output_dgrad, weight_dgrad
         else:
             dx = None
 

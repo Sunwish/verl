@@ -57,6 +57,7 @@ class MXFPQATConfig:
     mxfp4_scale_alg: str = "standard"
     mxfp4_mbs_enable: bool = False
     fake_quant_targets: tuple[str, ...] = ("fprop",)
+    # Retained for config compatibility; backward operands are always prepared on demand.
     backward_reduction_axis_fake_quant: bool = True
     rotation_enable: bool = False
     rotation_targets: tuple[str, ...] = ("fprop",)
@@ -151,29 +152,33 @@ def _prepare_wgrad_input(input: torch.Tensor, config: MXFPQATConfig) -> torch.Te
 
 class _MXFPLinear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weight, bias, dgrad_weight, wgrad_input_t, config, dgrad_enabled, wgrad_enabled):
-        ctx.has_saved_dgrad_weight = dgrad_weight is not None
-        ctx.has_saved_wgrad_input = wgrad_input_t is not None
+    def forward(ctx, input, weight, bias, config, dgrad_enabled, wgrad_enabled):
         ctx.dgrad_enabled = dgrad_enabled
         ctx.wgrad_enabled = wgrad_enabled
         ctx.config = config
         ctx.bias_is_none = bias is None
+        need_input_grad, need_weight_grad = ctx.needs_input_grad[:2]
+        weight_fprop = _target_tensor(weight, config, "fprop", config.weight_format, probe_operand="weight")
+        values = _target_tensor(input, config, "fprop", config.activation_format)
+        # Keep pre-QDQ operands, not backward-axis QDQ buffers. Each backward
+        # GEMM prepares its own rotation/MBS/QDQ from these original values.
+        # Disabled backward targets retain the ordinary fprop STE behavior.
         ctx.save_for_backward(
-            input,
-            weight,
-            dgrad_weight if dgrad_weight is not None else weight,
-            wgrad_input_t if wgrad_input_t is not None else input,
+            input if need_weight_grad and wgrad_enabled else None,
+            weight if need_input_grad and dgrad_enabled else None,
+            values if need_weight_grad and not wgrad_enabled else None,
+            weight_fprop if need_input_grad and not dgrad_enabled else None,
         )
-        return F.linear(input, weight, bias)
+        ctx.input_shape = input.shape
+        return F.linear(values, weight_fprop, bias)
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, weight, saved_dgrad_weight, saved_wgrad_input_t = ctx.saved_tensors
+        input, weight, input_fprop, weight_fprop = ctx.saved_tensors
         config = ctx.config
-        input_2d = input.reshape(-1, input.shape[-1])
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
         need_input_grad, need_weight_grad = ctx.needs_input_grad[:2]
-        # Return gradients in the transformed operand coordinates; outer autograd handles QDQ and rotation.
+        # Enabled backward targets operate directly in original coordinates.
 
         grad_input = None
         if need_input_grad:
@@ -186,10 +191,9 @@ class _MXFPLinear(torch.autograd.Function):
                         config.fake_quant_targets,
                         config.rotation.targets,
                     ),
-                    "dense dgrad executed: fake_quant=%s rotation=%s reduction_axis=output cached=%s",
+                    "dense dgrad executed: fake_quant=%s rotation=%s reduction_axis=output operand=recomputed",
                     "dgrad" in config.fake_quant_targets,
                     config.rotation.enable and "dgrad" in config.rotation.targets,
-                    ctx.has_saved_dgrad_weight,
                 )
             if ctx.dgrad_enabled:
                 grad_output_t = _target_tensor(
@@ -199,16 +203,19 @@ class _MXFPLinear(torch.autograd.Function):
                     config.activation_format,
                     probe_operand="grad_output",
                 )
-                weight_dgrad = (
-                    saved_dgrad_weight if ctx.has_saved_dgrad_weight else _prepare_dgrad_weight(weight, config)
-                )
+                weight_dgrad = _prepare_dgrad_weight(weight, config)
                 # _prepare_dgrad_weight restores F.linear's [out_features, in_features] layout.
                 weight_t = weight_dgrad
             else:
                 grad_output_t = grad_output_2d
-                weight_t = weight
+                weight_t = weight_fprop
             grad_input_2d = grad_output_t.matmul(weight_t)
-            grad_input = grad_input_2d.reshape_as(input)
+            if not ctx.dgrad_enabled and config.rotation.enable and "fprop" in config.rotation.targets:
+                grad_input_2d = rotate_blocks(grad_input_2d, config.rotation, transpose=True)
+            grad_input = grad_input_2d.reshape(ctx.input_shape)
+            del grad_output_t, weight_t
+            if ctx.dgrad_enabled:
+                del weight_dgrad
 
         grad_weight = None
         if need_weight_grad:
@@ -221,13 +228,12 @@ class _MXFPLinear(torch.autograd.Function):
                         config.fake_quant_targets,
                         config.rotation.targets,
                     ),
-                    "dense wgrad executed: fake_quant=%s rotation=%s reduction_axis=token cached=%s",
+                    "dense wgrad executed: fake_quant=%s rotation=%s reduction_axis=token operand=recomputed",
                     "wgrad" in config.fake_quant_targets,
                     config.rotation.enable and "wgrad" in config.rotation.targets,
-                    ctx.has_saved_wgrad_input,
                 )
             if ctx.wgrad_enabled:
-                input_t = saved_wgrad_input_t if ctx.has_saved_wgrad_input else _prepare_wgrad_input(input, config)
+                input_t = _prepare_wgrad_input(input, config)
                 grad_output_t = _target_tensor(
                     grad_output_2d.transpose(0, 1),
                     config,
@@ -237,12 +243,14 @@ class _MXFPLinear(torch.autograd.Function):
                     probe_operand="grad_output",
                 )
             else:
-                input_t = input_2d.transpose(0, 1)
+                input_t = input_fprop.reshape(-1, input_fprop.shape[-1]).transpose(0, 1)
                 grad_output_t = grad_output_2d.transpose(0, 1)
             grad_weight = grad_output_t.matmul(input_t.transpose(0, 1))
+            if not ctx.wgrad_enabled and config.rotation.enable and "fprop" in config.rotation.targets:
+                grad_weight = rotate_blocks(grad_weight, config.rotation, transpose=True)
 
         grad_bias = grad_output_2d.sum(dim=0) if not ctx.bias_is_none and ctx.needs_input_grad[2] else None
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None
 
 
 class MXFPQATLinear(nn.Linear):
@@ -288,48 +296,27 @@ class MXFPQATLinear(nn.Linear):
         if not self.fake_quant_enabled:
             return F.linear(input, self.weight, self.bias)
 
-        weight = _target_tensor(
-            self.weight,
-            config,
-            "fprop",
-            config.weight_format,
-            probe_operand="weight",
-        )
-        values = _target_tensor(
-            input,
-            config,
-            "fprop",
-            config.activation_format,
-            probe_operand="activation",
-        )
-
-        if not input.requires_grad and not self.weight.requires_grad:
-            return F.linear(values, weight, self.bias)
-
         needs_custom_backward = config.rotation.enable and "fprop" in config.rotation.targets
         needs_custom_backward = needs_custom_backward or any(
             target in config.fake_quant_targets or (config.rotation.enable and target in config.rotation.targets)
             for target in ("dgrad", "wgrad")
         )
-        if not needs_custom_backward:
+        if (
+            not needs_custom_backward
+            or not torch.is_grad_enabled()
+            or (not input.requires_grad and not self.weight.requires_grad)
+        ):
+            weight = _target_tensor(self.weight, config, "fprop", config.weight_format, probe_operand="weight")
+            values = _target_tensor(input, config, "fprop", config.activation_format)
             return F.linear(values, weight, self.bias)
 
-        dgrad_weight = None
-        wgrad_input_t = None
         dgrad_enabled = "dgrad" in config.fake_quant_targets or (
             config.rotation.enable and "dgrad" in config.rotation.targets
         )
         wgrad_enabled = "wgrad" in config.fake_quant_targets or (
             config.rotation.enable and "wgrad" in config.rotation.targets
         )
-        if config.backward_reduction_axis_fake_quant:
-            if dgrad_enabled and input.requires_grad:
-                dgrad_weight = _prepare_dgrad_weight(weight, config)
-            if wgrad_enabled and self.weight.requires_grad:
-                wgrad_input_t = _prepare_wgrad_input(values, config)
-        return _MXFPLinear.apply(
-            values, weight, self.bias, dgrad_weight, wgrad_input_t, config, dgrad_enabled, wgrad_enabled
-        )
+        return _MXFPLinear.apply(input, self.weight, self.bias, config, dgrad_enabled, wgrad_enabled)
 
     def extra_repr(self) -> str:
         return (

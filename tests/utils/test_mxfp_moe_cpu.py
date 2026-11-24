@@ -1,9 +1,14 @@
+import weakref
+from dataclasses import replace
+
 import pytest
 import torch
 from torch import nn
 
 from verl.utils.qat.mxfp_linear import MXFPQATConfig
 from verl.utils.qat.mxfp_moe import (
+    _pad_expert_rows,
+    _transform_feature,
     _transform_tokens,
     _transform_weight,
     attach_mxfp_expert_qat,
@@ -178,3 +183,87 @@ def test_grouped_matmul_rotation_gradients_match_unrotated_matmul(monkeypatch, r
     assert torch.allclose(qat_output, reference_output, atol=1e-5, rtol=1e-5)
     assert torch.allclose(x_qat.grad, x_reference.grad, atol=1e-5, rtol=1e-5)
     assert torch.allclose(weight_qat.grad, weight_reference.grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("mbs", [False, True])
+@pytest.mark.parametrize("group_list_type", [0, 1])
+def test_grouped_matmul_backward_uses_independent_raw_operands(monkeypatch, mbs, group_list_type):
+    monkeypatch.setattr("verl.utils.qat.mxfp_moe._call_grouped_matmul", _fake_grouped_matmul)
+    torch.manual_seed(61)
+    config = replace(_config(), mode="mxfp_w4a8", mxfp4_mbs_enable=mbs)
+    x = torch.randn(35, 32, requires_grad=True)
+    weight = torch.randn(3, 32, 64, requires_grad=True)
+    grad_output = torch.randn(35, 64)
+    counts = torch.tensor([7, 0, 28])
+    groups = counts.cumsum(0) if group_list_type == 0 else counts
+    with torch.no_grad():
+        expected_output = _fake_grouped_matmul(
+            _transform_feature(x, config, "fprop", config.activation_format),
+            _transform_weight(weight, config, "fprop", config.weight_format, reduction_dim=1),
+            groups,
+            group_list_type,
+        )
+        expected_dx = _fake_grouped_matmul(
+            _transform_feature(grad_output, config, "dgrad", config.activation_format),
+            _transform_weight(weight, config, "dgrad", config.weight_format, reduction_dim=2).transpose(1, 2),
+            groups,
+            group_list_type,
+        )
+        padded_x, padded_grad, padded_groups, _ = _pad_expert_rows(
+            x, grad_output, groups, group_list_type, config.group_size
+        )
+        expected_dw = _fake_grouped_matmul(
+            _transform_tokens(padded_x, config, "wgrad", config.activation_format).T,
+            _transform_tokens(padded_grad, config, "wgrad", config.activation_format),
+            padded_groups,
+            group_list_type,
+            split_item=3,
+            group_type=2,
+        )
+    actual = mxfp_grouped_matmul(
+        x,
+        weight,
+        groups,
+        config,
+        name="gate_proj",
+        group_list_type=group_list_type,
+        fprop_x=prepare_mxfp_fprop_input(x, config),
+    )
+    actual.backward(grad_output)
+    torch.testing.assert_close(actual, expected_output)
+    torch.testing.assert_close(x.grad, expected_dx)
+    torch.testing.assert_close(weight.grad, expected_dw)
+
+
+def test_grouped_matmul_releases_dgrad_buffers_before_wgrad(monkeypatch):
+    from verl.utils.qat import mxfp_moe
+
+    monkeypatch.setattr(mxfp_moe, "_call_grouped_matmul", _fake_grouped_matmul)
+    original_transform = mxfp_moe._transform_feature
+    original_weight_transform = mxfp_moe._transform_weight
+    original_pad = mxfp_moe._pad_expert_rows
+    temporary_refs = []
+
+    def transform(tensor, config, target, fmt, **kwargs):
+        result = original_transform(tensor, config, target, fmt, **kwargs)
+        if target == "dgrad" and kwargs.get("operand") == "grad_output":
+            temporary_refs.append(weakref.ref(result))
+        return result
+
+    def transform_weight(weight, config, target, fmt, reduction_dim, **kwargs):
+        result = original_weight_transform(weight, config, target, fmt, reduction_dim, **kwargs)
+        if target == "dgrad":
+            temporary_refs.append(weakref.ref(result))
+        return result
+
+    def pad(*args, **kwargs):
+        assert len(temporary_refs) == 2
+        assert all(reference() is None for reference in temporary_refs)
+        return original_pad(*args, **kwargs)
+
+    monkeypatch.setattr(mxfp_moe, "_transform_feature", transform)
+    monkeypatch.setattr(mxfp_moe, "_transform_weight", transform_weight)
+    monkeypatch.setattr(mxfp_moe, "_pad_expert_rows", pad)
+    x = torch.randn(35, 32, requires_grad=True)
+    weight = torch.randn(2, 32, 64, requires_grad=True)
+    mxfp_grouped_matmul(x, weight, torch.tensor([7, 28]), _config(), name="test").sum().backward()

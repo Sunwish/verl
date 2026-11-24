@@ -127,7 +127,7 @@ qat:
   # MXFP pseudo-quantization locations. Valid values are Fprop, Dgrad, and Wgrad.
   fake_quant_targets: [Fprop]
 
-  # Cache a separately quantized operand for the backward reduction axis when true.
+  # Compatibility field; selected backward operands are always transformed on demand from pre-QDQ values.
   backward_reduction_axis_fake_quant: false
 
   # Enable deterministic block-local rotation before the selected MXFP transforms.

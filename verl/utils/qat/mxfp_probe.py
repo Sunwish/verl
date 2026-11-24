@@ -317,7 +317,13 @@ def quantize_with_probe(
     valid_indices: torch.Tensor | None = None,
     indices_dim: int = 0,
 ) -> torch.Tensor:
-    """Quantize and record one unique QDQ observation when a probe step is active."""
+    """Record local QDQ error against this GEMM's pre-QDQ operand.
+
+    Callers supply the original operand after the selected target's rotation
+    and layout transform, never a preceding target's QDQ result. MXFP4 MBS
+    correction and its inverse belong to this single QDQ observation. Padded
+    entries are excluded using the same masks as the compute path.
+    """
     from verl.utils.qat.mxfp_quant import fake_quantize
 
     if target not in config.fake_quant_targets:

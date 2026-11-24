@@ -141,6 +141,9 @@ python3 scripts/check_fsdp_r3_log.py /path/to/logs/train.log --ranks 8 --min-bat
 
 ## 本地测试与服务器反馈
 
+MXFP QAT 的独立前反向归约轴、按需重算和误差采集口径见
+[MXFP QAT](../low_precision/mxfp_qat.md)。
+
 ```bash
 python3 -m pytest tests/utils/test_fsdp_router_replay_on_cpu.py \
   tests/workers/test_fsdp_r3_engine_on_cpu.py tests/utils/test_fsdp_r3_log_on_cpu.py \
